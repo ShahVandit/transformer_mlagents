@@ -43,6 +43,14 @@ class PPOSettings(OnPolicyHyperparamSettings):
     capture_internals: bool = False
     sequence_length: int = 64
 
+    # Critic warmup: freeze actor for N steps, only train critic
+    # (fixes performance dip when fine-tuning from merged checkpoints)
+    critic_warmup_steps: int = 0
+
+    # Staged unfreezing: freeze attention layers for N steps,
+    # let FFN/LayerNorm/scales/action_head calibrate first
+    attn_freeze_steps: int = 0
+
     # CBM-specific parameters
     use_concept_bottleneck: bool = False
     concept_loss_weight: float = 1.0
@@ -170,6 +178,16 @@ class TorchPPOOptimizer(TorchOptimizer):
         decay_lr = self.decay_learning_rate.get_value(self.policy.get_current_step())
         decay_eps = self.decay_epsilon.get_value(self.policy.get_current_step())
         decay_bet = self.decay_beta.get_value(self.policy.get_current_step())
+
+        # ── Staged unfreezing: freeze qkv_layers + attn_out_layers ──
+        attn_freeze_steps = self.hyperparameters.attn_freeze_steps
+        if attn_freeze_steps > 0:
+            current_step = self.policy.get_current_step()
+            for name, param in self.policy.actor.named_parameters():
+                if "qkv_layers" in name or "attn_out_layers" in name:
+                    param.requires_grad = current_step >= attn_freeze_steps
+            if current_step == attn_freeze_steps:
+                print(f"[STAGED UNFREEZE] step {current_step} — attention layers unfrozen")
         
         returns = {}
         old_values = {}
@@ -246,6 +264,15 @@ class TorchPPOOptimizer(TorchOptimizer):
         )
         
         # Base loss (standard PPO)
+        current_step = self.policy.get_current_step()
+        # warmup_steps = self.hyperparameters.critic_warmup_steps
+        # in_warmup = warmup_steps > 0 and current_step < warmup_steps
+        # if in_warmup:
+        #     print("in warmup")
+        #     # Critic warmup: only train value network, freeze actor
+        #     loss = 0.5 * value_loss
+        # else:
+        in_warmup = False
         loss = (
             policy_loss
             + 0.5 * value_loss
@@ -351,6 +378,13 @@ class TorchPPOOptimizer(TorchOptimizer):
         # =====================================================================
         # Prepare Update Statistics
         # =====================================================================
+        # # Log warmup transitions
+        # if in_warmup and current_step % 100000 == 0:
+        #     print(f"  [CRITIC WARMUP] step {current_step}/{warmup_steps} — actor frozen, only critic training")
+        # if warmup_steps > 0 and not in_warmup and current_step < warmup_steps + 50000 and current_step % 10000 == 0:
+        #     if current_step == warmup_steps or (current_step - warmup_steps) < 10000:
+        #         print(f"  [CRITIC WARMUP DONE] step {current_step} — actor unfrozen, full PPO training")
+
         update_stats = {
             "Losses/Policy Loss": torch.abs(policy_loss).item(),
             "Losses/Value Loss": value_loss.item(),
@@ -358,6 +392,7 @@ class TorchPPOOptimizer(TorchOptimizer):
             "Policy/Epsilon": decay_eps,
             "Policy/Beta": decay_bet,
             "Policy/Gradient Norm": grad_norm.item(),
+            "Policy/Critic Warmup": 1.0 if in_warmup else 0.0,
         }
         
         # Add concept statistics
