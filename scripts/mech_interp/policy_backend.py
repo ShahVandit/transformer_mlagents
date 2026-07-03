@@ -124,6 +124,7 @@ class TransformerPolicyBackend:
 
         for i in range(self.n_layer):
             x_norm = self._ln(x, f"norm1_layers.{i}")
+            cap[f"qkv_in.{i}"] = x_norm[:, -1, :].clone()     # input to qkv_layers.i
             qkv = self._lin(x_norm, f"qkv_layers.{i}")       # [B, L, 3*d_model]
             qkv = qkv.reshape(B, L, 3, self.n_head, self.head_dim)
             qkv = qkv.permute(2, 0, 3, 1, 4)
@@ -133,13 +134,18 @@ class TransformerPolicyBackend:
             attn = torch.softmax(attn, dim=-1)               # dropout off (eval)
             out = torch.matmul(attn, v)
             out = out.transpose(1, 2).reshape(B, L, self.d_model)
+            cap[f"attn_in.{i}"] = out[:, -1, :].clone()       # input to attn_out_layers.i
             out = self._lin(out, f"attn_out_layers.{i}")
+            cap[f"attn.{i}"] = out[:, -1, :].clone()          # output of attn_out_layers.i
             x = x + self.w[f"attn_scales.{i}"] * out
 
             x_norm2 = self._ln(x, f"norm2_layers.{i}")
+            cap[f"ffn_in.{i}"] = x_norm2[:, -1, :].clone()    # input to ffn_layers.i.0
             ffn = self._lin(x_norm2, f"ffn_layers.{i}.0")
             ffn = F.gelu(ffn)
+            cap[f"ffn_hidden.{i}"] = ffn[:, -1, :].clone()    # input to ffn_layers.i.3 (post-gelu)
             ffn = self._lin(ffn, f"ffn_layers.{i}.3")
+            cap[f"ffn.{i}"] = ffn[:, -1, :].clone()           # output of ffn_layers.i.3
             x = x + self.w[f"ffn_scales.{i}"] * ffn
 
             cap[f"resid.{i + 1}"] = x[:, -1, :].clone()

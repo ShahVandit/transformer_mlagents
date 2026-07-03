@@ -29,22 +29,35 @@ public class SimpleTask1 : Agent
     private float rechargeRatePerStep = 0.004f;
     private float batteryAtChargeStart = 0f;
     private bool validChargeCycle = false;
-    private bool rechargeBonusPaid = false;
-    private float rechargeBonusLevel = 0.7f;
-    private float rechargeBonusReward = 2f;
+    // Split recharge payout: a small reward at the 0.9 checkpoint (dense
+    // learning signal so the critic sees positive return-to-go as soon as
+    // charging works) plus a larger reward at full. The large full chunk makes
+    // finishing strictly best — leaving at 0.9 forfeits rechargeFullReward,
+    // far more than the ~0.025 nav-step cost of charging 0.9->1.0. Total still
+    // sums to 2.0 to keep the per-recharge reward scale consistent with soups.
+    private bool rechargePartialPaid = false;
+    private bool rechargeFullPaid = false;
+    private float rechargeBonusLevel = 0.9f;
+    private float rechargePartialReward = 0.5f;
+    private float rechargeFullReward = 1.5f;
+    // V3 ablation switch. "urgency" (default) = V2 behavior: IsRechargeUrgent()
+    // gates a split bonus and drives obs dim 96. "none" = no threshold anywhere:
+    // dim 96 is held at 0 and charging earns a proportional, ungated reward
+    // (kCharge * battery added per step), so the policy must learn WHEN to
+    // charge from raw battery + distances instead of being handed an urgency flag.
+    private string chargeRewardMode = "urgency";
+    private float kCharge = 2.5f;
     private bool rechargeLocked = false;
     private bool wasChargeCycleThisVisit = false;
+    // Freezes charging_state obs to 1 during an active valid (urgent) cycle so
+    // the policy is not told "you're done" mid-charge when IsRechargeUrgent()
+    // relaxes as battery rises. Reset on station exit.
+    private bool chargingStateFrozen = false;
     private int topUpCount = 0;
     private float initialBatteryMin = 0.4f;
     private float initialBatteryMax = 1.0f;
     private float obstaclePenalty = 50f;
     private float bsSpawnRange = 50f;
-    // Potential-based shaping toward the BS while battery is below threshold
-    // (Ng et al. 1999 — policy-invariant). Paid as k*(prevDist - currDist);
-    // telescopes to zero on closed loops, so it cannot be farmed.
-    private float bsShapingK = 0.005f;
-    private float prevDistToBS = -1f;
-    private float shapingTotal = 0f;
     // Reachability-aware charging: charge only when the battery can't safely
     // cover "reach PT, then reach BS" (distance-aware), instead of a flat
     // threshold. navStepsPerUnit is the calibrated steps/unit from
@@ -52,7 +65,7 @@ public class SimpleTask1 : Agent
     // is 2.5). chargeHardFloor is an absolute safety net so battery_dead
     // can't balloon if the distance estimate is optimistic.
     private float navStepsPerUnit = 3.91f;
-    private float chargeHardFloor  = 0.20f;
+    private float chargeHardFloor  = 0.00f;
     // Exact straight-line travel per battery-drain step; computed in
     // Initialize from maxSpeed, fixed timestep, and decision settings.
     private float unitsPerStep = 0.4f;
@@ -61,6 +74,14 @@ public class SimpleTask1 : Agent
     private int fullChargeCycles = 0;
     private int chargingSteps = 0;
     private int stationIdleSteps = 0;
+    // "Leave once charged" shaping: time spent in the BS collider while NOT
+    // actively charging (i.e. full/locked) is loitering. The penalty escalates
+    // with consecutive idle steps this visit so the agent departs promptly
+    // instead of camping on the station. Shapes exit behavior only — not charge
+    // timing. Reset on station exit and episode start.
+    private int idleStepsThisVisit = 0;
+    private float idlePenalty = 0.005f;     // per-step base, config: idle_penalty
+    private int idleEscalCap = 20;          // penalty caps at idlePenalty * cap
     private float batteryAtStart = 1f;
     private float totalChargeGained = 0f;
     private float minChargeStartBattery = 1f;
@@ -154,7 +175,6 @@ public class SimpleTask1 : Agent
             ? decisionRequester.DecisionPeriod
             : 1;
         unitsPerStep = maxSpeed * Time.fixedDeltaTime * stepsPerAction;
-        Debug.Log($"[SimpleTask1] unitsPerStep={unitsPerStep:F3} (maxSpeed={maxSpeed}, fixedDt={Time.fixedDeltaTime}, stepsPerAction={stepsPerAction})");
     }
 
     void Start()
@@ -167,9 +187,9 @@ public class SimpleTask1 : Agent
     private void UpdateBatteryLabel()
     {
         if (batteryLabel == null) return;
-        bool needsCharge = IsRechargeUrgent();
-        // bool needsCharge = battery < rechargeThreshold;
-        batteryLabel.text = $"bat={battery:F2} step={StepCount} needCharge={(needsCharge ? 1 : 0)}";
+        batteryLabel.text  = chargeRewardMode == "none"
+            ? $"bat={battery:F2} step={StepCount} chg={isCharging}"
+            : $"bat={battery:F2} step={StepCount} need={chargingStateFrozen || IsRechargeUrgent()}";
         batteryLabel.color = battery < 0.3f ? Color.red
                            : battery < 0.6f ? Color.yellow
                            : Color.white;
@@ -255,9 +275,6 @@ public class SimpleTask1 : Agent
                 else
                     rechargeRatePerStep = float.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture);
             }
-            Debug.Log($"[SimpleTask1] recharge_rate: {rechargeRatePerStep:F6}/step " +
-                      $"(~{(rechargeRatePerStep > 0 ? Mathf.RoundToInt(1f / rechargeRatePerStep) : 0)} steps to full) " +
-                      $"[source: {(rechargeMatch.Success ? "config" : "default 0.004")}]");
 
             var thresholdMatch = System.Text.RegularExpressions.Regex.Match(
                 json, "\"recharge_threshold\"\\s*:\\s*([\\d.]+)");
@@ -275,19 +292,26 @@ public class SimpleTask1 : Agent
                     : fallback;
             }
             rechargeBonusLevel = ReadFloat("recharge_bonus_level", rechargeBonusLevel);
-            rechargeBonusReward = ReadFloat("recharge_bonus_reward", rechargeBonusReward);
+            rechargePartialReward = ReadFloat("recharge_partial_reward", rechargePartialReward);
+            rechargeFullReward = ReadFloat("recharge_full_reward", rechargeFullReward);
             initialBatteryMin = ReadFloat("initial_battery_min", initialBatteryMin);
             initialBatteryMax = ReadFloat("initial_battery_max", initialBatteryMax);
             obstaclePenalty = ReadFloat("obstacle_penalty", obstaclePenalty);
             bsSpawnRange = ReadFloat("bs_spawn_range", bsSpawnRange);
-            bsShapingK = ReadFloat("bs_shaping_k", bsShapingK);
             maxTargetsToReach = (int)ReadFloat("max_targets", maxTargetsToReach);
             navStepsPerUnit = ReadFloat("nav_steps_per_unit", navStepsPerUnit);
             chargeHardFloor = ReadFloat("charge_hard_floor", chargeHardFloor);
+            kCharge = ReadFloat("k_charge", kCharge);
+            idlePenalty = ReadFloat("idle_penalty", idlePenalty);
+            var chargeModeMatch = System.Text.RegularExpressions.Regex.Match(
+                json, "\"charge_reward_mode\"\\s*:\\s*\"([^\"]+)\"");
+            if (chargeModeMatch.Success)
+                chargeRewardMode = chargeModeMatch.Groups[1].Value.ToLower();
+            Debug.Log($"[SimpleTask1] charge_reward_mode={chargeRewardMode}, k_charge={kCharge:F2}");
 
             int batteryLifeSteps = batteryDrainRate > 0 ? Mathf.RoundToInt(1f / batteryDrainRate) : 0;
             int rechargeSteps = rechargeRatePerStep > 0 ? Mathf.RoundToInt(1f / rechargeRatePerStep) : 0;
-            Debug.Log($"[SimpleTask1] Training mode: {trainingMode}, MaxStep: {MaxStep}, batteryDrainRate: {batteryDrainRate:F6} (~{batteryLifeSteps} steps/charge), rechargeRate: {rechargeRatePerStep:F6} (~{rechargeSteps} steps to full), rechargeThreshold: {rechargeThreshold:F2}, bonus: +{rechargeBonusReward:F1}@{rechargeBonusLevel:F2}, initBattery: [{initialBatteryMin:F2},{initialBatteryMax:F2}], obstaclePenalty: -{obstaclePenalty:F0}, bsRange: ±{bsSpawnRange:F0}, maxTargets: {maxTargetsToReach} (from {configPath})");
+            Debug.Log($"[SimpleTask1] Training mode: {trainingMode}, MaxStep: {MaxStep}, batteryDrainRate: {batteryDrainRate:F6} (~{batteryLifeSteps} steps/charge), rechargeRate: {rechargeRatePerStep:F6} (~{rechargeSteps} steps to full), rechargeThreshold: {rechargeThreshold:F2}, bonus: +{rechargePartialReward:F1}@{rechargeBonusLevel:F2}/+{rechargeFullReward:F1}@full, initBattery: [{initialBatteryMin:F2},{initialBatteryMax:F2}], obstaclePenalty: -{obstaclePenalty:F0}, bsRange: ±{bsSpawnRange:F0}, maxTargets: {maxTargetsToReach} (from {configPath})");
         }
         else
         {
@@ -312,12 +336,13 @@ public class SimpleTask1 : Agent
         chargeProgress = 0f;
         batteryAtChargeStart = 0f;
         validChargeCycle = false;
-        rechargeBonusPaid = false;
+        rechargePartialPaid = false;
+        rechargeFullPaid = false;
         rechargeLocked = false;
+        idleStepsThisVisit = 0;
         wasChargeCycleThisVisit = false;
+        chargingStateFrozen = false;
         topUpCount = 0;
-        prevDistToBS = -1f;
-        shapingTotal = 0f;
         chargeCycleStarts = 0;
         validChargeExits = 0;
         fullChargeCycles = 0;
@@ -367,10 +392,10 @@ public class SimpleTask1 : Agent
         }
         activeSegment = 0;
 
-        // Randomize environment: obstacles first, then BS, then target (checks against real BS pos), then agent
+        // Randomize environment
         RandomizeObstaclePositionsAndSizes();
-        RandomizeBatteryStationPosition();
         RandomizeTargetPosition();
+        RandomizeBatteryStationPosition();
         RandomizeAgentPosition();
 
         // Initial leg (agent spawn -> PT1): measured now that both the agent
@@ -421,15 +446,17 @@ public class SimpleTask1 : Agent
         }
 
         // === 3. BATTERY LEVEL (1 dim) ===
-        sensor.AddObservation(trainingMode == TrainingMode.Task1 ? 1.0f : battery);
+        // sensor.AddObservation(trainingMode == TrainingMode.Task1 ? 1.0f : battery);
+        sensor.AddObservation(battery);
 
         // === 4. BATTERY STATION DIRECTION (2 dims) ===
-        if (trainingMode != TrainingMode.Task1 && tfBatteryStation != null)
+        // BS obs are now live in all modes (incl. Task1) so a fine-tune sees a
+        // real, varying battery-station signal. Only guard is null-safety.
+        if (tfBatteryStation != null)
         {
             Vector3 relBS = tfBatteryStation.localPosition - tfAgent.localPosition;
             sensor.AddObservation(relBS.x / 400f);
             sensor.AddObservation(relBS.z / 400f);
-            // Debug.Log($"X: {relBS.x / 400f}, Z:{relBS.z / 400f}");
         }
         else
         {
@@ -452,7 +479,7 @@ public class SimpleTask1 : Agent
             sensor.AddObservation(0f);
         }
 
-        if (trainingMode != TrainingMode.Task1 && tfBatteryStation != null)
+        if (tfBatteryStation != null)
         {
             Vector3 relBS = tfBatteryStation.localPosition - tfAgent.localPosition;
             sensor.AddObservation(relBS.magnitude / 400f);
@@ -465,13 +492,16 @@ public class SimpleTask1 : Agent
         // === 7. CHARGING STATE (1 dim) ===
         // Reachability-aware trigger (distance to PT-then-BS) instead of a flat
         // battery threshold — same single dim, smarter value. See IsRechargeUrgent.
-        // sensor.AddObservation(IsRechargeUrgent() ? 1f : 0f);
-        // === 7. CHARGING STATE (1 dim) ===
-        // needscharging is reserved for delayed recharge logic; keep it shared now.
-        sensor.AddObservation(
-            0f
-            // trainingMode == TrainingMode.Task1 ? 0f : (battery < rechargeThreshold ? 1f : 0f)
-        );
+        // Frozen to 1 during an active valid cycle so the policy stays committed
+        // to filling up even as IsRechargeUrgent() relaxes mid-charge.
+        // V3 ablation ("none"): dim 96 carries no urgency/threshold signal — the
+        // policy must infer charge timing from battery (dim 88) + PT/BS distances.
+        // Kept as a constant-0 dim (not removed) so obs stays 99-dim and the only
+        // change vs V2 is this dimension's information content.
+        if (chargeRewardMode == "none")
+            sensor.AddObservation(0f);
+        else
+            sensor.AddObservation((chargingStateFrozen || IsRechargeUrgent()) ? 1f : 0f);
 
         // === 8. CURRENT COUNT (1 dim) ===
         sensor.AddObservation(ptReachCount);
@@ -497,26 +527,10 @@ public class SimpleTask1 : Agent
                 return;
             }
         }
-        // Debug.Log($"Battery:{battery}, Reward:{GetCumulativeReward()}");
         // === Step reward: survival signal for Task2, speed incentive for Task1/Combined ===
         AddReward(trainingMode == TrainingMode.Task2 ? 0.0005f : -0.001f);
 
-        // === BS-approach shaping (battery modes, only while urgently low) ===
-        // Potential-based: pays k*(prevDist - currDist) toward the station,
-        // refunds itself on retreat — guides the detour without changing the
-        // optimal policy or being farmable.
-        if ((trainingMode == TrainingMode.Task2 || trainingMode == TrainingMode.Combined)
-            && tfBatteryStation != null)
-        {
-            float distToBS = Vector3.Distance(tfAgent.localPosition, tfBatteryStation.localPosition);
-            if (IsRechargeUrgent() && !isCharging && prevDistToBS >= 0f)
-            {
-                float shaping = bsShapingK * (prevDistToBS - distToBS);
-                AddReward(shaping);
-                shapingTotal += shaping;
-            }
-            prevDistToBS = distToBS;
-        }
+
 
         // === Movement ===
         float moveX = actions.ContinuousActions[0];
@@ -582,11 +596,16 @@ public class SimpleTask1 : Agent
         {
             isInBatteryStation = true;
             BatteryStationReached();
-            // Penalize sitting in the station while not actively charging
+            // "Charge then leave": once charging stops (full/locked) further time
+            // in the station is loitering. Penalty escalates with consecutive idle
+            // steps this visit so the agent learns to depart promptly instead of
+            // camping on the BS — the incorrect behavior seen in earlier Task2
+            // runs. Escalation is capped to stay bounded.
             if (!isCharging)
             {
                 stationIdleSteps++;
-                AddReward(-0.005f);
+                idleStepsThisVisit++;
+                AddReward(-idlePenalty * Mathf.Min(idleStepsThisVisit, idleEscalCap));
             }
         }
     }
@@ -595,22 +614,22 @@ public class SimpleTask1 : Agent
     {
         if (collision.gameObject.tag.Equals("BatteryStation"))
         {
-            // Proportional reward on exit is partial credit for incomplete
-            // valid cycles only — complete cycles were already paid the bonus,
-            // and top-up cycles (started above threshold) earn nothing
+            // No partial exit reward: the only charge payout is the near-full
+            // bonus (paid in BatteryStationReached). Leaving a valid cycle
+            // early therefore earns nothing, which discourages "charge a
+            // little and leave" without an explicit penalty. Exits are only
+            // logged here for analysis.
             if (validChargeCycle &&
                 (trainingMode == TrainingMode.Task2 || trainingMode == TrainingMode.Combined))
             {
-                float chargeReward = Mathf.Clamp(battery - batteryAtChargeStart, 0f, 1f);
+                float chargeGain = Mathf.Clamp(battery - batteryAtChargeStart, 0f, 1f);
                 validChargeExits++;
-                totalChargeGained += chargeReward;
+                totalChargeGained += chargeGain;
                 maxChargeExitBattery = Mathf.Max(maxChargeExitBattery, battery);
                 if (battery >= 0.999f)
                     fullChargeCycles++;
-                chargeEventSummaries.Add($"{batteryAtChargeStart:F3}->{battery:F3}(+{chargeReward:F3})");
-                episodeEventTimeline.Add($"CH{validChargeExits}@{batteryAtChargeStart:F3}->{battery:F3}(+{chargeReward:F3})");
-                if (!rechargeBonusPaid)
-                    AddReward(chargeReward);
+                chargeEventSummaries.Add($"{batteryAtChargeStart:F3}->{battery:F3}(+{chargeGain:F3})");
+                episodeEventTimeline.Add($"CH{validChargeExits}@{batteryAtChargeStart:F3}->{battery:F3}(+{chargeGain:F3})");
             }
             else if (battery > batteryAtChargeStart + 0.005f && wasChargeCycleThisVisit &&
                      (trainingMode == TrainingMode.Task2 || trainingMode == TrainingMode.Combined))
@@ -621,9 +640,11 @@ public class SimpleTask1 : Agent
             }
             wasChargeCycleThisVisit = false;
             validChargeCycle = false;
+            chargingStateFrozen = false;
             isInBatteryStation = false;
             isCharging = false;
             rechargeLocked = false;
+            idleStepsThisVisit = 0;
         }
     }
 
@@ -724,51 +745,85 @@ public class SimpleTask1 : Agent
 
     private void BatteryStationReached()
     {
-        // Charging works at any battery level (so opportunistic top-ups are
-        // possible), but only cycles STARTED below the threshold are reward-
-        // eligible (validChargeCycle) — free top-ups pay nothing, so there is
-        // no farming surface. Lock prevents back-to-back cycles without
-        // leaving the station.
-        // 0.98 hysteresis: after topping out, drain must pull battery below
-        // 0.98 before another cycle can start, so camping in the station is
-        // mostly idle (penalized) rather than perpetually "charging"
+        // Charging works at any battery level (opportunistic top-ups stay
+        // possible — a smart agent passing the BS tops up to save a future
+        // trip). Reward eligibility (validChargeCycle) is gated on
+        // IsRechargeUrgent(): only a genuinely-needed charge earns the bonus.
+        // Camping is prevented not by blocking starts but by locking on full
+        // (below): once topped out, no restart until the agent leaves, so an
+        // idling agent pays the -0.005/step loiter penalty instead of
+        // oscillating 0.98->1.0 forever.
         if (!isCharging && !rechargeLocked && battery < 0.98f)
         {
             isCharging = true;
             wasChargeCycleThisVisit = true;
             batteryAtChargeStart = battery;
-            validChargeCycle = battery < rechargeThreshold;
-            rechargeBonusPaid = false;
-            if (validChargeCycle)
+            rechargePartialPaid = false;
+            rechargeFullPaid = false;
+            if (chargeRewardMode == "none")
             {
+                // No urgency gate — the policy learns WHEN to charge on its own.
+                // Every charge earns the proportional reward; farming/camping is
+                // prevented economically (kCharge*drainRate < step penalty) plus
+                // lock-on-full and the escalating station idle penalty, none of
+                // which encode when to charge.
+                validChargeCycle = true;
                 chargeCycleStarts++;
                 minChargeStartBattery = Mathf.Min(minChargeStartBattery, batteryAtChargeStart);
             }
+            else
+            {
+                validChargeCycle = IsRechargeUrgent();
+                if (validChargeCycle)
+                {
+                    chargingStateFrozen = true;   // commit the obs to "charging" for this cycle
+                    chargeCycleStarts++;
+                    minChargeStartBattery = Mathf.Min(minChargeStartBattery, batteryAtChargeStart);
+                }
+            }
         }
 
-        // Once charging, keep going until full (bonus paid immediately at
-        // rechargeBonusLevel; small proportional residual still paid on exit)
+        // Once charging, keep going until full.
+        //  - "none" (V3): pay kCharge * (battery actually added) every step —
+        //    dense, ungated, proportional. Charging-when-low is naturally worth
+        //    more; the policy learns timing from the gradient, not a threshold.
+        //  - "urgency" (V2): split bonus (small at 0.9, larger at full), valid
+        //    cycles only; top-up cycles earn nothing.
         if (isCharging)
         {
             chargingSteps++;
+            float batteryBefore = battery;
             battery = Mathf.Min(1.0f, battery + rechargeRatePerStep);
+            float added = battery - batteryBefore;
             chargeProgress = Mathf.InverseLerp(rechargeThreshold, 1.0f, battery);
 
-            // Recharge event: crossed the bonus level in a valid cycle
-            // (started below threshold) — top-up cycles earn nothing.
-            // Paid at the moment it happens for tight credit assignment.
-            if (validChargeCycle && !rechargeBonusPaid && battery >= rechargeBonusLevel)
+            if (chargeRewardMode == "none")
             {
-                rechargeBonusPaid = true;
-                rechargeLocked = true;
-                rechargeCount++;
-                AddReward(rechargeBonusReward);
+                AddReward(kCharge * added);
+            }
+            else if (validChargeCycle && !rechargePartialPaid && battery >= rechargeBonusLevel)
+            {
+                rechargePartialPaid = true;
+                AddReward(rechargePartialReward);
             }
 
             if (battery >= 1.0f)
             {
                 chargeProgress = 1.0f;
                 isCharging = false;
+                // Lock on full regardless of mode: kills the top-up
+                // oscillation (camping) loophole. No restart until exit.
+                rechargeLocked = true;
+                if (chargeRewardMode == "none")
+                {
+                    rechargeCount++;   // a completed full charge (already paid per-step)
+                }
+                else if (validChargeCycle && !rechargeFullPaid)
+                {
+                    rechargeFullPaid = true;
+                    rechargeCount++;
+                    AddReward(rechargeFullReward);
+                }
             }
         }
     }
@@ -803,7 +858,7 @@ public class SimpleTask1 : Agent
                     AddReward((maxTargetsToReach - ptReachCount) * -10f);
                 if (LearningBoard != null) LearningBoard.IncreaseTimeOut();
                 if(trainingMode == TrainingMode.Task1)
-                    AddReward(-10f);
+                    AddReward(-50f);
                 break;
 
             case "battery_dead":
@@ -854,9 +909,8 @@ public class SimpleTask1 : Agent
             {
                 eventsLog = $"END@{episodeSteps}({reason},b={battery:F3})";
             }
-            // Debug.Log($"[Battery] life={batteryLifeSteps}steps | atEnd={battery:F3} | recharges={rechargeCount} | reason={reason}");
 
-            string episodeEndLog = $"[{timestamp}] [EPISODE END] reason={reason} | mode={trainingMode} | totalSteps={episodeSteps} | reward={GetCumulativeReward():F1} | ptReaches={ptReachCount} | bonusRecharges={rechargeCount} | batteryAtEnd={battery:F3} | batteryAtStart={batteryAtStart:F3} | batteryLife={batteryLifeSteps}steps | ptRate={ptRate:F2} | firstPtStep={firstPtReachStep} | chargeStarts={chargeCycleStarts} | topUps={topUpCount} | chargeExits={validChargeExits} | fullCharges={fullChargeCycles} | chargeGained={chargeGainedLog} | minChargeStart={minChargeStartLog} | maxChargeExit={maxChargeExitLog} | chargingSteps={chargingSteps} | stationIdleSteps={stationIdleSteps} | shaping={shapingTotal:F2} | ptReachSteps=[{ptReachStepsLog}] | ptLegDists=[{ptLegDistsLog}] | chargeEvents={chargeEventsLog}";
+            string episodeEndLog = $"[{timestamp}] [EPISODE END] reason={reason} | mode={trainingMode} | totalSteps={episodeSteps} | reward={GetCumulativeReward():F1} | ptReaches={ptReachCount} | bonusRecharges={rechargeCount} | batteryAtEnd={battery:F3} | batteryAtStart={batteryAtStart:F3} | batteryLife={batteryLifeSteps}steps | ptRate={ptRate:F2} | firstPtStep={firstPtReachStep} | chargeStarts={chargeCycleStarts} | topUps={topUpCount} | chargeExits={validChargeExits} | fullCharges={fullChargeCycles} | chargeGained={chargeGainedLog} | minChargeStart={minChargeStartLog} | maxChargeExit={maxChargeExitLog} | chargingSteps={chargingSteps} | stationIdleSteps={stationIdleSteps} | ptReachSteps=[{ptReachStepsLog}] | ptLegDists=[{ptLegDistsLog}] | chargeEvents={chargeEventsLog}";
             LearningBoard.WriteEpisodeLog(episodeEndLog);
 
             string episodeStatsLog = $"[{timestamp}] [EPISODE STATS] ptVisits={ptReachCount} | bonusRecharges={rechargeCount} | steps={episodeSteps} | mode={trainingMode} | avgPtVisits={LearningBoard.AvgPtVisits:F2} | avgBonusRecharges={LearningBoard.AvgRecharges:F2} | eps={LearningBoard.TotalEpisodes}";
@@ -963,12 +1017,8 @@ public class SimpleTask1 : Agent
             Vector3 newTargetPosition = Vector3.zero;
             int attempt = 0;
 
-            while (!isPositionValid && attempt < 500)
+            while (!isPositionValid && attempt < 100)
             {
-                if (Vector3.Distance(newTargetPosition, tfBatteryStation.localPosition) < 50f)
-                {
-                    isPositionValid = false;
-                }
                 float randomX = Random.Range(-185f, 185f);
                 float randomZ = Random.Range(-185f, 185f);
                 float fixedY = targetTransform.localPosition.y;
@@ -984,9 +1034,7 @@ public class SimpleTask1 : Agent
                     }
                 }
                 attempt++;
-            }   
-
-
+            }
 
             if (isPositionValid)
             {
@@ -1014,7 +1062,7 @@ public class SimpleTask1 : Agent
         Vector3 newPos = Vector3.zero;
         int attempt = 0;
 
-        while (!isValid && attempt < 500)
+        while (!isValid && attempt < 300)
         {
             // Central box only: keeps worst-case agent->BS trip (corner to
             // far side of box ~506 units incl. detours) within the

@@ -111,19 +111,22 @@ def train_sae(acts: torch.Tensor, cfg: SAEConfig, verbose: bool = True
             print(f"  ep {ep + 1:3d}/{cfg.epochs} loss={ep_loss / nb:.4f} "
                   f"R2={ev:.4f} dead={int((ep_fire == 0).sum())}/{sae.dict_size}",
                   flush=True)
+        # stop resampling in the last few epochs so the dictionary can settle
         if (cfg.resample_every and (ep + 1) % cfg.resample_every == 0
-                and ep + 1 < cfg.epochs):
+                and ep + 1 < cfg.epochs - 3):
             _resample(sae, X, ep_fire, opt)
 
-    alive = (fire > 0)
     with torch.no_grad():
         xb = X.to(dev)
         xh, z = sae(xb)
+        final_fire = (z > 0).float().sum(0)          # steady-state firing
+        alive = final_fire > 0                        # alive at convergence
         metrics = {
             "r2": 1 - (xb - xh).pow(2).sum().item() / (
                 (xb - xb.mean(0)).pow(2).sum().item() + 1e-8),
             "l0": (z > 0).float().sum(-1).mean().item(),
-            "dead_frac": (~alive).float().mean().item(),
+            "dead_frac": (~alive).float().mean().item(),        # steady-state
+            "dead_cumulative": float((fire == 0).float().mean()),
         }
     return sae.cpu(), metrics, alive.cpu()
 
@@ -149,4 +152,15 @@ def _resample(sae: TopKSAE, X: torch.Tensor, fire: torch.Tensor,
     sae.encoder.bias[di] = 0.0
     sae.decoder.weight[:, di] = dirs.T
     sae._normalise_decoder()
+    # reset Adam state for resampled params (matches mecheeg SAETrainer): the
+    # stale exp_avg_sq of a long-dead feature decays toward 0, so without this
+    # the first post-reinit step size explodes and collapses the dictionary.
+    for p in (sae.encoder.weight, sae.encoder.bias,
+              sae.decoder.weight, sae.decoder.bias):
+        st = opt.state.get(p)
+        if st:
+            if "exp_avg" in st:
+                st["exp_avg"].zero_()
+            if "exp_avg_sq" in st:
+                st["exp_avg_sq"].zero_()
     return n_dead

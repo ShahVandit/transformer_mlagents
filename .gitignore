@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# IDE / tooling
+.vs/
+.vsconfig
+.agents/
+.claude/
+.mcp.json
+*.csproj
+*.sln
+
+# Unity generated
+Library/
+Temp/
+Obj/
+Build/
+Logs/
+UserSettings/
+
+# Large model / data binaries
+*.onnx
+*.pt
+scripts/models/

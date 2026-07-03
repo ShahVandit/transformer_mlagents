@@ -13,11 +13,15 @@ DEFAULT_LOG = os.path.join(os.path.dirname(__file__), "..", "results", "task1_v7
 
 args = sys.argv[1:]
 under_thresholds = []
+top_k = None
 filtered_args = []
 i = 0
 while i < len(args):
     if args[i] == "--under" and i + 1 < len(args):
         under_thresholds.append(int(args[i + 1]))
+        i += 2
+    elif args[i] == "--top-k" and i + 1 < len(args):
+        top_k = int(args[i + 1])
         i += 2
     else:
         filtered_args.append(args[i])
@@ -132,13 +136,20 @@ if denom_before_final > 0:
 print(SEP)
 print()
 
+analysis_steps = sorted(success_steps)
+if top_k is not None:
+    analysis_steps = analysis_steps[:top_k]
+    top_k_label = f"TOP-{top_k} fastest"
+else:
+    top_k_label = "all"
+
 print(SEP)
-print(f"  SUCCESS EPISODE ANALYSIS   ({log_path})")
+print(f"  SUCCESS EPISODE ANALYSIS   ({log_path})   [{top_k_label} episodes]")
 print(SEP)
 print(f"  {'Metric':<14}  {'n':>6}  {'avg':>7}  {'std':>7}  "
       f"{'min':>5}  {'p10':>5}  {'p25':>5}  {'p50':>5}  {'p75':>5}  {'p90':>5}  {'max':>5}")
 print("-" * 105)
-print_stats("Total steps", success_steps)
+print_stats("Total steps", analysis_steps)
 
 if pt_deltas:
     max_pts = max(len(d) for d in pt_deltas)
@@ -150,9 +161,8 @@ if pt_deltas:
         label = f"Start->PT{k+1}" if k == 0 else f"PT{k}->PT{k+1}"
         print_stats(label, vals)
 
-sorted_steps = sorted(success_steps)
-p10 = percentile(sorted_steps, 10)
-p50 = percentile(sorted_steps, 50)
+p10 = percentile(analysis_steps, 10)
+p50 = percentile(analysis_steps, 50)
 
 print()
 print(SEP)

@@ -35,36 +35,48 @@ ENV_EXE = r"config\drone_battery1.exe"
 RESULTS_DIR = os.path.join(PROJECT, "results")
 CAPTURE_DIR = os.path.join(RESULTS_DIR, "mech_interp", "captures")
 
+CAPTURE_FILE = "activations_combined.pt"   # combined+urgency capture (dim96 live)
 N_OBS = 300_000
 ALL_TOKENS = False           # last-token only; obs_window stores the full history
 CAPTURE_MAX_STEPS = 1_000_000
 BASE_PORT = 5010
 
-# Per-model env configs — each model captured in its own training mode.
+# Per-model env configs — each model captured in its OWN training mode, the
+# purest exercise of its task-specific subspace:
+#   * task1_v7 in Task1: pure navigation. Its dim-96/battery weights are untrained
+#     noise (trained with the gate off), so there is no real gate subspace to
+#     expose — capturing in Task1 (gate forced 0) loses nothing.
+#   * task2_v3 in Task2: full drain/recharge cycles, gate live. Same obs
+#     trajectory as Combined (frozen policy, lr=0) — only the terminal reward
+#     sign differs — so no under-exercising of low-battery states.
+# Own-mode is valid for both merges: CSM cascades each model on its own probe
+# (subspaces live in the 128-d output space); NAM correlates each model's
+# neurons with feature groups on its own activations (task1's dead battery/gate
+# columns correctly yield ~zero correlation).
 MODEL_CONFIGS = {
-    "task1_v7": {
-        "training_mode": "task1",         # nav only: battery drains to 0 but does NOT end episode
-        "max_steps": 10000,
-        "charge_reward_mode": "none",
-        "k_charge": 2.5,
-        "idle_penalty": 0.005,
-        "battery_drain_rate": "1/3000",
-        "recharge_rate": "1/100",
-        "initial_battery_min": 0.2,       # vary battery obs even if it doesn't drain
-        "initial_battery_max": 1.0,
-        "obstacle_penalty": 50,
-        "bs_spawn_range": 50,
-        "max_targets": 5,
-    },
+    # "task1_v8": {
+    #     "training_mode": "Task1",      # pure navigation (gate forced 0 — task1 ignores it)
+    #     "max_steps": 10000,
+    #     "charge_reward_mode": "urgency",  # no-op in Task1 mode (gate hard-zeroed); harmless
+    #     "k_charge": 2.5,
+    #     "idle_penalty": 0.005,
+    #     "battery_drain_rate": "1/3000",
+    #     "recharge_rate": "1/100",
+    #     "initial_battery_min": 0.4,       # sample low-battery urgency states
+    #     "initial_battery_max": 1.0,
+    #     "obstacle_penalty": 50,
+    #     "bs_spawn_range": 50,
+    #     "max_targets": 5,
+    # },
     "task2_v3": {
-        "training_mode": "task2",         # battery only: full drain/recharge cycles
+        "training_mode": "Task2",      # pure battery mgmt: full drain/recharge, gate live
         "max_steps": 10000,
-        "charge_reward_mode": "none",
+        "charge_reward_mode": "urgency",  # dim 96 = (frozen || IsRechargeUrgent), live for task2
         "k_charge": 2.5,
         "idle_penalty": 0.005,
         "battery_drain_rate": "1/3000",
         "recharge_rate": "1/100",
-        "initial_battery_min": 0.2,       # sample low-battery urgency states
+        "initial_battery_min": 0.4,       # sample low-battery urgency states
         "initial_battery_max": 1.0,
         "obstacle_penalty": 50,
         "bs_spawn_range": 50,
@@ -106,7 +118,7 @@ def write_capture_yaml(out_path):
 
 def capture_one(model, dry):
     run_id = f"{model}_capture"
-    out_path = os.path.join(CAPTURE_DIR, model, "activations.pt").replace("\\", "/")
+    out_path = os.path.join(CAPTURE_DIR, model, CAPTURE_FILE).replace("\\", "/")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cmd = [sys.executable, "-m", "mlagents.trainers.learn", CAPTURE_YAML,
            f"--run-id={run_id}", f"--initialize-from={model}", "--force",
@@ -153,14 +165,14 @@ def main():
     print(f"\n[CAPTURE COMPLETE] {len(models) - len(failures)}/{len(models)} ok"
           + (f"; failed: {failures}" if failures else ""))
     if not failures and not args.dry_run:
-        files = ",".join(os.path.join(CAPTURE_DIR, m, "activations.pt") for m in models)
+        files = ",".join(os.path.join(CAPTURE_DIR, m, CAPTURE_FILE) for m in models)
         print("\nNext — smoke test then diff:")
         print(f"  cd scripts\\mech_interp")
         print(f"  python smoke_test.py "
               f"--ckpt ..\\..\\results\\{models[0]}\\Drone\\checkpoint.pt "
-              f"--capture {os.path.join(CAPTURE_DIR, models[0], 'activations.pt')}")
+              f"--capture {os.path.join(CAPTURE_DIR, models[0], CAPTURE_FILE)}")
         print(f"  python run_crosscoder_diff.py "
-              f"--task1 ..\\..\\results\\task1_v7\\Drone\\checkpoint.pt "
+              f"--task1 ..\\..\\results\\task1_v8\\Drone\\checkpoint.pt "
               f"--task2 ..\\..\\results\\task2_v3\\Drone\\checkpoint.pt "
               f"--obs {files} "
               f"--layer encoding --dict-size 2048 --k 32 "
