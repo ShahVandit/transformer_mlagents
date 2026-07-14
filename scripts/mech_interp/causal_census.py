@@ -68,9 +68,13 @@ def main():
     ap.add_argument("--n-head", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=40_000)
     ap.add_argument("--repeats", type=int, default=2)
-    ap.add_argument("--n-placebo", type=int, default=8)
+    ap.add_argument("--n-placebo", type=int, default=20)
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-variance-match", action="store_true",
+                    help="legacy null: random placebo groups, not variance-matched")
+    ap.add_argument("--no-gbar-condition", action="store_true",
+                    help="legacy gbar: average action-gradient over all windows")
     ap.add_argument("--reuse", action="store_true",
                     help="load saved grams_<run>.pt when present instead of recomputing")
     args = ap.parse_args()
@@ -89,9 +93,11 @@ def main():
             ckpt = os.path.join(RESULTS, run, "Drone", "checkpoint.pt")
             backend = PatchableBackend(ckpt, n_head=args.n_head)
             print(f"\n[{run}] building causal grams ({backend})")
-            groups = make_groups(backend.obs_dim, args.n_placebo, seed=args.seed)
+            groups = make_groups(backend.obs_dim, args.n_placebo, seed=args.seed,
+                                 buf=None if args.no_variance_match else buf)
             g = build_causal_grams(backend, buf, groups, repeats=args.repeats,
                                    chunk=args.chunk, seed=args.seed,
+                                   gbar_condition=not args.no_gbar_condition,
                                    verbose=False)
             grams = g["grams"]
         all_grams[run] = grams

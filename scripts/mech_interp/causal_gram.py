@@ -26,10 +26,21 @@ resampling + placebo groups, resid_alignment_check's shared buffer.
 Known-answer check printed at the end: task1_base (pure nav) must show
 ~zero causal energy for the energy concept.
 
+v6.1 calibration upgrades (both on by default, disable with --no-* flags):
+  1. VARIANCE-MATCHED PLACEBOS (default 20 groups): placebo groups are chosen
+     so their injected input variance matches the concept's, instead of random
+     groups whose perturbations measured 2-8x larger (a false-negative bias)
+     with an ~8x group-to-group spread (a noisy null).
+  2. CONCEPT-CONDITIONED GBAR: each concept's action-gradient weights are
+     measured on that concept's behaviorally relevant windows (energy: urgency
+     gate on), so context-gated circuits are not diluted by windows where
+     their gradient to the action is ~0. Placebos share their concept's gbar.
+
 Usage
 -----
   python causal_gram.py --model task1_base
   python causal_gram.py --model task2_base_v2 --max-tokens 40000 --repeats 2
+  python causal_gram.py --model X --no-variance-match --no-gbar-condition  # legacy
 """
 
 from __future__ import annotations
@@ -55,6 +66,24 @@ OUT_DIR = os.environ.get(
     "MECH_GRAM_DIR",
     os.path.join(RESULTS, "mech_interp", "causal_grams"),
 )
+
+URGENCY_DIM = 96      # charging-urgency gate (last position of the window)
+
+# Concept-conditioned gbar: the action-gradient through a context-gated circuit
+# is ~0 on windows where the gate is off, so averaging gbar over the whole
+# buffer dilutes gated skills (energy fires on ~20% of combined-mode windows ->
+# ~5x understated) — a systematic false-negative source. Each concept's gbar is
+# therefore measured on the windows where that concept is behaviorally relevant;
+# a concept's placebo groups use the same filter (fair null). None = all windows.
+GBAR_FILTERS = {
+    "energy": lambda buf: buf[:, -1, URGENCY_DIM] > 0.5,
+    "PT":     None,
+}
+
+
+def concept_of(group_name: str) -> str:
+    """'energy' -> 'energy';  'plc_energy_3' -> 'energy'."""
+    return group_name if group_name in CONCEPTS else group_name.split("_")[1]
 
 
 def checkpoint_for_model(model: str) -> str:
@@ -171,17 +200,31 @@ def grad_colnorms(be: PatchableBackend, buf: torch.Tensor,
 def build_causal_grams(backend: PatchableBackend, buf: torch.Tensor,
                        groups: dict, repeats: int = 2, chunk: int = 2048,
                        grad_tokens: int = 4096, seed: int = 0,
-                       verbose: bool = True):
+                       gbar_condition: bool = True, verbose: bool = True):
     """groups = {name: [obs dims]} (concepts + placebos). Returns
-    {"grams": {linear: {group: C [d,d] float64}}, "gbar": ..., "specs": ...}."""
+    {"grams": {linear: {group: C [d,d] float64}}, "gbar": ..., "specs": ...}.
+    gbar_condition: measure each concept's action-gradient weights on that
+    concept's relevant windows (GBAR_FILTERS) instead of the whole buffer."""
     specs = linear_specs(backend)
     gen = torch.Generator().manual_seed(seed)
     dev = backend.device
 
-    gbar = grad_colnorms(backend, buf, n_tokens=grad_tokens, seed=seed)
-    if verbose:
-        print("[gbar] action-gradient channel norms per node: "
-              + "  ".join(f"{n}:{float(v.mean()):.2e}" for n, v in gbar.items()))
+    gbars = {}
+    for c in CONCEPTS:
+        filt = GBAR_FILTERS.get(c) if gbar_condition else None
+        sub = buf
+        if filt is not None:
+            mask = filt(buf)
+            if int(mask.sum()) >= 512:
+                sub = buf[mask]
+            elif verbose:
+                print(f"[gbar] {c}: only {int(mask.sum())} filtered windows; "
+                      f"falling back to full buffer")
+        gbars[c] = grad_colnorms(backend, sub, n_tokens=grad_tokens, seed=seed)
+        if verbose:
+            print(f"[gbar:{c}] windows={len(sub)}  channel norms per node: "
+                  + "  ".join(f"{n}:{float(v.mean()):.2e}"
+                              for n, v in gbars[c].items()))
 
     # donor permutations, one per (group, repeat) — deterministic given seed
     perms = {(g, r): torch.randperm(len(buf), generator=gen)
@@ -189,8 +232,9 @@ def build_causal_grams(backend: PatchableBackend, buf: torch.Tensor,
 
     W = {name: backend.w[wkey][osl] if osl is not None else backend.w[wkey]
          for name, _, wkey, _, osl in specs}          # already on device
-    gb = {name: (gbar[node][osl] if osl is not None else gbar[node]).to(dev)
-          for name, _, _, node, osl in specs}
+    gb = {c: {name: (gbars[c][node][osl] if osl is not None
+                     else gbars[c][node]).to(dev)
+              for name, _, _, node, osl in specs} for c in CONCEPTS}
 
     C = {name: {g: torch.zeros(W[name].shape[0], W[name].shape[0],
                                dtype=torch.float64)
@@ -208,10 +252,11 @@ def build_causal_grams(backend: PatchableBackend, buf: torch.Tensor,
                 donor = buf[perms[(gname, r)][s:s + chunk]]
                 ob_p[:, :, dims] = donor[:, :, dims]
                 caps_p = backend.forward(ob_p, capture=cap_bnds, full_seq=True)
+                gc = concept_of(gname)
                 for name, inb, _, _, _ in specs:
                     dX = ((ob_c - ob_p) if inb == "obs"
                           else (caps_c[inb] - caps_p[inb])).to(dev)
-                    dY = (dX @ W[name].T) * gb[name]
+                    dY = (dX @ W[name].T) * gb[gc][name]
                     dY = dY.reshape(-1, dY.shape[-1]).double()
                     C[name][gname] += (dY.T @ dY).cpu()
         n_rows += ob_c.shape[0] * backend.seq_len
@@ -222,18 +267,56 @@ def build_causal_grams(backend: PatchableBackend, buf: torch.Tensor,
     for name in C:
         for g in C[name]:
             C[name][g] /= norm
-    return {"grams": C, "gbar": {k: v.cpu() for k, v in gbar.items()},
+    return {"grams": C,
+            "gbar": {c: {k: v.cpu() for k, v in gbars[c].items()}
+                     for c in gbars},                 # per-concept since v6.1
+            "gbar_condition": gbar_condition,
             "specs": [(n, i, w, nd) for n, i, w, nd, _ in specs],
             "n_rows": n_rows, "repeats": repeats}
 
 
-def make_groups(obs_dim: int, n_placebo: int, seed: int = 0):
-    """Concepts + per-concept placebo groups (same size, non-concept dims)."""
+def make_groups(obs_dim: int, n_placebo: int, seed: int = 0,
+                buf: torch.Tensor | None = None, verbose: bool = True):
+    """Concepts + per-concept placebo groups (same size, non-concept dims).
+
+    With buf given, placebo groups are VARIANCE-MATCHED: a donor swap injects
+    2*sum(Var(dim)) of input variance, and unmatched random groups span an
+    ~8x spread (rays and high-variance counters vs near-constant dims), which
+    makes the rank-matched null both noisy and, on average, far stricter than
+    the concept's own perturbation (measured 2-8x larger -> false negatives).
+    Here we sample many candidate groups and keep the n_placebo whose injected
+    variance is closest to the concept's, so the null is calibrated."""
     groups = dict(CONCEPTS)
-    for c in CONCEPTS:
-        for j, grp in enumerate(placebo_groups(obs_dim, len(CONCEPTS[c]),
-                                               n_placebo, seed=seed)):
-            groups[f"plc_{c}_{j}"] = grp
+    if buf is None:                                   # legacy unmatched null
+        for c in CONCEPTS:
+            for j, grp in enumerate(placebo_groups(obs_dim, len(CONCEPTS[c]),
+                                                   n_placebo, seed=seed)):
+                groups[f"plc_{c}_{j}"] = grp
+        return groups
+
+    var = buf.reshape(-1, obs_dim).float().var(dim=0)
+    concept_dims = sorted({d for v in CONCEPTS.values() for d in v})
+    pool = [i for i in range(obs_dim)
+            if i not in concept_dims and float(var[i]) > 1e-8]
+    g = torch.Generator().manual_seed(seed)
+    for c, dims in CONCEPTS.items():
+        target = float(var[dims].sum())
+        cands = {}
+        for _ in range(max(500, 50 * n_placebo)):
+            grp = tuple(sorted(torch.tensor(pool)[
+                torch.randperm(len(pool), generator=g)[:len(dims)]].tolist()))
+            if grp not in cands:
+                inj = float(var[list(grp)].sum())
+                cands[grp] = abs(torch.log(torch.tensor(inj / target)).item())
+        best = sorted(cands.items(), key=lambda kv: kv[1])[:n_placebo]
+        ratios = []
+        for j, (grp, _) in enumerate(best):
+            groups[f"plc_{c}_{j}"] = list(grp)
+            ratios.append(float(var[list(grp)].sum()) / target)
+        if verbose:
+            print(f"[placebo] {c}: {len(best)} variance-matched groups, "
+                  f"injected-variance ratio to concept "
+                  f"{min(ratios):.2f}-{max(ratios):.2f}")
     return groups
 
 
@@ -250,10 +333,14 @@ def main():
     ap.add_argument("--n-head", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=40_000)
     ap.add_argument("--repeats", type=int, default=2)
-    ap.add_argument("--n-placebo", type=int, default=8)
+    ap.add_argument("--n-placebo", type=int, default=20)
     ap.add_argument("--grad-tokens", type=int, default=4096)
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-variance-match", action="store_true",
+                    help="legacy null: random placebo groups, not variance-matched")
+    ap.add_argument("--no-gbar-condition", action="store_true",
+                    help="legacy gbar: average action-gradient over all windows")
     args = ap.parse_args()
 
     ckpt = checkpoint_for_model(args.model)
@@ -264,10 +351,12 @@ def main():
     print(f"[buffer] {tuple(buf.shape)}  concepts={list(CONCEPTS)}  "
           f"placebo={args.n_placebo}/concept  repeats={args.repeats}")
 
-    groups = make_groups(backend.obs_dim, args.n_placebo, seed=args.seed)
+    groups = make_groups(backend.obs_dim, args.n_placebo, seed=args.seed,
+                         buf=None if args.no_variance_match else buf)
     out = build_causal_grams(backend, buf, groups, repeats=args.repeats,
                              chunk=args.chunk, grad_tokens=args.grad_tokens,
-                             seed=args.seed)
+                             seed=args.seed,
+                             gbar_condition=not args.no_gbar_condition)
     out.update({"model": args.model, "concepts": CONCEPTS, "groups": groups,
                 "buffer_models": args.buffer_models,
                 "max_tokens": args.max_tokens, "seed": args.seed})
