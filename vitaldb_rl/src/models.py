@@ -71,14 +71,24 @@ class MomentEncoder(nn.Module):
         self.out_dim = hidden * 2
 
     def _pad_or_crop(self, seq):
-        # seq: [B, T, C] -> [B, C, target_len]
-        x = seq.transpose(1, 2)
+        # seq: [B, T, values+masks+pad_flag]. MOMENT should see only values.
+        n_value_channels = (seq.shape[2] - 1) // 2
+        values = seq[:, :, :n_value_channels]
+        missing = seq[:, :, n_value_channels: n_value_channels * 2]
+        observed = 1.0 - missing.max(dim=2).values
+        observed = observed * (1.0 - seq[:, :, -1])
+
+        x = values.transpose(1, 2)
+        mask = observed
         length = x.shape[-1]
         if length < self.target_len:
-            x = F.pad(x, (self.target_len - length, 0))
+            pad = self.target_len - length
+            x = F.pad(x, (pad, 0))
+            mask = F.pad(mask, (pad, 0))
         elif length > self.target_len:
             x = x[..., -self.target_len:]
-        return x
+            mask = mask[..., -self.target_len:]
+        return x, mask
 
     @staticmethod
     def _extract_embedding(out):
@@ -97,8 +107,12 @@ class MomentEncoder(nn.Module):
         return emb
 
     def forward(self, seq, static):
-        x = self._pad_or_crop(seq)
-        out = self.moment(x_enc=x)
+        x, input_mask = self._pad_or_crop(seq)
+        if not any(p.requires_grad for p in self.moment.parameters()):
+            with torch.no_grad():
+                out = self.moment(x_enc=x, input_mask=input_mask)
+        else:
+            out = self.moment(x_enc=x, input_mask=input_mask)
         emb = self._extract_embedding(out)
         return torch.cat([self.proj(emb), self.static(static)], dim=1)
 
@@ -166,11 +180,16 @@ def _dims(data: dict[str, np.ndarray]) -> tuple[int, int]:
     return int(data["seq"].shape[2]), int(data["static"].shape[1])
 
 
+def _predict_batch_size(model: nn.Module, batch_size: int) -> int:
+    uses_moment = getattr(model, "encoder_name", None) == "moment"
+    return min(batch_size, 32) if uses_moment else batch_size
+
+
 def predict_logits(model: nn.Module, data: dict[str, np.ndarray], batch_size: int = 8192) -> np.ndarray:
     model.eval()
     outs = []
     with torch.no_grad():
-        for seq, static in _loader(data, ["seq", "static"], batch_size, shuffle=False):
+        for seq, static in _loader(data, ["seq", "static"], _predict_batch_size(model, batch_size), shuffle=False):
             outs.append(model(seq.to(DEVICE), static.to(DEVICE)).cpu().numpy())
     return np.concatenate(outs) if outs else np.empty((0, N_ACTIONS))
 
