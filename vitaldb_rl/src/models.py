@@ -1,4 +1,4 @@
-"""PyTorch behavior cloning, CQL-DQN, and FQE models."""
+"""PyTorch behavior cloning, CQL-DQN, FQE, and optional MOMENT encoders."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,10 +27,110 @@ class GRUEncoder(nn.Module):
         return torch.cat([h, s], dim=1)
 
 
-class PolicyNet(nn.Module):
-    def __init__(self, seq_dim: int, static_dim: int, hidden: int = 96, n_actions: int = N_ACTIONS):
+class MomentEncoder(nn.Module):
+    """Frozen MOMENT embedding encoder with a static-feature branch.
+
+    MOMENT is optional because it requires the external `momentfm` package and
+    downloads Hugging Face weights. The time-series input is [B, T, C]; MOMENT
+    expects [B, C, T]. We pad short VitalDB windows to 512 samples because the
+    pretrained checkpoints are patch-based and commonly configured for longer
+    contexts than our 30-minute windows.
+    """
+
+    def __init__(
+        self,
+        seq_dim: int,
+        static_dim: int,
+        hidden: int = 96,
+        model_name: str = "AutonLab/MOMENT-1-small",
+        target_len: int = 512,
+        freeze: bool = True,
+    ):
         super().__init__()
-        self.encoder = GRUEncoder(seq_dim, static_dim, hidden)
+        try:
+            from momentfm import MOMENTPipeline
+        except ImportError as exc:
+            raise ImportError(
+                "MOMENT encoder requested but `momentfm` is not installed. "
+                "Install with `pip install -r requirements-moment.txt`."
+            ) from exc
+
+        self.target_len = target_len
+        self.moment = MOMENTPipeline.from_pretrained(
+            model_name,
+            model_kwargs={"task_name": "embedding"},
+        )
+        self.moment.init()
+        if freeze:
+            for p in self.moment.parameters():
+                p.requires_grad = False
+            self.moment.eval()
+
+        self.static = nn.Sequential(nn.Linear(static_dim, hidden), nn.ReLU())
+        self.proj = nn.LazyLinear(hidden)
+        self.out_dim = hidden * 2
+
+    def _pad_or_crop(self, seq):
+        # seq: [B, T, C] -> [B, C, target_len]
+        x = seq.transpose(1, 2)
+        length = x.shape[-1]
+        if length < self.target_len:
+            x = F.pad(x, (self.target_len - length, 0))
+        elif length > self.target_len:
+            x = x[..., -self.target_len:]
+        return x
+
+    @staticmethod
+    def _extract_embedding(out):
+        if torch.is_tensor(out):
+            emb = out
+        elif hasattr(out, "embeddings"):
+            emb = out.embeddings
+        elif hasattr(out, "embedding"):
+            emb = out.embedding
+        elif isinstance(out, dict):
+            emb = out.get("embeddings", out.get("embedding"))
+        else:
+            raise TypeError(f"Unsupported MOMENT output type: {type(out)!r}")
+        if emb.ndim > 2:
+            emb = emb.mean(dim=tuple(range(1, emb.ndim - 1)))
+        return emb
+
+    def forward(self, seq, static):
+        x = self._pad_or_crop(seq)
+        out = self.moment(x_enc=x)
+        emb = self._extract_embedding(out)
+        return torch.cat([self.proj(emb), self.static(static)], dim=1)
+
+
+def make_encoder(
+    encoder: str,
+    seq_dim: int,
+    static_dim: int,
+    hidden: int = 96,
+    moment_model: str = "AutonLab/MOMENT-1-small",
+) -> nn.Module:
+    if encoder == "gru":
+        return GRUEncoder(seq_dim, static_dim, hidden)
+    if encoder == "moment":
+        return MomentEncoder(seq_dim, static_dim, hidden, model_name=moment_model)
+    raise ValueError(f"unknown encoder: {encoder}")
+
+
+class PolicyNet(nn.Module):
+    def __init__(
+        self,
+        seq_dim: int,
+        static_dim: int,
+        hidden: int = 96,
+        n_actions: int = N_ACTIONS,
+        encoder: str = "gru",
+        moment_model: str = "AutonLab/MOMENT-1-small",
+    ):
+        super().__init__()
+        self.encoder_name = encoder
+        self.moment_model = moment_model
+        self.encoder = make_encoder(encoder, seq_dim, static_dim, hidden, moment_model)
         self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden), nn.ReLU(), nn.Linear(hidden, n_actions))
 
     def forward(self, seq, static):
@@ -38,9 +138,19 @@ class PolicyNet(nn.Module):
 
 
 class QNet(nn.Module):
-    def __init__(self, seq_dim: int, static_dim: int, hidden: int = 96, n_actions: int = N_ACTIONS):
+    def __init__(
+        self,
+        seq_dim: int,
+        static_dim: int,
+        hidden: int = 96,
+        n_actions: int = N_ACTIONS,
+        encoder: str = "gru",
+        moment_model: str = "AutonLab/MOMENT-1-small",
+    ):
         super().__init__()
-        self.encoder = GRUEncoder(seq_dim, static_dim, hidden)
+        self.encoder_name = encoder
+        self.moment_model = moment_model
+        self.encoder = make_encoder(encoder, seq_dim, static_dim, hidden, moment_model)
         self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden), nn.ReLU(), nn.Linear(hidden, n_actions))
 
     def forward(self, seq, static):
@@ -83,10 +193,12 @@ def train_bc(
     batch_size: int = 1024,
     lr: float = 1e-3,
     seed: int = 0,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
 ) -> tuple[PolicyNet, dict[str, float]]:
     torch.manual_seed(seed)
     seq_dim, static_dim = _dims(train)
-    model = PolicyNet(seq_dim, static_dim).to(DEVICE)
+    model = PolicyNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr)
     best, best_state = -1.0, None
 
@@ -128,11 +240,13 @@ def train_cql(
     gamma: float = 0.99,
     cql_alpha: float = 0.5,
     seed: int = 0,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
 ) -> tuple[QNet, dict[str, float]]:
     torch.manual_seed(seed)
     seq_dim, static_dim = _dims(train)
-    q = QNet(seq_dim, static_dim).to(DEVICE)
-    target = QNet(seq_dim, static_dim).to(DEVICE)
+    q = QNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model).to(DEVICE)
+    target = QNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model).to(DEVICE)
     target.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr)
 
@@ -187,11 +301,13 @@ def train_fqe(
     lr: float = 3e-4,
     gamma: float = 0.99,
     seed: int = 0,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
 ) -> QNet:
     torch.manual_seed(seed)
     seq_dim, static_dim = _dims(train)
-    q = QNet(seq_dim, static_dim).to(DEVICE)
-    target = QNet(seq_dim, static_dim).to(DEVICE)
+    q = QNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model).to(DEVICE)
+    target = QNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model).to(DEVICE)
     target.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr)
     train_local = dict(train)
@@ -247,9 +363,22 @@ def save_model(path: Path, model: nn.Module, kind: str, extra: dict | None = Non
     torch.save({"kind": kind, "state_dict": model.state_dict(), "extra": extra or {}}, path)
 
 
-def load_model(path: Path, kind: str, seq_dim: int, static_dim: int) -> nn.Module:
+def load_model(
+    path: Path,
+    kind: str,
+    seq_dim: int,
+    static_dim: int,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
+) -> nn.Module:
     payload = torch.load(path, map_location=DEVICE)
-    model = PolicyNet(seq_dim, static_dim) if kind == "bc" else QNet(seq_dim, static_dim)
+    extra = payload.get("extra", {})
+    encoder = extra.get("encoder", encoder)
+    moment_model = extra.get("moment_model", moment_model)
+    model = (
+        PolicyNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model)
+        if kind == "bc"
+        else QNet(seq_dim, static_dim, encoder=encoder, moment_model=moment_model)
+    )
     model.load_state_dict(payload["state_dict"])
     return model.to(DEVICE)
-

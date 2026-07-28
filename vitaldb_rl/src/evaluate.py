@@ -68,6 +68,8 @@ def evaluate_policy_rows(
     bc_model,
     policies: list[tuple[str, tuple[float, float, float], object, str]],
     fqe_epochs: int,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
 ) -> pd.DataFrame:
     rows = []
     bc_probs = models.policy_probs(bc_model, test)
@@ -77,7 +79,10 @@ def evaluate_policy_rows(
         "work_value": (0.0, 0.0, 1.0),
     }
     for name, weights, policy, ptype in policies:
-        scalar_fqe = models.train_fqe(train, weights, policy, ptype, epochs=fqe_epochs)
+        scalar_fqe = models.train_fqe(
+            train, weights, policy, ptype, epochs=fqe_epochs,
+            encoder=encoder, moment_model=moment_model,
+        )
         row = {
             "policy": name,
             "w_map": weights[0],
@@ -86,7 +91,10 @@ def evaluate_policy_rows(
             "fqe_scalar_value": models.fqe_value(scalar_fqe, test, policy, ptype),
         }
         for metric, cw in component_weights.items():
-            fqe = models.train_fqe(train, cw, policy, ptype, epochs=fqe_epochs)
+            fqe = models.train_fqe(
+                train, cw, policy, ptype, epochs=fqe_epochs,
+                encoder=encoder, moment_model=moment_model,
+            )
             row[metric] = models.fqe_value(fqe, test, policy, ptype)
         if ptype == "bc":
             acts = models.greedy_actions(policy, test)
@@ -114,4 +122,3 @@ def plot_pareto(df: pd.DataFrame, out: Path) -> None:
     plt.tight_layout()
     plt.savefig(out, dpi=160)
     plt.close()
-

@@ -26,6 +26,10 @@ def main() -> None:
     show_csv("cql_metrics.csv")
     show_csv("pareto_frontier.csv")
     show_csv("action_support.csv")
+    show_csv("pareto_frontier_gru.csv")
+    show_csv("action_support_gru.csv")
+    show_csv("pareto_frontier_moment.csv")
+    show_csv("action_support_moment.csv")
     plot = RESULTS / "pareto_frontier.png"
     if plot.exists():
         print(f"\nplot: {plot}")
@@ -33,4 +37,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

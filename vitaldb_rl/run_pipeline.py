@@ -72,19 +72,43 @@ def run_diagnostics() -> None:
 def run_bc(args):
     ensure_data_exists()
     train, val = load_split("train"), load_split("val")
-    model, metrics = models.train_bc(train, val, epochs=args.bc_epochs, batch_size=args.batch_size)
+    model, metrics = models.train_bc(
+        train,
+        val,
+        epochs=args.bc_epochs,
+        batch_size=args.batch_size,
+        encoder=args.encoder,
+        moment_model=args.moment_model,
+    )
     save_metrics(RESULTS / "bc_metrics.csv", metrics)
     seq_dim, static_dim = train["seq"].shape[2], train["static"].shape[1]
-    models.save_model(RESULTS / "bc_model.pt", model, "bc", {"seq_dim": int(seq_dim), "static_dim": int(static_dim)})
+    models.save_model(
+        RESULTS / f"bc_model_{args.encoder}.pt",
+        model,
+        "bc",
+        {
+            "seq_dim": int(seq_dim),
+            "static_dim": int(static_dim),
+            "encoder": args.encoder,
+            "moment_model": args.moment_model,
+        },
+    )
     print("[bc]", metrics)
     return model
 
 
 def load_or_train_bc(args):
     train = load_split("train")
-    path = RESULTS / "bc_model.pt"
+    path = RESULTS / f"bc_model_{args.encoder}.pt"
     if path.exists():
-        return models.load_model(path, "bc", train["seq"].shape[2], train["static"].shape[1])
+        return models.load_model(
+            path,
+            "bc",
+            train["seq"].shape[2],
+            train["static"].shape[1],
+            encoder=args.encoder,
+            moment_model=args.moment_model,
+        )
     return run_bc(args)
 
 
@@ -100,12 +124,19 @@ def run_cql(args):
             epochs=args.cql_epochs,
             batch_size=args.batch_size,
             cql_alpha=args.cql_alpha,
+            encoder=args.encoder,
+            moment_model=args.moment_model,
         )
-        name = f"cql_w{i}"
+        name = f"cql_{args.encoder}_w{i}"
         row = {"policy": name, "w_map": weights[0], "w_bis": weights[1], "w_work": weights[2]}
         row.update(metrics)
         rows.append(row)
-        models.save_model(RESULTS / f"{name}.pt", q, "q", {"weights": weights})
+        models.save_model(
+            RESULTS / f"{name}.pt",
+            q,
+            "q",
+            {"weights": weights, "encoder": args.encoder, "moment_model": args.moment_model},
+        )
         print("[cql]", row)
     pd.DataFrame(rows).to_csv(RESULTS / "cql_metrics.csv", index=False)
 
@@ -116,17 +147,32 @@ def run_evaluate(args):
     bc = load_or_train_bc(args)
     policies = [("bc", (0.45, 0.45, 0.10), bc, "bc")]
     for i, weights in enumerate(WEIGHT_GRID):
-        path = RESULTS / f"cql_w{i}.pt"
+        path = RESULTS / f"cql_{args.encoder}_w{i}.pt"
         if not path.exists():
             raise FileNotFoundError(f"missing {path}; run --stage cql first")
-        q = models.load_model(path, "q", train["seq"].shape[2], train["static"].shape[1])
-        policies.append((f"cql_w{i}", weights, q, "q"))
+        q = models.load_model(
+            path,
+            "q",
+            train["seq"].shape[2],
+            train["static"].shape[1],
+            encoder=args.encoder,
+            moment_model=args.moment_model,
+        )
+        policies.append((f"cql_{args.encoder}_w{i}", weights, q, "q"))
 
-    rows = evaluate.evaluate_policy_rows(train, test, bc, policies, fqe_epochs=args.fqe_epochs)
-    rows.to_csv(RESULTS / "pareto_frontier.csv", index=False)
+    rows = evaluate.evaluate_policy_rows(
+        train,
+        test,
+        bc,
+        policies,
+        fqe_epochs=args.fqe_epochs,
+        encoder=args.encoder,
+        moment_model=args.moment_model,
+    )
+    rows.to_csv(RESULTS / f"pareto_frontier_{args.encoder}.csv", index=False)
     support_cols = ["policy", "action_match_logged", "support_prob_mean", "support_prob_p10", "support_frac_ge_0p05"]
-    rows[support_cols].to_csv(RESULTS / "action_support.csv", index=False)
-    evaluate.plot_pareto(rows, RESULTS / "pareto_frontier.png")
+    rows[support_cols].to_csv(RESULTS / f"action_support_{args.encoder}.csv", index=False)
+    evaluate.plot_pareto(rows, RESULTS / f"pareto_frontier_{args.encoder}.png")
     print(rows.round(4).to_string(index=False))
 
 
@@ -144,6 +190,8 @@ def main() -> None:
     ap.add_argument("--fqe-epochs", type=int, default=15)
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--cql-alpha", type=float, default=0.5)
+    ap.add_argument("--encoder", choices=["gru", "moment"], default="gru")
+    ap.add_argument("--moment-model", default="AutonLab/MOMENT-1-small")
     args = ap.parse_args()
 
     if args.stage in ("data", "all"):
@@ -160,4 +208,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

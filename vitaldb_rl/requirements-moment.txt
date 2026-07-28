@@ -1,0 +1,4 @@
+momentfm>=0.1.4
+transformers>=4.36
+accelerate>=0.25
+
