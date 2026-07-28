@@ -22,6 +22,8 @@ ACTION_LABELS = {
     8: "ppf_inc+rftn_inc",
 }
 
+DEFAULT_SELECTION_WEIGHTS = (0.45, 0.45, 0.10)
+
 
 def action_distribution(data: dict[str, np.ndarray]) -> pd.DataFrame:
     counts = np.bincount(data["action"], minlength=9)
@@ -43,6 +45,19 @@ def support_metrics(policy_actions: np.ndarray, bc_probs: np.ndarray, logged_act
         "support_prob_mean": float(np.mean(chosen_prob)),
         "support_prob_p10": float(np.percentile(chosen_prob, 10)),
         "support_frac_ge_0p05": float(np.mean(chosen_prob >= 0.05)),
+    }
+
+
+def observed_value(data: dict[str, np.ndarray], weights: tuple[float, float, float]) -> dict[str, float]:
+    """Direct logged clinician value under observed clinician actions."""
+    rewards = data["reward_components"]
+    scalar = rewards @ np.asarray(weights, dtype=np.float32)
+    return {
+        "observed_scalar_value": float(np.mean(scalar)),
+        "observed_map_value": float(np.mean(rewards[:, 0])),
+        "observed_bis_value": float(np.mean(rewards[:, 1])),
+        "observed_work_value": float(np.mean(rewards[:, 2])),
+        "n_transitions": int(len(scalar)),
     }
 
 
@@ -107,6 +122,68 @@ def evaluate_policy_rows(
     for i, row in enumerate(rows):
         row["pareto"] = i in nd
     return pd.DataFrame(rows)
+
+
+def policy_row(
+    train: dict[str, np.ndarray],
+    eval_data: dict[str, np.ndarray],
+    bc_model,
+    name: str,
+    weights: tuple[float, float, float],
+    policy,
+    ptype: str,
+    fqe_epochs: int,
+    encoder: str = "gru",
+    moment_model: str = "AutonLab/MOMENT-1-small",
+) -> dict:
+    scalar_fqe = models.train_fqe(
+        train, weights, policy, ptype, epochs=fqe_epochs,
+        encoder=encoder, moment_model=moment_model,
+    )
+    row = {
+        "policy": name,
+        "w_map": weights[0],
+        "w_bis": weights[1],
+        "w_work": weights[2],
+        "fqe_scalar_value": models.fqe_value(scalar_fqe, eval_data, policy, ptype),
+    }
+    for metric, cw in {
+        "fqe_map_value": (1.0, 0.0, 0.0),
+        "fqe_bis_value": (0.0, 1.0, 0.0),
+        "fqe_work_value": (0.0, 0.0, 1.0),
+    }.items():
+        fqe = models.train_fqe(
+            train, cw, policy, ptype, epochs=fqe_epochs,
+            encoder=encoder, moment_model=moment_model,
+        )
+        row[metric] = models.fqe_value(fqe, eval_data, policy, ptype)
+    acts = models.greedy_actions(policy, eval_data)
+    bc_probs = models.policy_probs(bc_model, eval_data)
+    row.update(support_metrics(acts, bc_probs, eval_data["action"]))
+    row["pred_hold_hold_frac"] = float(np.mean(acts == 4))
+    return row
+
+
+def select_policy(
+    rows: pd.DataFrame,
+    support_prob_p10_min: float = 0.01,
+    support_frac_ge_0p05_min: float = 0.50,
+    action_match_min: float = 0.45,
+    max_hold_frac: float = 0.95,
+) -> pd.DataFrame:
+    out = rows.copy()
+    out["feasible"] = (
+        (out["support_prob_p10"] >= support_prob_p10_min)
+        & (out["support_frac_ge_0p05"] >= support_frac_ge_0p05_min)
+        & (out["action_match_logged"] >= action_match_min)
+        & (out["pred_hold_hold_frac"] <= max_hold_frac)
+    )
+    out["selected"] = False
+    feasible = out.index[out["feasible"]].tolist()
+    if feasible:
+        chosen = out.loc[feasible, "fqe_scalar_value"].idxmax()
+        out.loc[chosen, "selected"] = True
+    return out
 
 
 def plot_pareto(df: pd.DataFrame, out: Path) -> None:

@@ -141,11 +141,8 @@ def run_cql(args):
     pd.DataFrame(rows).to_csv(RESULTS / "cql_metrics.csv", index=False)
 
 
-def run_evaluate(args):
-    ensure_data_exists()
-    train, test = load_split("train"), load_split("test")
-    bc = load_or_train_bc(args)
-    policies = [("bc", (0.45, 0.45, 0.10), bc, "bc")]
+def load_cql_policies(args, train):
+    policies = []
     for i, weights in enumerate(WEIGHT_GRID):
         path = RESULTS / f"cql_{args.encoder}_w{i}.pt"
         if not path.exists():
@@ -159,26 +156,103 @@ def run_evaluate(args):
             moment_model=args.moment_model,
         )
         policies.append((f"cql_{args.encoder}_w{i}", weights, q, "q"))
+    return policies
 
-    rows = evaluate.evaluate_policy_rows(
-        train,
-        test,
-        bc,
-        policies,
-        fqe_epochs=args.fqe_epochs,
-        encoder=args.encoder,
-        moment_model=args.moment_model,
+
+def run_select(args):
+    ensure_data_exists()
+    train, val = load_split("train"), load_split("val")
+    bc = load_or_train_bc(args)
+    rows = [
+        evaluate.policy_row(
+            train,
+            val,
+            bc,
+            "bc",
+            evaluate.DEFAULT_SELECTION_WEIGHTS,
+            bc,
+            "bc",
+            args.fqe_epochs,
+            encoder=args.encoder,
+            moment_model=args.moment_model,
+        )
+    ]
+    for name, weights, q, ptype in load_cql_policies(args, train):
+        rows.append(
+            evaluate.policy_row(
+                train,
+                val,
+                bc,
+                name,
+                weights,
+                q,
+                ptype,
+                args.fqe_epochs,
+                encoder=args.encoder,
+                moment_model=args.moment_model,
+            )
+        )
+    selected = evaluate.select_policy(
+        pd.DataFrame(rows),
+        support_prob_p10_min=args.support_prob_p10_min,
+        support_frac_ge_0p05_min=args.support_frac_ge_0p05_min,
+        action_match_min=args.action_match_min,
+        max_hold_frac=args.max_hold_frac,
     )
-    rows.to_csv(RESULTS / f"pareto_frontier_{args.encoder}.csv", index=False)
+    selected["split"] = "val"
+    for k, v in evaluate.observed_value(val, evaluate.DEFAULT_SELECTION_WEIGHTS).items():
+        selected[f"clinician_{k}"] = v
+    selected.to_csv(RESULTS / f"policy_selection_{args.encoder}.csv", index=False)
+    print(selected.round(4).to_string(index=False))
+
+
+def run_evaluate(args):
+    ensure_data_exists()
+    train, test = load_split("train"), load_split("test")
+    bc = load_or_train_bc(args)
+    selection_path = RESULTS / f"policy_selection_{args.encoder}.csv"
+    if not selection_path.exists():
+        raise FileNotFoundError(f"missing {selection_path}; run --stage select first")
+    selection = pd.read_csv(selection_path)
+    selected_names = selection.loc[
+        (selection["selected"] == True) & (selection["policy"] != "bc"), "policy"
+    ].tolist()
+    policies = [("bc", evaluate.DEFAULT_SELECTION_WEIGHTS, bc, "bc")]
+    for policy in load_cql_policies(args, train):
+        if policy[0] in selected_names:
+            policies.append(policy)
+    if len(policies) == 1:
+        print("[warn] no feasible selected CQL policy; final report includes BC only")
+
+    rows = pd.DataFrame(
+        [
+            evaluate.policy_row(
+                train,
+                test,
+                bc,
+                name,
+                weights,
+                policy,
+                ptype,
+                args.fqe_epochs,
+                encoder=args.encoder,
+                moment_model=args.moment_model,
+            )
+            for name, weights, policy, ptype in policies
+        ]
+    )
+    rows["split"] = "test"
+    for k, v in evaluate.observed_value(test, evaluate.DEFAULT_SELECTION_WEIGHTS).items():
+        rows[f"clinician_{k}"] = v
+    rows.to_csv(RESULTS / f"final_test_report_{args.encoder}.csv", index=False)
     support_cols = ["policy", "action_match_logged", "support_prob_mean", "support_prob_p10", "support_frac_ge_0p05"]
     rows[support_cols].to_csv(RESULTS / f"action_support_{args.encoder}.csv", index=False)
-    evaluate.plot_pareto(rows, RESULTS / f"pareto_frontier_{args.encoder}.png")
     print(rows.round(4).to_string(index=False))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["data", "diagnostics", "bc", "cql", "evaluate", "all"], default="all")
+    ap.add_argument("--stage", choices=["data", "diagnostics", "bc", "cql", "select", "evaluate", "all"], default="all")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--refresh", action="store_true")
@@ -192,6 +266,10 @@ def main() -> None:
     ap.add_argument("--cql-alpha", type=float, default=0.5)
     ap.add_argument("--encoder", choices=["gru", "transformer", "moment"], default="gru")
     ap.add_argument("--moment-model", default="AutonLab/MOMENT-1-small")
+    ap.add_argument("--support-prob-p10-min", type=float, default=0.01)
+    ap.add_argument("--support-frac-ge-0p05-min", type=float, default=0.50)
+    ap.add_argument("--action-match-min", type=float, default=0.45)
+    ap.add_argument("--max-hold-frac", type=float, default=0.95)
     args = ap.parse_args()
 
     if args.stage in ("data", "all"):
@@ -202,6 +280,8 @@ def main() -> None:
         run_bc(args)
     if args.stage in ("cql", "all"):
         run_cql(args)
+    if args.stage in ("select", "all"):
+        run_select(args)
     if args.stage in ("evaluate", "all"):
         run_evaluate(args)
 

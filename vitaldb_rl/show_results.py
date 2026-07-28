@@ -30,6 +30,12 @@ def main() -> None:
     show_csv("action_support_gru.csv")
     show_csv("pareto_frontier_moment.csv")
     show_csv("action_support_moment.csv")
+    show_csv("policy_selection_transformer.csv")
+    show_csv("final_test_report_transformer.csv")
+    show_csv("policy_selection_gru.csv")
+    show_csv("final_test_report_gru.csv")
+    show_csv("policy_selection_moment.csv")
+    show_csv("final_test_report_moment.csv")
     plot = RESULTS / "pareto_frontier.png"
     if plot.exists():
         print(f"\nplot: {plot}")
