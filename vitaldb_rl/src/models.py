@@ -56,6 +56,7 @@ class MomentEncoder(nn.Module):
             ) from exc
 
         self.target_len = target_len
+        self.n_value_channels = (seq_dim - 1) // 2
         self.moment = MOMENTPipeline.from_pretrained(
             model_name,
             model_kwargs={"task_name": "embedding"},
@@ -66,17 +67,24 @@ class MomentEncoder(nn.Module):
                 p.requires_grad = False
             self.moment.eval()
 
-        self.static = nn.Sequential(nn.Linear(static_dim, hidden), nn.ReLU())
+        self.static = nn.Sequential(
+            nn.Linear(static_dim + self.n_value_channels, hidden),
+            nn.ReLU(),
+        )
         self.proj = nn.LazyLinear(hidden)
         self.out_dim = hidden * 2
 
     def _pad_or_crop(self, seq):
         # seq: [B, T, values+masks+pad_flag]. MOMENT should see only values.
-        n_value_channels = (seq.shape[2] - 1) // 2
-        values = seq[:, :, :n_value_channels]
-        missing = seq[:, :, n_value_channels: n_value_channels * 2]
-        observed = 1.0 - missing.max(dim=2).values
-        observed = observed * (1.0 - seq[:, :, -1])
+        values = seq[:, :, :self.n_value_channels]
+        missing = seq[:, :, self.n_value_channels: self.n_value_channels * 2]
+        observed = 1.0 - seq[:, :, -1]
+
+        # MOMENT only supports a time-level mask. Per-signal missingness is kept
+        # as a compact side feature rather than turning mostly-complete minutes
+        # into fully masked patches.
+        denom = observed.sum(dim=1, keepdim=True).clamp_min(1.0)
+        missing_summary = (missing * observed.unsqueeze(-1)).sum(dim=1) / denom
 
         x = values.transpose(1, 2)
         mask = observed
@@ -88,7 +96,7 @@ class MomentEncoder(nn.Module):
         elif length > self.target_len:
             x = x[..., -self.target_len:]
             mask = mask[..., -self.target_len:]
-        return x, mask
+        return x, mask, missing_summary
 
     @staticmethod
     def _extract_embedding(out):
@@ -107,14 +115,15 @@ class MomentEncoder(nn.Module):
         return emb
 
     def forward(self, seq, static):
-        x, input_mask = self._pad_or_crop(seq)
+        x, input_mask, missing_summary = self._pad_or_crop(seq)
         if not any(p.requires_grad for p in self.moment.parameters()):
             with torch.no_grad():
                 out = self.moment(x_enc=x, input_mask=input_mask)
         else:
             out = self.moment(x_enc=x, input_mask=input_mask)
         emb = self._extract_embedding(out)
-        return torch.cat([self.proj(emb), self.static(static)], dim=1)
+        static_aug = torch.cat([static, missing_summary], dim=1)
+        return torch.cat([self.proj(emb), self.static(static_aug)], dim=1)
 
 
 def make_encoder(
@@ -237,9 +246,16 @@ def train_bc(
     if best_state:
         model.load_state_dict(best_state)
     pred = greedy_actions(model, val)
+    val_counts = np.bincount(val["action"], minlength=N_ACTIONS)
+    pred_counts = np.bincount(pred, minlength=N_ACTIONS)
+    majority = int(val_counts.argmax())
     metrics = {
         "val_accuracy": float(accuracy_score(val["action"], pred)),
         "val_macro_f1": float(f1_score(val["action"], pred, average="macro", zero_division=0)),
+        "val_majority_accuracy": float(val_counts.max() / max(val_counts.sum(), 1)),
+        "val_majority_action": majority,
+        "pred_majority_action": int(pred_counts.argmax()),
+        "pred_hold_hold_frac": float(pred_counts[4] / max(pred_counts.sum(), 1)),
     }
     return model, metrics
 
