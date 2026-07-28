@@ -126,6 +126,47 @@ class MomentEncoder(nn.Module):
         return torch.cat([self.proj(emb), self.static(static_aug)], dim=1)
 
 
+class TimeSeriesTransformerEncoder(nn.Module):
+    """Small trainable Transformer encoder for short VitalDB history windows."""
+
+    def __init__(
+        self,
+        seq_dim: int,
+        static_dim: int,
+        hidden: int = 96,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        max_len: int = 256,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(seq_dim, hidden)
+        self.pos = nn.Parameter(torch.zeros(1, max_len, hidden))
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=n_heads,
+            dim_feedforward=hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.static = nn.Sequential(nn.Linear(static_dim, hidden), nn.ReLU())
+        self.out_dim = hidden * 2
+
+    def forward(self, seq, static):
+        pad_mask = seq[:, :, -1] > 0.5
+        x = self.input_proj(seq)
+        if x.shape[1] > self.pos.shape[1]:
+            raise ValueError(f"sequence length {x.shape[1]} exceeds max_len {self.pos.shape[1]}")
+        x = x + self.pos[:, : x.shape[1]]
+        h = self.transformer(x, src_key_padding_mask=pad_mask)
+        valid = (~pad_mask).float().unsqueeze(-1)
+        pooled = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        return torch.cat([pooled, self.static(static)], dim=1)
+
+
 def make_encoder(
     encoder: str,
     seq_dim: int,
@@ -135,6 +176,8 @@ def make_encoder(
 ) -> nn.Module:
     if encoder == "gru":
         return GRUEncoder(seq_dim, static_dim, hidden)
+    if encoder == "transformer":
+        return TimeSeriesTransformerEncoder(seq_dim, static_dim, hidden)
     if encoder == "moment":
         return MomentEncoder(seq_dim, static_dim, hidden, model_name=moment_model)
     raise ValueError(f"unknown encoder: {encoder}")

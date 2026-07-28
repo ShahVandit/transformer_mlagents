@@ -190,7 +190,7 @@ def main() -> None:
     ap.add_argument("--fqe-epochs", type=int, default=15)
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--cql-alpha", type=float, default=0.5)
-    ap.add_argument("--encoder", choices=["gru", "moment"], default="gru")
+    ap.add_argument("--encoder", choices=["gru", "transformer", "moment"], default="gru")
     ap.add_argument("--moment-model", default="AutonLab/MOMENT-1-small")
     args = ap.parse_args()
 
