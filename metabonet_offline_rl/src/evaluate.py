@@ -20,6 +20,25 @@ def action_distribution(data: dict[str, np.ndarray], labels: list[str]) -> pd.Da
     return pd.DataFrame({"action": range(len(labels)), "label": labels, "count": counts, "frac": counts / total})
 
 
+def source_action_distribution(metadata: pd.DataFrame, labels: list[str]) -> pd.DataFrame:
+    if metadata.empty:
+        return pd.DataFrame(columns=["source_file", "action", "label", "count", "frac"])
+    frame = metadata[["source_file", "action"]].copy()
+    frame["action"] = pd.to_numeric(frame["action"], errors="coerce").fillna(-1).astype(int)
+    counts = (
+        frame.groupby(["source_file", "action"], dropna=False)
+        .size()
+        .rename("count")
+        .reset_index()
+    )
+    totals = counts.groupby("source_file")["count"].transform("sum").clip(lower=1)
+    counts["frac"] = counts["count"] / totals
+    counts["label"] = counts["action"].map(lambda x: labels[x] if 0 <= x < len(labels) else "unknown")
+    return counts[["source_file", "action", "label", "count", "frac"]].sort_values(
+        ["source_file", "action"]
+    )
+
+
 def support_metrics(policy_actions: np.ndarray, bc_probs: np.ndarray, logged_actions: np.ndarray) -> dict[str, float]:
     if len(policy_actions) == 0:
         return {"action_match_logged": 0.0, "support_prob_mean": 0.0, "support_prob_p10": 0.0, "support_frac_ge_0p05": 0.0}

@@ -55,13 +55,36 @@ def run_diagnostics() -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
     labels = load_config()["action_labels"]
     frames = []
+    source_frames = []
     for split in ["train", "val", "test"]:
         frame = evaluate.action_distribution(load_split(split), labels)
         frame.insert(0, "split", split)
         frames.append(frame)
+        meta_path = DATA / f"metadata_{split}.parquet"
+        if meta_path.exists():
+            source_frame = evaluate.source_action_distribution(pd.read_parquet(meta_path), labels)
+            source_frame.insert(0, "split", split)
+            source_frames.append(source_frame)
     out = pd.concat(frames, ignore_index=True)
     out.to_csv(RESULTS / "action_distribution.csv", index=False)
-    print(out.to_string(index=False))
+    pivot = out.pivot(index=["action", "label"], columns="split", values="frac").reset_index()
+    counts = out.pivot(index=["action", "label"], columns="split", values="count").reset_index()
+    pivot.to_csv(RESULTS / "action_distribution_pivot_frac.csv", index=False)
+    counts.to_csv(RESULTS / "action_distribution_pivot_count.csv", index=False)
+    print("\nACTION DISTRIBUTION BY SPLIT - COUNTS")
+    print(counts.to_string(index=False))
+    print("\nACTION DISTRIBUTION BY SPLIT - FRACTIONS")
+    print(pivot.round(4).to_string(index=False))
+    if source_frames:
+        source_out = pd.concat(source_frames, ignore_index=True)
+        source_out.to_csv(RESULTS / "source_action_distribution.csv", index=False)
+        source_summary = (
+            source_out.sort_values(["split", "source_file", "count"], ascending=[True, True, False])
+            .groupby(["split", "source_file"], as_index=False)
+            .head(3)
+        )
+        print("\nTOP ACTIONS BY SPLIT AND SOURCE")
+        print(source_summary.round(4).to_string(index=False))
 
 
 def run_bc(args):
