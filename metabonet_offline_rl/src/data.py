@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -113,18 +114,25 @@ def _prepare(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _sequence_features(frame: pd.DataFrame) -> np.ndarray:
-    hour = frame.date.dt.hour.to_numpy(float) + frame.date.dt.minute.to_numpy(float) / 60.0
+def _sequence_features_from_arrays(
+    cgm: np.ndarray,
+    basal: np.ndarray,
+    bolus: np.ndarray,
+    carbs: np.ndarray,
+    insulin: np.ndarray,
+    hour: np.ndarray,
+    cgm_missing: np.ndarray,
+) -> np.ndarray:
     features = np.column_stack(
         [
-            (frame.CGM.to_numpy(float) - 150.0) / 60.0,
-            frame.basal.fillna(0).clip(lower=0).to_numpy(float) / 3.0,
-            frame.bolus.fillna(0).clip(lower=0).to_numpy(float) / 10.0,
-            frame.carbs.fillna(0).clip(lower=0).to_numpy(float) / 100.0,
-            frame.insulin.fillna(0).clip(lower=0).to_numpy(float) / 10.0,
-            frame.CGM.isna().to_numpy(float),
-            frame.bolus.fillna(0).gt(0).to_numpy(float),
-            frame.carbs.fillna(0).gt(0).to_numpy(float),
+            (cgm - 150.0) / 60.0,
+            basal / 3.0,
+            bolus / 10.0,
+            carbs / 100.0,
+            insulin / 10.0,
+            cgm_missing.astype(float),
+            (bolus > 0).astype(float),
+            (carbs > 0).astype(float),
             np.sin(2 * np.pi * hour / 24.0),
             np.cos(2 * np.pi * hour / 24.0),
         ]
@@ -193,82 +201,104 @@ def _window(values: np.ndarray, t: int, steps: int) -> np.ndarray:
     return values[max(0, t - steps + 1): t + 1]
 
 
-def _finite_mean(values: np.ndarray, default: float) -> float:
-    values = values[np.isfinite(values)]
-    return float(values.mean()) if len(values) else default
+def _rolling_sum(values: np.ndarray, steps: int) -> np.ndarray:
+    prefix = np.r_[0.0, np.cumsum(values, dtype=float)]
+    end = np.arange(len(values)) + 1
+    start = np.maximum(end - steps, 0)
+    return prefix[end] - prefix[start]
 
 
-def _finite_std(values: np.ndarray) -> float:
-    values = values[np.isfinite(values)]
-    return float(values.std()) if len(values) else 0.0
+def _rolling_nan_mean(values: np.ndarray, steps: int, default: np.ndarray) -> np.ndarray:
+    valid = np.isfinite(values)
+    count = _rolling_sum(valid.astype(float), steps)
+    total = _rolling_sum(np.where(valid, values, 0.0), steps)
+    return np.where(count > 0, total / np.maximum(count, 1.0), default)
 
 
-def _finite_min(values: np.ndarray, default: float) -> float:
-    values = values[np.isfinite(values)]
-    return float(values.min()) if len(values) else default
+def _rolling_nan_std(values: np.ndarray, steps: int) -> np.ndarray:
+    valid = np.isfinite(values)
+    count = _rolling_sum(valid.astype(float), steps)
+    total = _rolling_sum(np.where(valid, values, 0.0), steps)
+    total_sq = _rolling_sum(np.where(valid, values * values, 0.0), steps)
+    mean = total / np.maximum(count, 1.0)
+    var = np.maximum(total_sq / np.maximum(count, 1.0) - mean * mean, 0.0)
+    return np.where(count > 0, np.sqrt(var), 0.0)
 
 
-def _finite_max(values: np.ndarray, default: float) -> float:
-    values = values[np.isfinite(values)]
-    return float(values.max()) if len(values) else default
+def _time_since_event_vector(event: np.ndarray, max_steps: int) -> np.ndarray:
+    out = np.empty(len(event), dtype=np.float32)
+    last = -max_steps
+    for idx, flag in enumerate(event > 0):
+        if flag:
+            last = idx
+        out[idx] = min(idx - last, max_steps)
+    return out
 
 
-def _time_since_event(event: np.ndarray, t: int, max_steps: int) -> float:
-    hits = np.flatnonzero(_window(event.astype(float), t, max_steps) > 0)
-    if len(hits) == 0:
-        return float(max_steps)
-    return float(len(_window(event.astype(float), t, max_steps)) - 1 - hits[-1])
+def _engineered_matrix(
+    cgm: np.ndarray,
+    basal: np.ndarray,
+    bolus: np.ndarray,
+    carbs: np.ndarray,
+    insulin: np.ndarray,
+    hour: np.ndarray,
+    bolus_event: np.ndarray,
+    carb_event: np.ndarray,
+    stat: np.ndarray,
+) -> np.ndarray:
+    n = len(cgm)
+    idx = np.arange(n)
+    cgm_now = np.where(np.isfinite(cgm), cgm, 150.0)
 
-
-def _engineered_vector(group: pd.DataFrame, t: int, stat: np.ndarray) -> np.ndarray:
-    cgm = group.CGM.to_numpy(float)
-    basal = group.basal.ffill().fillna(0).to_numpy(float)
-    bolus = group.bolus.fillna(0).clip(lower=0).to_numpy(float)
-    carbs = group.carbs.fillna(0).clip(lower=0).to_numpy(float)
-    insulin = group.insulin.fillna(0).clip(lower=0).to_numpy(float)
-    hour = float(group.date.iloc[t].hour) + float(group.date.iloc[t].minute) / 60.0
-    cgm_now = cgm[t] if np.isfinite(cgm[t]) else 150.0
-
-    def delta(lag: int) -> float:
-        idx = max(0, t - lag)
-        prior = cgm[idx] if np.isfinite(cgm[idx]) else cgm_now
+    def delta(lag: int) -> np.ndarray:
+        prior_idx = np.maximum(idx - lag, 0)
+        prior_raw = cgm[prior_idx]
+        prior = np.where(np.isfinite(prior_raw), prior_raw, cgm_now)
         return (cgm_now - prior) / 60.0
 
-    recent_bolus = _window(bolus, t, 48)
-    recent_carbs = _window(carbs, t, 48)
-    decay = np.exp(-np.arange(len(recent_bolus) - 1, -1, -1) / 24.0)
-    vector = np.array(
+    cgm_mean_6 = _rolling_nan_mean(cgm, 6, cgm_now)
+    cgm_mean_12 = _rolling_nan_mean(cgm, 12, cgm_now)
+    cgm_mean_24 = _rolling_nan_mean(cgm, 24, cgm_now)
+    cgm_std_12 = _rolling_nan_std(cgm, 12)
+    cgm_min_24 = pd.Series(cgm).rolling(24, min_periods=1).min().to_numpy()
+    cgm_max_24 = pd.Series(cgm).rolling(24, min_periods=1).max().to_numpy()
+    cgm_min_24 = np.where(np.isfinite(cgm_min_24), cgm_min_24, cgm_now)
+    cgm_max_24 = np.where(np.isfinite(cgm_max_24), cgm_max_24, cgm_now)
+    decay = np.exp(-np.arange(48) / 24.0)
+    iob_proxy = np.convolve(bolus, decay, mode="full")[:n]
+    cob_proxy = np.convolve(carbs, decay, mode="full")[:n]
+    stat_block = np.repeat(stat.reshape(1, -1), n, axis=0)
+    matrix = np.column_stack(
         [
             (cgm_now - 150.0) / 60.0,
             delta(3),
             delta(6),
             delta(12),
             delta(24),
-            (_finite_mean(_window(cgm, t, 6), cgm_now) - 150.0) / 60.0,
-            (_finite_mean(_window(cgm, t, 12), cgm_now) - 150.0) / 60.0,
-            (_finite_mean(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
-            _finite_std(_window(cgm, t, 12)) / 60.0,
-            (_finite_min(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
-            (_finite_max(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
-            float(basal[t]) / 3.0,
-            float(np.sum(_window(bolus, t, 6))) / 10.0,
-            float(np.sum(_window(bolus, t, 12))) / 10.0,
-            float(np.sum(_window(bolus, t, 24))) / 10.0,
-            float(np.sum(_window(carbs, t, 6))) / 100.0,
-            float(np.sum(_window(carbs, t, 12))) / 100.0,
-            float(np.sum(_window(carbs, t, 24))) / 100.0,
-            float(np.sum(_window(insulin, t, 24))) / 10.0,
-            _time_since_event(bolus > 0, t, 48) / 48.0,
-            _time_since_event(carbs > 0, t, 48) / 48.0,
-            float(np.sum(recent_bolus * decay)) / 10.0,
-            float(np.sum(recent_carbs * decay)) / 100.0,
+            (cgm_mean_6 - 150.0) / 60.0,
+            (cgm_mean_12 - 150.0) / 60.0,
+            (cgm_mean_24 - 150.0) / 60.0,
+            cgm_std_12 / 60.0,
+            (cgm_min_24 - 150.0) / 60.0,
+            (cgm_max_24 - 150.0) / 60.0,
+            basal / 3.0,
+            _rolling_sum(bolus, 6) / 10.0,
+            _rolling_sum(bolus, 12) / 10.0,
+            _rolling_sum(bolus, 24) / 10.0,
+            _rolling_sum(carbs, 6) / 100.0,
+            _rolling_sum(carbs, 12) / 100.0,
+            _rolling_sum(carbs, 24) / 100.0,
+            _rolling_sum(insulin, 24) / 10.0,
+            _time_since_event_vector(bolus_event, 48) / 48.0,
+            _time_since_event_vector(carb_event, 48) / 48.0,
+            iob_proxy / 10.0,
+            cob_proxy / 100.0,
             np.sin(2 * np.pi * hour / 24.0),
             np.cos(2 * np.pi * hour / 24.0),
-            *stat.tolist(),
-        ],
-        dtype=np.float32,
+            stat_block,
+        ]
     )
-    return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
 def _build_group(
@@ -280,17 +310,31 @@ def _build_group(
     stride_steps: int,
     new_row_mask: np.ndarray,
     action_mode: str,
+    max_rows: int | None = None,
 ) -> tuple[list, list]:
-    features = _sequence_features(group)
-    cgm = group.CGM.to_numpy(float)
+    cgm_raw = group.CGM.to_numpy(float)
+    cgm_missing = ~np.isfinite(cgm_raw)
+    cgm = np.where(cgm_missing, np.nan, cgm_raw)
     basal = group.basal.ffill().fillna(0).to_numpy(float)
     bolus = group.bolus.fillna(0).clip(lower=0).to_numpy(float)
+    carbs = group.carbs.fillna(0).clip(lower=0).to_numpy(float)
+    insulin = group.insulin.fillna(0).clip(lower=0).to_numpy(float)
+    hour = group.date.dt.hour.to_numpy(float) + group.date.dt.minute.to_numpy(float) / 60.0
+    bolus_event_arr = (bolus > 0).astype(float)
+    carb_event_arr = (carbs > 0).astype(float)
+    features = _sequence_features_from_arrays(np.where(cgm_missing, 150.0, cgm), basal, bolus, carbs, insulin, hour, cgm_missing)
     dates = group.date.to_numpy()
     rows, meta = [], []
     stat = _static_features(group.iloc[0])
-    subject = f"{group.source_file.iloc[0]}::{group.id.iloc[0]}"
+    source_file = group.source_file.iloc[0]
+    subject_id = group.id.iloc[0]
+    subject = f"{source_file}::{subject_id}"
     split = stable_split(subject, bool(group.is_test.astype(bool).any()))
     max_forward_steps = max(action_steps, reward_delay_steps + reward_steps)
+    vectors = _engineered_matrix(cgm, basal, bolus, carbs, insulin, hour, bolus_event_arr, carb_event_arr, stat)
+    algo = group.insulin_delivery_algorithm.iloc[0]
+    modality = group.insulin_delivery_modality.iloc[0]
+    treatment = group.treatment_group.iloc[0]
 
     for t in range(history_steps - 1, len(group) - max_forward_steps, stride_steps):
         if not new_row_mask[t]:
@@ -323,9 +367,9 @@ def _build_group(
         rows.append(
             (
                 _encode_window(features, t, history_steps),
-                _engineered_vector(group, t, stat),
+                vectors[t],
                 _encode_window(features, action_end, history_steps),
-                _engineered_vector(group, action_end, stat),
+                vectors[action_end],
                 action,
                 np.array([glycemic_effectiveness, low_burden, hypo_safety], dtype=np.float32),
                 np.array(
@@ -337,8 +381,8 @@ def _build_group(
         )
         meta.append(
             {
-                "source_file": group.source_file.iloc[0],
-                "id": group.id.iloc[0],
+                "source_file": source_file,
+                "id": subject_id,
                 "date": group.date.iloc[t],
                 "action_end": group.date.iloc[action_end],
                 "reward_start": group.date.iloc[reward_start],
@@ -346,11 +390,13 @@ def _build_group(
                 "split": split,
                 "action": action,
                 "bolus_units": interval_bolus,
-                "insulin_delivery_algorithm": group.insulin_delivery_algorithm.iloc[0],
-                "insulin_delivery_modality": group.insulin_delivery_modality.iloc[0],
-                "treatment_group": group.treatment_group.iloc[0],
+                "insulin_delivery_algorithm": algo,
+                "insulin_delivery_modality": modality,
+                "treatment_group": treatment,
             }
         )
+        if max_rows is not None and len(rows) >= max_rows:
+            break
     return rows, meta
 
 
@@ -425,6 +471,8 @@ def build_transition_dataset(
     split_meta: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     tails: dict[str, pd.DataFrame] = {}
     subject_counts: defaultdict[str, int] = defaultdict(int)
+    tail_steps = history_steps + max(action_steps, reward_delay_steps + reward_steps)
+    started = time.perf_counter()
 
     for batch_idx, record_batch in enumerate(scanner.to_batches(), start=1):
         frame = _prepare(record_batch.to_pandas())
@@ -437,7 +485,11 @@ def build_transition_dataset(
             else:
                 new_mask = np.ones(len(group), dtype=bool)
             if bool(group.subject_split_across_traintest.astype(bool).any()):
-                tails[key] = group.tail(history_steps + reward_delay_steps + reward_steps).copy()
+                tails[key] = group.tail(tail_steps).copy()
+                continue
+            remaining = max_subject_transitions - subject_counts[key]
+            if remaining <= 0:
+                tails[key] = group.tail(tail_steps).copy()
                 continue
             rows, metas = _build_group(
                 group,
@@ -448,6 +500,7 @@ def build_transition_dataset(
                 stride_steps,
                 new_mask,
                 action_mode,
+                max_rows=remaining,
             )
             for row, meta in zip(rows, metas):
                 split = meta["split"]
@@ -457,10 +510,11 @@ def build_transition_dataset(
                 split_rows[split].append(row)
                 split_meta[split].append(meta)
                 subject_counts[subject] += 1
-            tails[key] = group.tail(history_steps + reward_delay_steps + reward_steps).copy()
-        if batch_idx == 1 or batch_idx % 20 == 0:
+            tails[key] = group.tail(tail_steps).copy()
+        if batch_idx == 1 or batch_idx % 5 == 0:
             counts_now = {split: len(rows) for split, rows in split_rows.items()}
-            print(f"[data] batch={batch_idx} transitions={counts_now}", flush=True)
+            elapsed = time.perf_counter() - started
+            print(f"[data] batch={batch_idx} transitions={counts_now} elapsed={elapsed:.1f}s", flush=True)
 
     split_rows, split_meta = balanced_sample_splits(
         split_rows,
