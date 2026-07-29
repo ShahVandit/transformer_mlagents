@@ -45,8 +45,11 @@ def run_data(args) -> None:
         min_split_transitions=args.min_split_transitions,
         max_subject_transitions=args.max_subject_transitions,
         history_steps=args.history_steps,
-        horizon_steps=args.horizon_steps,
+        action_steps=args.action_steps,
+        reward_delay_steps=args.reward_delay_steps,
+        reward_steps=args.reward_steps,
         stride_steps=args.stride_steps,
+        action_mode=args.action_mode,
     )
 
 
@@ -91,19 +94,27 @@ def run_bc(args):
     ensure_data()
     RESULTS.mkdir(parents=True, exist_ok=True)
     train, val = load_split("train"), load_split("val")
-    model, metrics = models.train_bc(train, val, epochs=args.bc_epochs, batch_size=args.train_batch_size)
+    model, metrics = models.train_bc(train, val, epochs=args.bc_epochs, batch_size=args.train_batch_size, encoder=args.encoder)
     pd.DataFrame([metrics]).to_csv(RESULTS / "bc_metrics.csv", index=False)
-    seq_dim, static_dim, n_actions = train["seq"].shape[2], train["static"].shape[1], int(train["action"].max() + 1)
-    models.save_model(RESULTS / "bc_transformer.pt", model, "bc", {"seq_dim": seq_dim, "static_dim": static_dim, "n_actions": n_actions})
+    seq_dim = train["seq"].shape[2]
+    static_dim = train["static"].shape[1]
+    n_actions = int(np.asarray(train["n_actions"]).item()) if "n_actions" in train else int(train["action"].max() + 1)
+    models.save_model(
+        RESULTS / f"bc_{args.encoder}.pt",
+        model,
+        "bc",
+        {"seq_dim": seq_dim, "static_dim": static_dim, "n_actions": n_actions, "encoder": args.encoder},
+    )
     print("[bc]", metrics)
     return model
 
 
 def load_bc(args):
     train = load_split("train")
-    path = RESULTS / "bc_transformer.pt"
+    path = RESULTS / f"bc_{args.encoder}.pt"
     if path.exists():
-        return models.load_model(path, "bc", train["seq"].shape[2], train["static"].shape[1], int(train["action"].max() + 1))
+        n_actions = int(np.asarray(train["n_actions"]).item()) if "n_actions" in train else int(train["action"].max() + 1)
+        return models.load_model(path, "bc", train["seq"].shape[2], train["static"].shape[1], n_actions, encoder=args.encoder)
     return run_bc(args)
 
 
@@ -120,22 +131,27 @@ def run_cql(args) -> None:
             epochs=args.cql_epochs,
             batch_size=args.train_batch_size,
             cql_alpha=args.cql_alpha,
+            encoder=args.encoder,
         )
-        row = {"policy": f"cql_{name}", "w_hypo": weights[0], "w_hyper": weights[1], "w_burden": weights[2]}
+        row = {"policy": f"cql_{name}", "w_effectiveness": weights[0], "w_burden": weights[1], "w_hypo_safety": weights[2]}
         row.update(metrics)
         rows.append(row)
-        models.save_model(RESULTS / f"cql_{name}.pt", q, "q", {"weights": weights})
+        models.save_model(RESULTS / f"cql_{args.encoder}_{name}.pt", q, "q", {"weights": weights, "encoder": args.encoder})
         print("[cql]", row)
     pd.DataFrame(rows).to_csv(RESULTS / "cql_metrics.csv", index=False)
 
 
-def load_cql_policies(train) -> list[tuple[str, object, str]]:
+def load_cql_policies(args, train) -> list[tuple[str, object, str]]:
     policies = []
-    n_actions = int(train["action"].max() + 1)
+    n_actions = int(np.asarray(train["n_actions"]).item()) if "n_actions" in train else int(train["action"].max() + 1)
     for name in evaluate.OBJECTIVE_WEIGHTS:
-        path = RESULTS / f"cql_{name}.pt"
+        path = RESULTS / f"cql_{args.encoder}_{name}.pt"
         if path.exists():
-            policies.append((f"cql_{name}", models.load_model(path, "q", train["seq"].shape[2], train["static"].shape[1], n_actions), "q"))
+            policies.append((
+                f"cql_{name}",
+                models.load_model(path, "q", train["seq"].shape[2], train["static"].shape[1], n_actions, encoder=args.encoder),
+                "q",
+            ))
     return policies
 
 
@@ -144,12 +160,12 @@ def plot_pareto(frame: pd.DataFrame, path: Path) -> None:
         return
     colors = np.where(frame["pareto"], "tab:red", "tab:blue")
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(frame.fqe_hypo_safety, frame.fqe_hyper_control, s=80, c=colors, alpha=0.85)
+    ax.scatter(frame.fqe_glycemic_effectiveness, frame.fqe_low_burden, s=80, c=colors, alpha=0.85)
     for _, row in frame.iterrows():
-        ax.annotate(row.policy, (row.fqe_hypo_safety, row.fqe_hyper_control), fontsize=8, xytext=(4, 4), textcoords="offset points")
-    ax.set_xlabel("FQE hypoglycemia safety value (higher better)")
-    ax.set_ylabel("FQE hyperglycemia control value (higher better)")
-    ax.set_title("Policy tradeoffs; low-burden value in CSV")
+        ax.annotate(row.policy, (row.fqe_glycemic_effectiveness, row.fqe_low_burden), fontsize=8, xytext=(4, 4), textcoords="offset points")
+    ax.set_xlabel("FQE glycemic effectiveness (higher better)")
+    ax.set_ylabel("FQE low treatment burden (higher better)")
+    ax.set_title("Pareto tradeoff; hypo safety reported as CMDP constraint")
     ax.grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
@@ -162,12 +178,20 @@ def run_evaluate(args) -> None:
     train, test = load_split("train"), load_split("test")
     if len(test["action"]) == 0:
         raise RuntimeError("test split is empty; rerun --stage data with a larger --max-transitions")
-    bc = load_bc(args)
-    policies = [("bc", bc, "bc")] + load_cql_policies(train)
-    rows = [evaluate.policy_value_row(train, test, bc, name, policy, ptype, args.fqe_epochs) for name, policy, ptype in policies]
+    bc = None if args.skip_bc else load_bc(args)
+    policies = [] if args.skip_bc else [("bc", bc, "bc")]
+    policies += load_cql_policies(args, train)
+    if not policies:
+        raise FileNotFoundError("No policies found for evaluation. Run --stage cql first.")
+    rows = [
+        evaluate.policy_value_row(train, test, bc, name, policy, ptype, args.fqe_epochs, encoder=args.encoder)
+        for name, policy, ptype in policies
+    ]
     values = pd.DataFrame(rows)
-    values["observed_test_tir"] = evaluate.observed_metrics(test)["tir"]
-    values["pareto"] = evaluate.pareto_mask(values, ["fqe_hypo_safety", "fqe_hyper_control", "fqe_low_burden"])
+    observed = evaluate.observed_metrics(test)
+    values["observed_test_tir"] = observed["tir"]
+    values["observed_test_hypo_safety"] = observed["hypo_safety"]
+    values["pareto"] = evaluate.pareto_mask(values, ["fqe_glycemic_effectiveness", "fqe_low_burden"])
     values.to_csv(RESULTS / "policy_values.csv", index=False)
     values[values.pareto].to_csv(RESULTS / "pareto_policies.csv", index=False)
     plot_pareto(values, RESULTS / "pareto_frontier.png")
@@ -176,30 +200,39 @@ def run_evaluate(args) -> None:
     if meta_path.exists():
         group_values = evaluate.observed_group_values(pd.read_parquet(meta_path), test)
         group_values.to_csv(RESULTS / "observed_group_values.csv", index=False)
-    write_report(values, test)
+    write_report(values, test, args)
     print(values.round(4).to_string(index=False))
 
 
-def write_report(values: pd.DataFrame, test: dict[str, np.ndarray]) -> None:
+def write_report(values: pd.DataFrame, test: dict[str, np.ndarray], args) -> None:
     observed = evaluate.observed_metrics(test)
+    model_text = f"{args.encoder.upper()} CQL"
+    if not args.skip_bc:
+        model_text = f"{args.encoder.upper()} behavior-cloning and CQL"
     lines = [
         "# MetaboNet Offline MORL Report",
         "",
-        "This run trains Transformer behavior-cloning and CQL policies from logged MetaboNet trajectories.",
+        f"This run trains {model_text} policies from logged MetaboNet trajectories.",
         "Learned-policy values are FQE estimates, not direct ground truth.",
         "",
         "## Observed Logged Test Outcomes",
         f"- TIR: {observed['tir']:.4f}",
+        f"- Glycemic effectiveness reward: {observed['glycemic_effectiveness']:.4f}",
+        f"- Low-burden reward: {observed['low_burden']:.4f}",
+        f"- Hypo-safety value: {observed['hypo_safety']:.4f}",
+        f"- TBR<70: {observed['tbr70']:.4f}",
         f"- TBR<54: {observed['tbr54']:.4f}",
+        f"- TAR>180: {observed['tar180']:.4f}",
         f"- TAR>250: {observed['tar250']:.4f}",
-        f"- Burden: {observed['burden']:.4f}",
+        f"- Bolus units per decision: {observed['bolus_units']:.4f}",
+        f"- Bolus event rate: {observed['bolus_event']:.4f}",
         "",
         "## Pareto Policies",
     ]
     for _, row in values[values.pareto].iterrows():
         lines.append(
-            f"- {row.policy}: hypo_safety={row.fqe_hypo_safety:.4f}, "
-            f"hyper_control={row.fqe_hyper_control:.4f}, low_burden={row.fqe_low_burden:.4f}"
+            f"- {row.policy}: glycemic_effectiveness={row.fqe_glycemic_effectiveness:.4f}, "
+            f"low_burden={row.fqe_low_burden:.4f}, hypo_safety={row.fqe_hypo_safety:.4f}"
         )
     lines.extend(
         [
@@ -220,10 +253,16 @@ def main() -> None:
     parser.add_argument("--max-transitions", type=int, default=300_000)
     parser.add_argument("--min-split-transitions", type=int, default=1000)
     parser.add_argument("--max-subject-transitions", type=int, default=600)
-    parser.add_argument("--history-steps", type=int, default=12)
-    parser.add_argument("--horizon-steps", type=int, default=6)
+    parser.add_argument("--history-steps", type=int, default=24)
+    parser.add_argument("--horizon-steps", type=int, default=6, help="legacy argument; use --action-steps/--reward-delay-steps/--reward-steps")
+    parser.add_argument("--action-steps", type=int, default=6)
+    parser.add_argument("--reward-delay-steps", type=int, default=6)
+    parser.add_argument("--reward-steps", type=int, default=18)
     parser.add_argument("--stride-steps", type=int, default=6)
+    parser.add_argument("--action-mode", choices=["bolus4", "basal_bolus12"], default="bolus4")
+    parser.add_argument("--encoder", choices=["mlp", "transformer"], default="mlp")
     parser.add_argument("--bc-epochs", type=int, default=5)
+    parser.add_argument("--skip-bc", action="store_true")
     parser.add_argument("--cql-epochs", type=int, default=8)
     parser.add_argument("--fqe-epochs", type=int, default=5)
     parser.add_argument("--train-batch-size", type=int, default=1024)
@@ -234,7 +273,7 @@ def main() -> None:
         run_data(args)
     if args.stage in ["diagnostics", "all"]:
         run_diagnostics()
-    if args.stage in ["bc", "all"]:
+    if args.stage in ["bc", "all"] and not args.skip_bc:
         run_bc(args)
     if args.stage in ["cql", "all"]:
         run_cql(args)

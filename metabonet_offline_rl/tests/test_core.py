@@ -13,9 +13,9 @@ import evaluate  # noqa: E402
 
 
 def test_action_space_has_expected_bins():
-    assert data.N_ACTIONS == 12
-    assert data.ACTION_LABELS[4] == "basal_same|no_bolus"
-    assert data.ACTION_LABELS[-1] == "basal_up|bolus_gt5"
+    assert data.N_ACTIONS == 4
+    assert data.ACTION_LABELS == ["no_bolus", "bolus_le2", "bolus_2_5", "bolus_gt5"]
+    assert data.action_labels("basal_bolus12")[4] == "basal_same|no_bolus"
 
 
 def test_pareto_mask_uses_higher_is_better_values():

@@ -10,7 +10,23 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, TensorDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-N_ACTIONS = 12
+N_ACTIONS = 4
+
+
+class MLPEncoder(nn.Module):
+    def __init__(self, static_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(static_dim, hidden),
+            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        self.out_dim = hidden
+
+    def forward(self, seq: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        return self.net(static)
 
 
 class TransformerEncoder(nn.Module):
@@ -42,9 +58,16 @@ class TransformerEncoder(nn.Module):
 
 
 class PolicyNet(nn.Module):
-    def __init__(self, seq_dim: int, static_dim: int, n_actions: int, hidden: int = 96):
+    def __init__(self, seq_dim: int, static_dim: int, n_actions: int, hidden: int = 96, encoder: str = "mlp"):
         super().__init__()
-        self.encoder = TransformerEncoder(seq_dim, static_dim, hidden)
+        if encoder == "mlp":
+            self.encoder = MLPEncoder(static_dim, hidden=128)
+            head_hidden = 128
+        elif encoder == "transformer":
+            self.encoder = TransformerEncoder(seq_dim, static_dim, hidden)
+            head_hidden = hidden
+        else:
+            raise ValueError(f"unknown encoder={encoder}")
         self.head = nn.Sequential(nn.Linear(self.encoder.out_dim, hidden), nn.ReLU(), nn.Linear(hidden, n_actions))
 
     def forward(self, seq: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
@@ -56,8 +79,11 @@ class QNet(PolicyNet):
 
 
 def _dims(data: dict[str, np.ndarray]) -> tuple[int, int, int]:
-    observed = int(data["action"].max() + 1) if len(data["action"]) else N_ACTIONS
-    return int(data["seq"].shape[2]), int(data["static"].shape[1]), max(N_ACTIONS, observed)
+    if "n_actions" in data:
+        n_actions = int(np.asarray(data["n_actions"]).item())
+    else:
+        n_actions = int(data["action"].max() + 1) if len(data["action"]) else N_ACTIONS
+    return int(data["seq"].shape[2]), int(data["static"].shape[1]), n_actions
 
 
 def _loader(data: dict[str, np.ndarray], keys: list[str], batch_size: int, shuffle: bool = True) -> DataLoader:
@@ -90,10 +116,10 @@ def policy_probs(model: nn.Module, data: dict[str, np.ndarray], batch_size: int 
     return exp / exp.sum(1, keepdims=True)
 
 
-def train_bc(train, val, epochs: int = 5, batch_size: int = 1024, lr: float = 1e-3, seed: int = 0):
+def train_bc(train, val, epochs: int = 5, batch_size: int = 1024, lr: float = 1e-3, seed: int = 0, encoder: str = "mlp"):
     torch.manual_seed(seed)
     seq_dim, static_dim, n_actions = _dims(train)
-    model = PolicyNet(seq_dim, static_dim, n_actions).to(DEVICE)
+    model = PolicyNet(seq_dim, static_dim, n_actions, encoder=encoder).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     best_f1, best_state = -1.0, None
     for _ in range(epochs):
@@ -130,11 +156,12 @@ def train_cql(
     gamma: float = 0.99,
     cql_alpha: float = 0.5,
     seed: int = 0,
+    encoder: str = "mlp",
 ):
     torch.manual_seed(seed)
     seq_dim, static_dim, n_actions = _dims(train)
-    q = QNet(seq_dim, static_dim, n_actions).to(DEVICE)
-    target = QNet(seq_dim, static_dim, n_actions).to(DEVICE)
+    q = QNet(seq_dim, static_dim, n_actions, encoder=encoder).to(DEVICE)
+    target = QNet(seq_dim, static_dim, n_actions, encoder=encoder).to(DEVICE)
     target.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr=lr)
     local = dict(train)
@@ -180,11 +207,12 @@ def train_fqe(
     lr: float = 3e-4,
     gamma: float = 0.99,
     seed: int = 0,
+    encoder: str = "mlp",
 ):
     torch.manual_seed(seed)
     seq_dim, static_dim, n_actions = _dims(train)
-    q = QNet(seq_dim, static_dim, n_actions).to(DEVICE)
-    target = QNet(seq_dim, static_dim, n_actions).to(DEVICE)
+    q = QNet(seq_dim, static_dim, n_actions, encoder=encoder).to(DEVICE)
+    target = QNet(seq_dim, static_dim, n_actions, encoder=encoder).to(DEVICE)
     target.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr=lr)
     local = dict(train)
@@ -236,8 +264,14 @@ def save_model(path: Path, model: nn.Module, kind: str, extra: dict | None = Non
     torch.save({"kind": kind, "state_dict": model.state_dict(), "extra": extra or {}}, path)
 
 
-def load_model(path: Path, kind: str, seq_dim: int, static_dim: int, n_actions: int):
+def load_model(path: Path, kind: str, seq_dim: int, static_dim: int, n_actions: int, encoder: str = "mlp"):
     payload = torch.load(path, map_location=DEVICE)
-    model = PolicyNet(seq_dim, static_dim, n_actions) if kind == "bc" else QNet(seq_dim, static_dim, n_actions)
+    extra = payload.get("extra", {})
+    encoder = extra.get("encoder", encoder)
+    model = (
+        PolicyNet(seq_dim, static_dim, n_actions, encoder=encoder)
+        if kind == "bc"
+        else QNet(seq_dim, static_dim, n_actions, encoder=encoder)
+    )
     model.load_state_dict(payload["state_dict"])
     return model.to(DEVICE)

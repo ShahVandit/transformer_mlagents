@@ -5,16 +5,17 @@ Minimal interview-ready offline RL project for insulin decision support using th
 ## What It Does
 
 - Builds an offline MDP from CGM, insulin, carbs, and metadata.
-- Trains a Transformer behavior-cloning policy.
+- Uses a 2-hour state window, a 30-minute bolus macro-action, and delayed 30-120 minute glucose response.
+- Optionally trains an MLP behavior-cloning policy over engineered 2-hour state features.
 - Trains discrete Conservative Q-Learning policies under different clinical tradeoffs.
 - Evaluates learned policies with FQE-style off-policy evaluation.
-- Reports a policy-level Pareto frontier over hypoglycemia, hyperglycemia, and treatment burden.
+- Reports a policy-level Pareto frontier over glycemic effectiveness and low treatment burden.
 
-Time-in-range is reported as a primary clinical metric, but the Pareto axes are the actual competing objectives:
+Hypoglycemia is reported as the CMDP safety constraint, not as a Pareto axis.
 
-- minimize severe hypoglycemia, `% CGM <54`
-- minimize severe hyperglycemia, `% CGM >250`
-- minimize treatment burden, bolus events + basal changes
+- maximize glycemic effectiveness, reducing future high-glucose exposure
+- maximize low treatment burden, using fewer/lower bolus interventions
+- constrain hypoglycemia risk, `% CGM <70` and `% CGM <54`
 
 ## Run
 
@@ -23,7 +24,15 @@ python metabonet_offline_rl/run_pipeline.py \
   --stage all \
   --parquet /scratch/metabonet_public.parquet \
   --download-url "INSERT_METABONET_PARQUET_URL" \
-  --max-transitions 300000
+  --max-transitions 300000 \
+  --history-steps 24 \
+  --action-steps 6 \
+  --reward-delay-steps 6 \
+  --reward-steps 18 \
+  --stride-steps 6 \
+  --action-mode bolus4 \
+  --encoder mlp \
+  --skip-bc
 ```
 
 If the parquet already exists, `--download-url` is ignored.
@@ -37,7 +46,15 @@ python metabonet_offline_rl/run_pipeline.py \
   --max-transitions 50000 \
   --bc-epochs 2 \
   --cql-epochs 2 \
-  --fqe-epochs 2
+  --fqe-epochs 2 \
+  --history-steps 24 \
+  --action-steps 6 \
+  --reward-delay-steps 6 \
+  --reward-steps 18 \
+  --stride-steps 6 \
+  --action-mode bolus4 \
+  --encoder mlp \
+  --skip-bc
 ```
 
 ## Outputs

@@ -35,12 +35,41 @@ SEQ_FEATURES = [
     "hour_cos",
 ]
 STATIC_FEATURES = ["age_scaled", "height_scaled", "weight_scaled", "gender_male"]
-ACTION_LABELS = [
+ACTION_LABELS_12 = [
     f"{basal}|{bolus}"
     for basal in ("basal_down", "basal_same", "basal_up")
     for bolus in ("no_bolus", "bolus_le2", "bolus_2_5", "bolus_gt5")
 ]
+ACTION_LABELS_BOLUS4 = ["no_bolus", "bolus_le2", "bolus_2_5", "bolus_gt5"]
+ACTION_LABELS = ACTION_LABELS_BOLUS4
 N_ACTIONS = len(ACTION_LABELS)
+VECTOR_FEATURES = [
+    "cgm_now_z",
+    "cgm_delta_15",
+    "cgm_delta_30",
+    "cgm_delta_60",
+    "cgm_delta_120",
+    "cgm_mean_30",
+    "cgm_mean_60",
+    "cgm_mean_120",
+    "cgm_std_60",
+    "cgm_min_120",
+    "cgm_max_120",
+    "basal_now_scaled",
+    "bolus_sum_30",
+    "bolus_sum_60",
+    "bolus_sum_120",
+    "carbs_sum_30",
+    "carbs_sum_60",
+    "carbs_sum_120",
+    "insulin_sum_120",
+    "time_since_bolus",
+    "time_since_carbs",
+    "iob_proxy",
+    "cob_proxy",
+    "hour_sin",
+    "hour_cos",
+] + STATIC_FEATURES
 
 
 def download_if_needed(parquet: Path, url: str | None) -> None:
@@ -143,12 +172,114 @@ def _bolus_bin(total: float) -> int:
     return 3
 
 
+def action_labels(action_mode: str) -> list[str]:
+    if action_mode == "bolus4":
+        return ACTION_LABELS_BOLUS4
+    if action_mode == "basal_bolus12":
+        return ACTION_LABELS_12
+    raise ValueError(f"unknown action_mode={action_mode}")
+
+
+def encode_action(interval_basal_delta: float, interval_bolus: float, action_mode: str) -> int:
+    bolus_action = _bolus_bin(interval_bolus)
+    if action_mode == "bolus4":
+        return bolus_action
+    if action_mode == "basal_bolus12":
+        return _basal_bin(interval_basal_delta) * 4 + bolus_action
+    raise ValueError(f"unknown action_mode={action_mode}")
+
+
+def _window(values: np.ndarray, t: int, steps: int) -> np.ndarray:
+    return values[max(0, t - steps + 1): t + 1]
+
+
+def _finite_mean(values: np.ndarray, default: float) -> float:
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if len(values) else default
+
+
+def _finite_std(values: np.ndarray) -> float:
+    values = values[np.isfinite(values)]
+    return float(values.std()) if len(values) else 0.0
+
+
+def _finite_min(values: np.ndarray, default: float) -> float:
+    values = values[np.isfinite(values)]
+    return float(values.min()) if len(values) else default
+
+
+def _finite_max(values: np.ndarray, default: float) -> float:
+    values = values[np.isfinite(values)]
+    return float(values.max()) if len(values) else default
+
+
+def _time_since_event(event: np.ndarray, t: int, max_steps: int) -> float:
+    hits = np.flatnonzero(_window(event.astype(float), t, max_steps) > 0)
+    if len(hits) == 0:
+        return float(max_steps)
+    return float(len(_window(event.astype(float), t, max_steps)) - 1 - hits[-1])
+
+
+def _engineered_vector(group: pd.DataFrame, t: int, stat: np.ndarray) -> np.ndarray:
+    cgm = group.CGM.to_numpy(float)
+    basal = group.basal.ffill().fillna(0).to_numpy(float)
+    bolus = group.bolus.fillna(0).clip(lower=0).to_numpy(float)
+    carbs = group.carbs.fillna(0).clip(lower=0).to_numpy(float)
+    insulin = group.insulin.fillna(0).clip(lower=0).to_numpy(float)
+    hour = float(group.date.iloc[t].hour) + float(group.date.iloc[t].minute) / 60.0
+    cgm_now = cgm[t] if np.isfinite(cgm[t]) else 150.0
+
+    def delta(lag: int) -> float:
+        idx = max(0, t - lag)
+        prior = cgm[idx] if np.isfinite(cgm[idx]) else cgm_now
+        return (cgm_now - prior) / 60.0
+
+    recent_bolus = _window(bolus, t, 48)
+    recent_carbs = _window(carbs, t, 48)
+    decay = np.exp(-np.arange(len(recent_bolus) - 1, -1, -1) / 24.0)
+    vector = np.array(
+        [
+            (cgm_now - 150.0) / 60.0,
+            delta(3),
+            delta(6),
+            delta(12),
+            delta(24),
+            (_finite_mean(_window(cgm, t, 6), cgm_now) - 150.0) / 60.0,
+            (_finite_mean(_window(cgm, t, 12), cgm_now) - 150.0) / 60.0,
+            (_finite_mean(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
+            _finite_std(_window(cgm, t, 12)) / 60.0,
+            (_finite_min(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
+            (_finite_max(_window(cgm, t, 24), cgm_now) - 150.0) / 60.0,
+            float(basal[t]) / 3.0,
+            float(np.sum(_window(bolus, t, 6))) / 10.0,
+            float(np.sum(_window(bolus, t, 12))) / 10.0,
+            float(np.sum(_window(bolus, t, 24))) / 10.0,
+            float(np.sum(_window(carbs, t, 6))) / 100.0,
+            float(np.sum(_window(carbs, t, 12))) / 100.0,
+            float(np.sum(_window(carbs, t, 24))) / 100.0,
+            float(np.sum(_window(insulin, t, 24))) / 10.0,
+            _time_since_event(bolus > 0, t, 48) / 48.0,
+            _time_since_event(carbs > 0, t, 48) / 48.0,
+            float(np.sum(recent_bolus * decay)) / 10.0,
+            float(np.sum(recent_carbs * decay)) / 100.0,
+            np.sin(2 * np.pi * hour / 24.0),
+            np.cos(2 * np.pi * hour / 24.0),
+            *stat.tolist(),
+        ],
+        dtype=np.float32,
+    )
+    return np.nan_to_num(vector, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
 def _build_group(
     group: pd.DataFrame,
     history_steps: int,
-    horizon_steps: int,
+    action_steps: int,
+    reward_delay_steps: int,
+    reward_steps: int,
     stride_steps: int,
     new_row_mask: np.ndarray,
+    action_mode: str,
 ) -> tuple[list, list]:
     features = _sequence_features(group)
     cgm = group.CGM.to_numpy(float)
@@ -159,36 +290,48 @@ def _build_group(
     stat = _static_features(group.iloc[0])
     subject = f"{group.source_file.iloc[0]}::{group.id.iloc[0]}"
     split = stable_split(subject, bool(group.is_test.astype(bool).any()))
+    max_forward_steps = max(action_steps, reward_delay_steps + reward_steps)
 
-    for t in range(history_steps - 1, len(group) - horizon_steps, stride_steps):
+    for t in range(history_steps - 1, len(group) - max_forward_steps, stride_steps):
         if not new_row_mask[t]:
             continue
-        nt = t + horizon_steps
-        minutes = (dates[nt] - dates[t]) / np.timedelta64(1, "m")
-        if not 20 <= float(minutes) <= 45:
+        action_end = t + action_steps
+        reward_start = t + reward_delay_steps + 1
+        reward_end = t + reward_delay_steps + reward_steps
+        action_minutes = (dates[action_end] - dates[t]) / np.timedelta64(1, "m")
+        reward_minutes = (dates[reward_end] - dates[t]) / np.timedelta64(1, "m")
+        if not 20 <= float(action_minutes) <= 45:
             continue
-        future_cgm = cgm[t + 1: nt + 1]
+        if not 90 <= float(reward_minutes) <= 150:
+            continue
+        future_cgm = cgm[reward_start: reward_end + 1]
         if not np.isfinite(future_cgm).any() or not np.isfinite(cgm[t]):
             continue
-        interval_bolus = float(np.nansum(bolus[t + 1: nt + 1]))
-        interval_basal_delta = float(np.nanmean(basal[t + 1: nt + 1]) - basal[t])
-        action = _basal_bin(interval_basal_delta) * 4 + _bolus_bin(interval_bolus)
-        basal_changes = float(np.sum(np.abs(np.diff(basal[t: nt + 1])) > 0.01))
-        bolus_events = float(np.sum(bolus[t + 1: nt + 1] > 0))
-        burden = bolus_events + basal_changes
+        interval_bolus = float(np.nansum(bolus[t + 1: action_end + 1]))
+        interval_basal_delta = float(np.nanmean(basal[t + 1: action_end + 1]) - basal[t])
+        action = encode_action(interval_basal_delta, interval_bolus, action_mode)
+        bolus_event = float(interval_bolus > 1e-9)
         valid = future_cgm[np.isfinite(future_cgm)]
         tir = float(np.mean((valid >= 70) & (valid <= 180)))
+        tbr70 = float(np.mean(valid < 70))
         tbr54 = float(np.mean(valid < 54))
+        tar180 = float(np.mean(valid > 180))
         tar250 = float(np.mean(valid > 250))
+        glycemic_effectiveness = -float(np.mean(np.maximum(valid - 180.0, 0.0) / 70.0)) - 2.0 * tar250
+        low_burden = -bolus_event - interval_bolus / 10.0
+        hypo_safety = -(tbr70 + 3.0 * tbr54)
         rows.append(
             (
                 _encode_window(features, t, history_steps),
-                stat,
-                _encode_window(features, nt, history_steps),
-                stat,
+                _engineered_vector(group, t, stat),
+                _encode_window(features, action_end, history_steps),
+                _engineered_vector(group, action_end, stat),
                 action,
-                np.array([-tbr54, -tar250, -burden / max(horizon_steps, 1)], dtype=np.float32),
-                np.array([tir, tbr54, tar250, burden], dtype=np.float32),
+                np.array([glycemic_effectiveness, low_burden, hypo_safety], dtype=np.float32),
+                np.array(
+                    [glycemic_effectiveness, low_burden, hypo_safety, tir, tbr70, tbr54, tar180, tar250, interval_bolus, bolus_event],
+                    dtype=np.float32,
+                ),
                 0.0,
             )
         )
@@ -197,8 +340,12 @@ def _build_group(
                 "source_file": group.source_file.iloc[0],
                 "id": group.id.iloc[0],
                 "date": group.date.iloc[t],
+                "action_end": group.date.iloc[action_end],
+                "reward_start": group.date.iloc[reward_start],
+                "reward_end": group.date.iloc[reward_end],
                 "split": split,
                 "action": action,
+                "bolus_units": interval_bolus,
                 "insulin_delivery_algorithm": group.insulin_delivery_algorithm.iloc[0],
                 "insulin_delivery_modality": group.insulin_delivery_modality.iloc[0],
                 "treatment_group": group.treatment_group.iloc[0],
@@ -258,9 +405,12 @@ def build_transition_dataset(
     max_transitions: int | None = 300_000,
     min_split_transitions: int = 1_000,
     max_subject_transitions: int = 600,
-    history_steps: int = 12,
-    horizon_steps: int = 6,
+    history_steps: int = 24,
+    action_steps: int = 6,
+    reward_delay_steps: int = 6,
+    reward_steps: int = 18,
     stride_steps: int = 6,
+    action_mode: str = "bolus4",
 ) -> dict[str, int]:
     download_if_needed(parquet, download_url)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,9 +437,18 @@ def build_transition_dataset(
             else:
                 new_mask = np.ones(len(group), dtype=bool)
             if bool(group.subject_split_across_traintest.astype(bool).any()):
-                tails[key] = group.tail(history_steps + horizon_steps).copy()
+                tails[key] = group.tail(history_steps + reward_delay_steps + reward_steps).copy()
                 continue
-            rows, metas = _build_group(group, history_steps, horizon_steps, stride_steps, new_mask)
+            rows, metas = _build_group(
+                group,
+                history_steps,
+                action_steps,
+                reward_delay_steps,
+                reward_steps,
+                stride_steps,
+                new_mask,
+                action_mode,
+            )
             for row, meta in zip(rows, metas):
                 split = meta["split"]
                 subject = f"{meta['source_file']}::{meta['id']}"
@@ -298,7 +457,7 @@ def build_transition_dataset(
                 split_rows[split].append(row)
                 split_meta[split].append(meta)
                 subject_counts[subject] += 1
-            tails[key] = group.tail(history_steps + horizon_steps).copy()
+            tails[key] = group.tail(history_steps + reward_delay_steps + reward_steps).copy()
         if batch_idx == 1 or batch_idx % 20 == 0:
             counts_now = {split: len(rows) for split, rows in split_rows.items()}
             print(f"[data] batch={batch_idx} transitions={counts_now}", flush=True)
@@ -312,7 +471,7 @@ def build_transition_dataset(
 
     counts = {}
     for split, rows in split_rows.items():
-        arrays = rows_to_arrays(rows)
+        arrays = rows_to_arrays(rows, n_actions=len(action_labels(action_mode)), history_steps=history_steps)
         np.savez_compressed(output_dir / f"transitions_{split}.npz", **arrays)
         pd.DataFrame(split_meta[split]).to_parquet(output_dir / f"metadata_{split}.parquet", index=False)
         counts[split] = int(len(arrays["action"]))
@@ -320,14 +479,28 @@ def build_transition_dataset(
         json.dump(
             {
                 "seq_features": SEQ_FEATURES,
-                "static_features": STATIC_FEATURES,
-                "action_labels": ACTION_LABELS,
+                "static_features": VECTOR_FEATURES,
+                "action_labels": action_labels(action_mode),
+                "action_mode": action_mode,
                 "history_steps": history_steps,
-                "horizon_steps": horizon_steps,
+                "action_steps": action_steps,
+                "reward_delay_steps": reward_delay_steps,
+                "reward_steps": reward_steps,
                 "stride_steps": stride_steps,
                 "max_subject_transitions": max_subject_transitions,
-                "reward_components": ["neg_tbr54", "neg_tar250", "neg_burden"],
-                "outcome_components": ["tir", "tbr54", "tar250", "burden"],
+                "reward_components": ["glycemic_effectiveness", "low_burden", "hypo_safety"],
+                "outcome_components": [
+                    "glycemic_effectiveness",
+                    "low_burden",
+                    "hypo_safety",
+                    "tir",
+                    "tbr70",
+                    "tbr54",
+                    "tar180",
+                    "tar250",
+                    "bolus_units",
+                    "bolus_event",
+                ],
                 "counts": counts,
             },
             handle,
@@ -337,16 +510,17 @@ def build_transition_dataset(
     return counts
 
 
-def rows_to_arrays(rows: list) -> dict[str, np.ndarray]:
+def rows_to_arrays(rows: list, n_actions: int = N_ACTIONS, history_steps: int = 24) -> dict[str, np.ndarray]:
     if not rows:
         return {
-            "seq": np.empty((0, 12, len(SEQ_FEATURES) + 1), dtype=np.float32),
-            "static": np.empty((0, len(STATIC_FEATURES)), dtype=np.float32),
-            "next_seq": np.empty((0, 12, len(SEQ_FEATURES) + 1), dtype=np.float32),
-            "next_static": np.empty((0, len(STATIC_FEATURES)), dtype=np.float32),
+            "seq": np.empty((0, history_steps, len(SEQ_FEATURES) + 1), dtype=np.float32),
+            "static": np.empty((0, len(VECTOR_FEATURES)), dtype=np.float32),
+            "next_seq": np.empty((0, history_steps, len(SEQ_FEATURES) + 1), dtype=np.float32),
+            "next_static": np.empty((0, len(VECTOR_FEATURES)), dtype=np.float32),
             "action": np.empty((0,), dtype=np.int64),
+            "n_actions": np.asarray(n_actions, dtype=np.int64),
             "reward_components": np.empty((0, 3), dtype=np.float32),
-            "outcome_components": np.empty((0, 4), dtype=np.float32),
+            "outcome_components": np.empty((0, 10), dtype=np.float32),
             "done": np.empty((0,), dtype=np.float32),
         }
     seq, static, nseq, nstatic, action, reward, outcome, done = zip(*rows)
@@ -356,6 +530,7 @@ def rows_to_arrays(rows: list) -> dict[str, np.ndarray]:
         "next_seq": np.asarray(nseq, dtype=np.float32),
         "next_static": np.asarray(nstatic, dtype=np.float32),
         "action": np.asarray(action, dtype=np.int64),
+        "n_actions": np.asarray(n_actions, dtype=np.int64),
         "reward_components": np.asarray(reward, dtype=np.float32),
         "outcome_components": np.asarray(outcome, dtype=np.float32),
         "done": np.asarray(done, dtype=np.float32),

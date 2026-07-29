@@ -7,10 +7,10 @@ import models
 
 
 OBJECTIVE_WEIGHTS = {
-    "safety_heavy": (0.70, 0.20, 0.10),
-    "hyper_heavy": (0.20, 0.70, 0.10),
-    "balanced": (0.45, 0.45, 0.10),
-    "low_burden": (0.30, 0.30, 0.40),
+    "burden_heavy": (0.20, 0.80, 0.00),
+    "balanced": (0.50, 0.50, 0.00),
+    "control_heavy": (0.80, 0.20, 0.00),
+    "aggressive_control": (0.95, 0.05, 0.00),
 }
 
 
@@ -51,30 +51,70 @@ def support_metrics(policy_actions: np.ndarray, bc_probs: np.ndarray, logged_act
     }
 
 
+def simple_policy_diagnostics(policy_actions: np.ndarray, logged_actions: np.ndarray) -> dict[str, float]:
+    if len(policy_actions) == 0:
+        return {"action_match_logged": 0.0, "unique_actions": 0.0, "max_action_frac": 0.0}
+    counts = np.bincount(policy_actions)
+    return {
+        "action_match_logged": float(np.mean(policy_actions == logged_actions)),
+        "unique_actions": float(np.count_nonzero(counts)),
+        "max_action_frac": float(counts.max() / max(counts.sum(), 1)),
+    }
+
+
 def observed_metrics(data: dict[str, np.ndarray]) -> dict[str, float]:
     out = data["outcome_components"]
     if len(out) == 0:
-        return {"tir": np.nan, "tbr54": np.nan, "tar250": np.nan, "burden": np.nan}
+        return {
+            "glycemic_effectiveness": np.nan,
+            "low_burden": np.nan,
+            "hypo_safety": np.nan,
+            "tir": np.nan,
+            "tbr70": np.nan,
+            "tbr54": np.nan,
+            "tar180": np.nan,
+            "tar250": np.nan,
+            "bolus_units": np.nan,
+            "bolus_event": np.nan,
+        }
     return {
-        "tir": float(np.mean(out[:, 0])),
-        "tbr54": float(np.mean(out[:, 1])),
-        "tar250": float(np.mean(out[:, 2])),
-        "burden": float(np.mean(out[:, 3])),
+        "glycemic_effectiveness": float(np.mean(out[:, 0])),
+        "low_burden": float(np.mean(out[:, 1])),
+        "hypo_safety": float(np.mean(out[:, 2])),
+        "tir": float(np.mean(out[:, 3])),
+        "tbr70": float(np.mean(out[:, 4])),
+        "tbr54": float(np.mean(out[:, 5])),
+        "tar180": float(np.mean(out[:, 6])),
+        "tar250": float(np.mean(out[:, 7])),
+        "bolus_units": float(np.mean(out[:, 8])),
+        "bolus_event": float(np.mean(out[:, 9])),
     }
 
 
-def policy_value_row(train, eval_data, bc_model, name: str, policy, policy_type: str, fqe_epochs: int) -> dict[str, float | str]:
+def policy_value_row(
+    train,
+    eval_data,
+    bc_model,
+    name: str,
+    policy,
+    policy_type: str,
+    fqe_epochs: int,
+    encoder: str = "mlp",
+) -> dict[str, float | str]:
     row: dict[str, float | str] = {"policy": name}
     reward_components = {
-        "fqe_hypo_safety": train["reward_components"][:, 0],
-        "fqe_hyper_control": train["reward_components"][:, 1],
-        "fqe_low_burden": train["reward_components"][:, 2],
+        "fqe_glycemic_effectiveness": train["reward_components"][:, 0],
+        "fqe_low_burden": train["reward_components"][:, 1],
+        "fqe_hypo_safety": train["reward_components"][:, 2],
     }
     for out_name, reward in reward_components.items():
-        fqe = models.train_fqe(train, reward, policy, policy_type, epochs=fqe_epochs)
+        fqe = models.train_fqe(train, reward, policy, policy_type, epochs=fqe_epochs, encoder=encoder)
         row[out_name] = models.fqe_value(fqe, eval_data, policy, policy_type)
     actions = models.greedy_actions(policy, eval_data) if policy_type != "bc" else models.policy_probs(policy, eval_data).argmax(1)
-    row.update(support_metrics(actions, models.policy_probs(bc_model, eval_data), eval_data["action"]))
+    if bc_model is None:
+        row.update(simple_policy_diagnostics(actions, eval_data["action"]))
+    else:
+        row.update(support_metrics(actions, models.policy_probs(bc_model, eval_data), eval_data["action"]))
     return row
 
 
@@ -95,7 +135,7 @@ def observed_group_values(metadata: pd.DataFrame, data: dict[str, np.ndarray]) -
         return pd.DataFrame()
     out = metadata.reset_index(drop=True).copy()
     vals = data["outcome_components"]
-    for i, col in enumerate(["tir", "tbr54", "tar250", "burden"]):
+    for i, col in enumerate(["glycemic_effectiveness", "low_burden", "hypo_safety", "tir", "tbr70", "tbr54", "tar180", "tar250", "bolus_units", "bolus_event"]):
         out[col] = vals[:, i]
     rows = []
     for label in ["insulin_delivery_algorithm", "insulin_delivery_modality", "treatment_group"]:
@@ -110,10 +150,16 @@ def observed_group_values(metadata: pd.DataFrame, data: dict[str, np.ndarray]) -
                     "policy_label": value,
                     "n": len(group),
                     "subjects": group["id"].nunique(),
+                    "glycemic_effectiveness": group.glycemic_effectiveness.mean(),
+                    "low_burden": group.low_burden.mean(),
+                    "hypo_safety": group.hypo_safety.mean(),
                     "tir": group.tir.mean(),
+                    "tbr70": group.tbr70.mean(),
                     "tbr54": group.tbr54.mean(),
+                    "tar180": group.tar180.mean(),
                     "tar250": group.tar250.mean(),
-                    "burden": group.burden.mean(),
+                    "bolus_units": group.bolus_units.mean(),
+                    "bolus_event": group.bolus_event.mean(),
                 }
             )
     return pd.DataFrame(rows)
