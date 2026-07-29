@@ -43,6 +43,7 @@ def run_data(args) -> None:
         batch_size=args.batch_size,
         max_transitions=args.max_transitions,
         min_split_transitions=args.min_split_transitions,
+        max_subject_transitions=args.max_subject_transitions,
         history_steps=args.history_steps,
         horizon_steps=args.horizon_steps,
         stride_steps=args.stride_steps,
@@ -195,6 +196,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=500_000)
     parser.add_argument("--max-transitions", type=int, default=300_000)
     parser.add_argument("--min-split-transitions", type=int, default=1000)
+    parser.add_argument("--max-subject-transitions", type=int, default=600)
     parser.add_argument("--history-steps", type=int, default=12)
     parser.add_argument("--horizon-steps", type=int, default=6)
     parser.add_argument("--stride-steps", type=int, default=6)

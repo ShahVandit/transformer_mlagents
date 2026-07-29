@@ -25,3 +25,4 @@ UserSettings/
 scripts/models/
 metabonet_offline_rl/data/
 metabonet_offline_rl/results/
+metabonet_offline_rl/server_results/

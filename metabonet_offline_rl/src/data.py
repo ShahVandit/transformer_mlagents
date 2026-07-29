@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -206,6 +207,49 @@ def _build_group(
     return rows, meta
 
 
+def balanced_sample_splits(
+    split_rows: dict[str, list],
+    split_meta: dict[str, list[dict]],
+    max_transitions: int | None,
+    min_split_transitions: int,
+    seed: int = 7,
+) -> tuple[dict[str, list], dict[str, list[dict]]]:
+    if max_transitions is None:
+        return split_rows, split_meta
+    rng = np.random.default_rng(seed)
+    target = max(min_split_transitions, max(1, max_transitions // 3))
+    out_rows: dict[str, list] = {}
+    out_meta: dict[str, list[dict]] = {}
+    for split in ["train", "val", "test"]:
+        rows = split_rows[split]
+        metas = split_meta[split]
+        if len(rows) <= target:
+            out_rows[split] = rows
+            out_meta[split] = metas
+            continue
+        buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for idx, meta in enumerate(metas):
+            buckets[(str(meta["source_file"]), int(meta["action"]))].append(idx)
+        bucket_keys = sorted(buckets)
+        chosen: list[int] = []
+        while len(chosen) < target and bucket_keys:
+            next_keys = []
+            for key in bucket_keys:
+                bucket = buckets[key]
+                if not bucket:
+                    continue
+                chosen.append(bucket.pop(int(rng.integers(0, len(bucket)))))
+                if bucket:
+                    next_keys.append(key)
+                if len(chosen) >= target:
+                    break
+            bucket_keys = next_keys
+        chosen = sorted(chosen)
+        out_rows[split] = [rows[i] for i in chosen]
+        out_meta[split] = [metas[i] for i in chosen]
+    return out_rows, out_meta
+
+
 def build_transition_dataset(
     parquet: Path,
     output_dir: Path,
@@ -213,6 +257,7 @@ def build_transition_dataset(
     batch_size: int = 500_000,
     max_transitions: int | None = 300_000,
     min_split_transitions: int = 1_000,
+    max_subject_transitions: int = 600,
     history_steps: int = 12,
     horizon_steps: int = 6,
     stride_steps: int = 6,
@@ -229,15 +274,7 @@ def build_transition_dataset(
     split_rows: dict[str, list] = {"train": [], "val": [], "test": []}
     split_meta: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     tails: dict[str, pd.DataFrame] = {}
-    target_per_split = None
-    if max_transitions:
-        target_per_split = max(min_split_transitions, max(1, max_transitions // 3))
-
-    def needs_more(split: str) -> bool:
-        return target_per_split is None or len(split_rows[split]) < target_per_split
-
-    def complete() -> bool:
-        return target_per_split is not None and all(not needs_more(split) for split in split_rows)
+    subject_counts: defaultdict[str, int] = defaultdict(int)
 
     for batch_idx, record_batch in enumerate(scanner.to_batches(), start=1):
         frame = _prepare(record_batch.to_pandas())
@@ -255,19 +292,23 @@ def build_transition_dataset(
             rows, metas = _build_group(group, history_steps, horizon_steps, stride_steps, new_mask)
             for row, meta in zip(rows, metas):
                 split = meta["split"]
-                if needs_more(split):
-                    split_rows[split].append(row)
-                    split_meta[split].append(meta)
-                if complete():
-                    break
+                subject = f"{meta['source_file']}::{meta['id']}"
+                if subject_counts[subject] >= max_subject_transitions:
+                    continue
+                split_rows[split].append(row)
+                split_meta[split].append(meta)
+                subject_counts[subject] += 1
             tails[key] = group.tail(history_steps + horizon_steps).copy()
-            if complete():
-                break
         if batch_idx == 1 or batch_idx % 20 == 0:
             counts_now = {split: len(rows) for split, rows in split_rows.items()}
             print(f"[data] batch={batch_idx} transitions={counts_now}", flush=True)
-        if complete():
-            break
+
+    split_rows, split_meta = balanced_sample_splits(
+        split_rows,
+        split_meta,
+        max_transitions=max_transitions,
+        min_split_transitions=min_split_transitions,
+    )
 
     counts = {}
     for split, rows in split_rows.items():
@@ -284,6 +325,7 @@ def build_transition_dataset(
                 "history_steps": history_steps,
                 "horizon_steps": horizon_steps,
                 "stride_steps": stride_steps,
+                "max_subject_transitions": max_subject_transitions,
                 "reward_components": ["neg_tbr54", "neg_tar250", "neg_burden"],
                 "outcome_components": ["tir", "tbr54", "tar250", "burden"],
                 "counts": counts,
