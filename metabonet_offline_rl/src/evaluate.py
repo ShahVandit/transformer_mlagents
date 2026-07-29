@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import balanced_accuracy_score, f1_score
 
 import models
 
@@ -60,6 +61,33 @@ def simple_policy_diagnostics(policy_actions: np.ndarray, logged_actions: np.nda
         "unique_actions": float(np.count_nonzero(counts)),
         "max_action_frac": float(counts.max() / max(counts.sum(), 1)),
     }
+
+
+def policy_action_report(policy_actions: np.ndarray, logged_actions: np.ndarray, labels: list[str], policy: str) -> tuple[dict, pd.DataFrame]:
+    counts = np.bincount(policy_actions, minlength=len(labels)) if len(policy_actions) else np.zeros(len(labels), dtype=int)
+    total = max(int(counts.sum()), 1)
+    row = {
+        "policy": policy,
+        "action_match_logged": float(np.mean(policy_actions == logged_actions)) if len(policy_actions) else 0.0,
+        "balanced_accuracy_logged": float(balanced_accuracy_score(logged_actions, policy_actions)) if len(policy_actions) else 0.0,
+        "macro_f1_logged": float(f1_score(logged_actions, policy_actions, average="macro", zero_division=0)) if len(policy_actions) else 0.0,
+        "unique_actions": float(np.count_nonzero(counts)),
+        "max_action_frac": float(counts.max() / total),
+    }
+    dist_rows = []
+    for action, label in enumerate(labels):
+        row[f"pred_{label}_count"] = int(counts[action])
+        row[f"pred_{label}_frac"] = float(counts[action] / total)
+        dist_rows.append(
+            {
+                "policy": policy,
+                "action": action,
+                "label": label,
+                "pred_count": int(counts[action]),
+                "pred_frac": float(counts[action] / total),
+            }
+        )
+    return row, pd.DataFrame(dist_rows)
 
 
 def observed_metrics(data: dict[str, np.ndarray]) -> dict[str, float]:

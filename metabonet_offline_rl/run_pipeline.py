@@ -176,6 +176,7 @@ def run_evaluate(args) -> None:
     ensure_data()
     RESULTS.mkdir(parents=True, exist_ok=True)
     train, test = load_split("train"), load_split("test")
+    labels = load_config()["action_labels"]
     if len(test["action"]) == 0:
         raise RuntimeError("test split is empty; rerun --stage data with a larger --max-transitions")
     bc = None if args.skip_bc else load_bc(args)
@@ -183,6 +184,21 @@ def run_evaluate(args) -> None:
     policies += load_cql_policies(args, train)
     if not policies:
         raise FileNotFoundError("No policies found for evaluation. Run --stage cql first.")
+
+    logged_dist = evaluate.action_distribution(test, labels)
+    logged_dist.to_csv(RESULTS / "test_logged_action_distribution.csv", index=False)
+    inference_rows = []
+    pred_dist_rows = []
+    for name, policy, ptype in policies:
+        actions = models.greedy_actions(policy, test) if ptype != "bc" else models.policy_probs(policy, test).argmax(1)
+        summary, dist = evaluate.policy_action_report(actions, test["action"], labels, name)
+        inference_rows.append(summary)
+        pred_dist_rows.append(dist)
+    inference = pd.DataFrame(inference_rows)
+    pred_dist = pd.concat(pred_dist_rows, ignore_index=True) if pred_dist_rows else pd.DataFrame()
+    inference.to_csv(RESULTS / "policy_test_inference.csv", index=False)
+    pred_dist.to_csv(RESULTS / "policy_predicted_action_distribution.csv", index=False)
+
     rows = [
         evaluate.policy_value_row(train, test, bc, name, policy, ptype, args.fqe_epochs, encoder=args.encoder)
         for name, policy, ptype in policies
@@ -201,6 +217,16 @@ def run_evaluate(args) -> None:
         group_values = evaluate.observed_group_values(pd.read_parquet(meta_path), test)
         group_values.to_csv(RESULTS / "observed_group_values.csv", index=False)
     write_report(values, test, args)
+    print("\nTEST LOGGED ACTION DISTRIBUTION")
+    print(logged_dist.assign(percent=100 * logged_dist.frac).round(4).to_string(index=False))
+    print("\nPOLICY TEST INFERENCE SUMMARY")
+    summary_cols = ["policy", "action_match_logged", "balanced_accuracy_logged", "macro_f1_logged", "unique_actions", "max_action_frac"]
+    frac_cols = [f"pred_{label}_frac" for label in labels]
+    count_cols = [f"pred_{label}_count" for label in labels]
+    print(inference[summary_cols + frac_cols].round(4).to_string(index=False))
+    print("\nPOLICY PREDICTED ACTION COUNTS")
+    print(inference[["policy"] + count_cols].to_string(index=False))
+    print("\nFQE / PARETO POLICY VALUES")
     print(values.round(4).to_string(index=False))
 
 
