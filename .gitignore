@@ -23,3 +23,5 @@ UserSettings/
 *.onnx
 *.pt
 scripts/models/
+metabonet_offline_rl/data/
+metabonet_offline_rl/results/
