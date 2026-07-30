@@ -525,23 +525,28 @@ def tune_hyperparameters(args) -> None:
                 "action_match_val": DiscreteActionMatchEvaluator(val_dataset.episodes),
             },
         )
-        metrics = {} if not history else {key: float(value) for key, value in history[-1][1].items()}
-        row = {
-            "trial": trial,
-            "policy": args.tune_policy,
-            "gamma": gamma,
-            "learning_rate": learning_rate,
-            "cql_alpha": alpha,
-            "target_update_interval": target_update_interval,
-            "batch_size": args.tune_batch_size,
-        }
-        row.update(metrics)
-        rows.append(row)
+        trial_rows = []
+        for epoch, metrics in history:
+            row = {
+                "trial": trial,
+                "epoch": int(epoch),
+                "step": int(epoch) * steps_per_epoch,
+                "policy": args.tune_policy,
+                "gamma": gamma,
+                "learning_rate": learning_rate,
+                "cql_alpha": alpha,
+                "target_update_interval": target_update_interval,
+                "batch_size": args.tune_batch_size,
+            }
+            row.update({key: float(value) for key, value in metrics.items()})
+            trial_rows.append(row)
+        rows.extend(trial_rows)
+        last_row = trial_rows[-1] if trial_rows else {}
         print(
             f"[tune] result trial={trial} "
-            f"td_error_val={row.get('td_error_val', float('nan')):.4f} "
-            f"avg_value_val={row.get('avg_value_val', float('nan')):.4f} "
-            f"action_match_val={row.get('action_match_val', float('nan')):.4f}",
+            f"last_td_error_val={last_row.get('td_error_val', float('nan')):.4f} "
+            f"last_avg_value_val={last_row.get('avg_value_val', float('nan')):.4f} "
+            f"last_action_match_val={last_row.get('action_match_val', float('nan')):.4f}",
             flush=True,
         )
 
@@ -553,6 +558,7 @@ def tune_hyperparameters(args) -> None:
         best = frame.loc[frame["td_error_val"].idxmin()]
         print(
             f"[tune] best_by_td_error trial={int(best.trial)} "
+            f"epoch={int(best.epoch)} step={int(best.step)} "
             f"gamma={best.gamma} lr={best.learning_rate} "
             f"alpha={best.cql_alpha} target_update_interval={int(best.target_update_interval)} "
             f"td_error_val={best.td_error_val:.4f}",
