@@ -359,6 +359,19 @@ def train_policies(args) -> None:
     MODELS.mkdir(parents=True, exist_ok=True)
     metrics = []
     for name, weights in evaluate.OBJECTIVE_WEIGHTS.items():
+        model_path = MODELS / f"cql_{name}.d3"
+        if args.skip_existing and model_path.exists():
+            row = {
+                "policy": f"cql_{name}",
+                "model_path": str(model_path),
+                "w_effectiveness": weights[0],
+                "w_burden": weights[1],
+                "w_hypo_safety": weights[2],
+                "skipped_existing": True,
+            }
+            metrics.append(row)
+            print(f"\n[d3rlpy:train] skip existing policy=cql_{name} path={model_path}", flush=True)
+            continue
         dataset = make_mdp_dataset(train, scalar_reward(train, weights))
         steps_per_epoch = max(1, min(args.n_steps_per_epoch, args.n_steps))
         save_interval = max(1, args.n_steps // steps_per_epoch + 1)
@@ -379,7 +392,6 @@ def train_policies(args) -> None:
             show_progress=True,
             save_interval=save_interval,
         )
-        model_path = MODELS / f"cql_{name}.d3"
         algo.save(str(model_path))
         row = {"policy": f"cql_{name}", "model_path": str(model_path), "w_effectiveness": weights[0], "w_burden": weights[1], "w_hypo_safety": weights[2]}
         if history:
@@ -390,6 +402,13 @@ def train_policies(args) -> None:
 
 def saved_policy_paths() -> list[tuple[str, Path]]:
     return [(f"cql_{name}", MODELS / f"cql_{name}.d3") for name in evaluate.OBJECTIVE_WEIGHTS]
+
+
+def existing_policy_paths() -> list[tuple[str, Path]]:
+    paths = [(name, path) for name, path in saved_policy_paths() if path.exists()]
+    if not paths:
+        raise FileNotFoundError(f"No d3rlpy models found in {MODELS}. Run --stage train first.")
+    return paths
 
 
 def load_policy(path: Path, device: str):
@@ -412,7 +431,7 @@ def run_infer(args) -> None:
     cm_rows = []
     print("\nTEST LOGGED ACTION DISTRIBUTION")
     print(logged_dist.round(4).to_string(index=False))
-    for policy_name, path in saved_policy_paths():
+    for policy_name, path in existing_policy_paths():
         algo = load_policy(path, args.device)
         pred = algo.predict(test["observations"].astype(np.float32)).astype(int).reshape(-1)
         pred_dist = action_distribution(pred, labels)
@@ -464,7 +483,7 @@ def run_fqe(args) -> None:
     train = load_arrays("train")
     test = load_arrays("test")
     rows = []
-    for policy_name, path in saved_policy_paths():
+    for policy_name, path in existing_policy_paths():
         algo = load_policy(path, args.device)
         pred_test = algo.predict(test["observations"].astype(np.float32)).astype(int).reshape(-1)
         row = {"policy": policy_name}
@@ -561,6 +580,7 @@ def main() -> None:
     parser.add_argument("--cql-alpha", type=float, default=1.0)
     parser.add_argument("--target-update-interval", type=int, default=8000)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--skip-existing", action="store_true", help="During --stage train/all, do not retrain policies whose .d3 file already exists.")
     args = parser.parse_args()
 
     if args.stage in ["data", "all"]:
