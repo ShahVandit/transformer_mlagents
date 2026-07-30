@@ -44,14 +44,30 @@ def _import_d3rlpy():
         from d3rlpy.algos import DiscreteCQLConfig
         from d3rlpy.constants import ActionSpace
         from d3rlpy.dataset import MDPDataset
-        from d3rlpy.metrics import InitialStateValueEstimationEvaluator
+        from d3rlpy.metrics import (
+            AverageValueEstimationEvaluator,
+            DiscreteActionMatchEvaluator,
+            InitialStateValueEstimationEvaluator,
+            TDErrorEvaluator,
+        )
         from d3rlpy.ope import DiscreteFQE, FQEConfig
     except ImportError as exc:
         raise ImportError(
             "d3rlpy is not installed in this Python environment. "
             "Create/activate the d3rlpy env and run `python -m pip install -r metabonet_offline_rl/requirements.txt`."
         ) from exc
-    return d3rlpy, DiscreteCQLConfig, ActionSpace, MDPDataset, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator
+    return (
+        d3rlpy,
+        DiscreteCQLConfig,
+        ActionSpace,
+        MDPDataset,
+        DiscreteFQE,
+        FQEConfig,
+        InitialStateValueEstimationEvaluator,
+        TDErrorEvaluator,
+        AverageValueEstimationEvaluator,
+        DiscreteActionMatchEvaluator,
+    )
 
 
 def _flat_observation(seq: np.ndarray, static: np.ndarray) -> np.ndarray:
@@ -312,8 +328,24 @@ def scalar_reward(arrays: dict[str, np.ndarray], weights: tuple[float, float, fl
     return (arrays["reward_components"] @ np.asarray(weights, dtype=np.float32)).astype(np.float32)
 
 
+def logged_reward_summary(
+    train_reward: np.ndarray,
+    val_reward: np.ndarray,
+    train_dataset,
+    val_dataset,
+) -> dict[str, float]:
+    train_returns = [episode.compute_return() for episode in train_dataset.episodes]
+    val_returns = [episode.compute_return() for episode in val_dataset.episodes]
+    return {
+        "logged_train_avg_step_reward": float(np.mean(train_reward)) if len(train_reward) else float("nan"),
+        "logged_val_avg_step_reward": float(np.mean(val_reward)) if len(val_reward) else float("nan"),
+        "logged_train_avg_episode_return": float(np.mean(train_returns)) if train_returns else float("nan"),
+        "logged_val_avg_episode_return": float(np.mean(val_returns)) if val_returns else float("nan"),
+    }
+
+
 def make_mdp_dataset(arrays: dict[str, np.ndarray], reward: np.ndarray):
-    _, _, ActionSpace, MDPDataset, _, _, _ = _import_d3rlpy()
+    _, _, ActionSpace, MDPDataset, *_ = _import_d3rlpy()
     return MDPDataset(
         observations=arrays["observations"].astype(np.float32),
         actions=arrays["actions"].astype(np.int64),
@@ -355,8 +387,20 @@ def run_diagnostics() -> None:
 
 
 def train_policies(args) -> None:
-    d3rlpy, DiscreteCQLConfig, _, _, _, _, _ = _import_d3rlpy()
+    (
+        d3rlpy,
+        DiscreteCQLConfig,
+        _,
+        _,
+        _,
+        _,
+        _,
+        TDErrorEvaluator,
+        AverageValueEstimationEvaluator,
+        DiscreteActionMatchEvaluator,
+    ) = _import_d3rlpy()
     train = load_arrays("train")
+    val = load_arrays("val")
     MODELS.mkdir(parents=True, exist_ok=True)
     metrics = []
     for name, weights in evaluate.OBJECTIVE_WEIGHTS.items():
@@ -373,7 +417,10 @@ def train_policies(args) -> None:
             metrics.append(row)
             print(f"\n[d3rlpy:train] skip existing policy=cql_{name} path={model_path}", flush=True)
             continue
-        dataset = make_mdp_dataset(train, scalar_reward(train, weights))
+        train_reward = scalar_reward(train, weights)
+        val_reward = scalar_reward(val, weights)
+        dataset = make_mdp_dataset(train, train_reward)
+        val_dataset = make_mdp_dataset(val, val_reward)
         steps_per_epoch = max(1, min(args.n_steps_per_epoch, args.n_steps))
         save_interval = max(1, args.n_steps // steps_per_epoch + 1)
         algo = DiscreteCQLConfig(
@@ -383,7 +430,15 @@ def train_policies(args) -> None:
             alpha=args.cql_alpha,
             target_update_interval=args.target_update_interval,
         ).create(device=args.device)
+        reward_summary = logged_reward_summary(train_reward, val_reward, dataset, val_dataset)
         print(f"\n[d3rlpy:train] policy=cql_{name} weights={weights} steps={args.n_steps} device={args.device}", flush=True)
+        print(
+            "[d3rlpy:train] logged reward "
+            f"train_step={reward_summary['logged_train_avg_step_reward']:.4f} "
+            f"val_step={reward_summary['logged_val_avg_step_reward']:.4f} "
+            f"val_episode_return={reward_summary['logged_val_avg_episode_return']:.4f}",
+            flush=True,
+        )
         history = algo.fit(
             dataset,
             n_steps=args.n_steps,
@@ -392,9 +447,15 @@ def train_policies(args) -> None:
             with_timestamp=False,
             show_progress=True,
             save_interval=save_interval,
+            evaluators={
+                "td_error_val": TDErrorEvaluator(val_dataset.episodes),
+                "avg_value_val": AverageValueEstimationEvaluator(val_dataset.episodes),
+                "action_match_val": DiscreteActionMatchEvaluator(val_dataset.episodes),
+            },
         )
         algo.save(str(model_path))
         row = {"policy": f"cql_{name}", "model_path": str(model_path), "w_effectiveness": weights[0], "w_burden": weights[1], "w_hypo_safety": weights[2]}
+        row.update(reward_summary)
         if history:
             row.update({f"last_{k}": float(v) for k, v in history[-1][1].items()})
         metrics.append(row)
@@ -479,7 +540,7 @@ def fqe_value(fqe, observations: np.ndarray, actions: np.ndarray, batch_size: in
 
 
 def run_fqe(args) -> None:
-    _, _, _, _, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator = _import_d3rlpy()
+    _, _, _, _, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator, *_ = _import_d3rlpy()
     RESULTS.mkdir(parents=True, exist_ok=True)
     train = load_arrays("train")
     test = load_arrays("test")
