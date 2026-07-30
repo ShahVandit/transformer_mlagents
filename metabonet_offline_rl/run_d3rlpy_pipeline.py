@@ -44,13 +44,14 @@ def _import_d3rlpy():
         from d3rlpy.algos import DiscreteCQLConfig
         from d3rlpy.constants import ActionSpace
         from d3rlpy.dataset import MDPDataset
+        from d3rlpy.metrics import InitialStateValueEstimationEvaluator
         from d3rlpy.ope import DiscreteFQE, FQEConfig
     except ImportError as exc:
         raise ImportError(
             "d3rlpy is not installed in this Python environment. "
-            "Create/activate the d3rlpy env and run `pip install -e ./d3rlpy` from repo root."
+            "Create/activate the d3rlpy env and run `python -m pip install -r metabonet_offline_rl/requirements.txt`."
         ) from exc
-    return d3rlpy, DiscreteCQLConfig, ActionSpace, MDPDataset, DiscreteFQE, FQEConfig
+    return d3rlpy, DiscreteCQLConfig, ActionSpace, MDPDataset, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator
 
 
 def _flat_observation(seq: np.ndarray, static: np.ndarray) -> np.ndarray:
@@ -312,7 +313,7 @@ def scalar_reward(arrays: dict[str, np.ndarray], weights: tuple[float, float, fl
 
 
 def make_mdp_dataset(arrays: dict[str, np.ndarray], reward: np.ndarray):
-    _, _, ActionSpace, MDPDataset, _, _ = _import_d3rlpy()
+    _, _, ActionSpace, MDPDataset, _, _, _ = _import_d3rlpy()
     return MDPDataset(
         observations=arrays["observations"].astype(np.float32),
         actions=arrays["actions"].astype(np.int64),
@@ -354,7 +355,7 @@ def run_diagnostics() -> None:
 
 
 def train_policies(args) -> None:
-    d3rlpy, DiscreteCQLConfig, _, _, _, _ = _import_d3rlpy()
+    d3rlpy, DiscreteCQLConfig, _, _, _, _, _ = _import_d3rlpy()
     train = load_arrays("train")
     MODELS.mkdir(parents=True, exist_ok=True)
     metrics = []
@@ -478,7 +479,7 @@ def fqe_value(fqe, observations: np.ndarray, actions: np.ndarray, batch_size: in
 
 
 def run_fqe(args) -> None:
-    _, _, _, _, DiscreteFQE, FQEConfig = _import_d3rlpy()
+    _, _, _, _, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator = _import_d3rlpy()
     RESULTS.mkdir(parents=True, exist_ok=True)
     train = load_arrays("train")
     test = load_arrays("test")
@@ -489,6 +490,7 @@ def run_fqe(args) -> None:
         row = {"policy": policy_name}
         for component_idx, component in enumerate(REWARD_COMPONENTS):
             dataset = make_mdp_dataset(train, train["reward_components"][:, component_idx].astype(np.float32))
+            eval_dataset = make_mdp_dataset(test, test["reward_components"][:, component_idx].astype(np.float32))
             fqe = DiscreteFQE(algo=algo, config=FQEConfig(batch_size=args.fqe_batch_size, gamma=args.gamma), device=args.device)
             steps_per_epoch = max(1, min(args.fqe_steps_per_epoch, args.fqe_steps))
             save_interval = max(1, args.fqe_steps // steps_per_epoch + 1)
@@ -502,7 +504,13 @@ def run_fqe(args) -> None:
                 show_progress=True,
                 save_interval=save_interval,
             )
-            row[f"fqe_{component}"] = fqe_value(fqe, test["observations"], pred_test)
+            init_value = InitialStateValueEstimationEvaluator(episodes=eval_dataset.episodes)(fqe, eval_dataset)
+            all_state_value = fqe_value(fqe, test["observations"], pred_test)
+            row[f"fqe_{component}"] = init_value
+            row[f"fqe_initial_{component}"] = init_value
+            row[f"fqe_all_state_{component}"] = all_state_value
+            effective_horizon = 1.0 / (1.0 - args.gamma) if args.gamma < 1.0 else float("nan")
+            row[f"fqe_step_equiv_{component}"] = init_value / effective_horizon if np.isfinite(effective_horizon) else float("nan")
         rows.append(row)
     values = pd.DataFrame(rows)
     observed = observed_metrics(test)
