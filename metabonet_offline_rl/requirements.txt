@@ -13,4 +13,4 @@ typing-extensions
 structlog
 colorama
 dataclasses-json
--e ./d3rlpy
+d3rlpy>=2.8.1
