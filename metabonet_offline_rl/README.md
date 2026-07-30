@@ -57,6 +57,30 @@ python metabonet_offline_rl/run_pipeline.py \
   --skip-bc
 ```
 
+## d3rlpy Run
+
+Use this path for the d3rlpy port. It uses ordered episodes and four train-quantile total-insulin actions, not bolus-only actions.
+
+```bash
+python metabonet_offline_rl/run_d3rlpy_pipeline.py \
+  --stage all \
+  --parquet /scratch/metabonet_public.parquet \
+  --max-transitions 300000 \
+  --n-steps 50000 \
+  --train-batch-size 1024 \
+  --device cuda:0
+```
+
+FQE/Pareto is intentionally separate because it is slower:
+
+```bash
+python metabonet_offline_rl/run_d3rlpy_pipeline.py \
+  --stage fqe \
+  --parquet /scratch/metabonet_public.parquet \
+  --fqe-steps 30000 \
+  --device cuda:0
+```
+
 ## Outputs
 
 Outputs are written to `metabonet_offline_rl/results/`.
