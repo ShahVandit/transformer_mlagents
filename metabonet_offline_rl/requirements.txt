@@ -13,4 +13,5 @@ typing-extensions
 structlog
 colorama
 dataclasses-json
+mypy-extensions
 d3rlpy>=2.8.1
