@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 import time
@@ -462,6 +463,104 @@ def train_policies(args) -> None:
     pd.DataFrame(metrics).to_csv(RESULTS / "training_metrics.csv", index=False)
 
 
+def _parse_grid(text: str, cast):
+    return [cast(value.strip()) for value in text.split(",") if value.strip()]
+
+
+def tune_hyperparameters(args) -> None:
+    """Run short validation-only CQL pilots before expensive full training."""
+    (
+        _,
+        DiscreteCQLConfig,
+        _,
+        _,
+        _,
+        _,
+        _,
+        TDErrorEvaluator,
+        AverageValueEstimationEvaluator,
+        DiscreteActionMatchEvaluator,
+    ) = _import_d3rlpy()
+    train = load_arrays("train")
+    val = load_arrays("val")
+    weights = evaluate.OBJECTIVE_WEIGHTS[args.tune_policy]
+    train_reward = scalar_reward(train, weights)
+    val_reward = scalar_reward(val, weights)
+    train_dataset = make_mdp_dataset(train, train_reward)
+    val_dataset = make_mdp_dataset(val, val_reward)
+
+    grid = itertools.product(
+        _parse_grid(args.tune_gammas, float),
+        _parse_grid(args.tune_learning_rates, float),
+        _parse_grid(args.tune_cql_alphas, float),
+        _parse_grid(args.tune_target_update_intervals, int),
+    )
+    rows = []
+    for trial, (gamma, learning_rate, alpha, target_update_interval) in enumerate(grid, 1):
+        print(
+            f"[tune] trial={trial} policy={args.tune_policy} "
+            f"gamma={gamma} lr={learning_rate} alpha={alpha} "
+            f"target_update_interval={target_update_interval}",
+            flush=True,
+        )
+        algo = DiscreteCQLConfig(
+            learning_rate=learning_rate,
+            batch_size=args.tune_batch_size,
+            gamma=gamma,
+            alpha=alpha,
+            target_update_interval=target_update_interval,
+        ).create(device=args.device)
+        steps_per_epoch = max(1, min(args.tune_steps_per_epoch, args.tune_steps))
+        history = algo.fit(
+            train_dataset,
+            n_steps=args.tune_steps,
+            n_steps_per_epoch=steps_per_epoch,
+            experiment_name=f"d3rlpy_tune_{args.tune_policy}_{trial}",
+            with_timestamp=False,
+            show_progress=True,
+            save_interval=max(1, args.tune_steps // steps_per_epoch + 1),
+            evaluators={
+                "td_error_val": TDErrorEvaluator(val_dataset.episodes),
+                "avg_value_val": AverageValueEstimationEvaluator(val_dataset.episodes),
+                "action_match_val": DiscreteActionMatchEvaluator(val_dataset.episodes),
+            },
+        )
+        metrics = {} if not history else {key: float(value) for key, value in history[-1][1].items()}
+        row = {
+            "trial": trial,
+            "policy": args.tune_policy,
+            "gamma": gamma,
+            "learning_rate": learning_rate,
+            "cql_alpha": alpha,
+            "target_update_interval": target_update_interval,
+            "batch_size": args.tune_batch_size,
+        }
+        row.update(metrics)
+        rows.append(row)
+        print(
+            f"[tune] result trial={trial} "
+            f"td_error_val={row.get('td_error_val', float('nan')):.4f} "
+            f"avg_value_val={row.get('avg_value_val', float('nan')):.4f} "
+            f"action_match_val={row.get('action_match_val', float('nan')):.4f}",
+            flush=True,
+        )
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    output = RESULTS / f"hyperparameter_tuning_{args.tune_policy}.csv"
+    frame = pd.DataFrame(rows)
+    frame.to_csv(output, index=False)
+    if not frame.empty and "td_error_val" in frame:
+        best = frame.loc[frame["td_error_val"].idxmin()]
+        print(
+            f"[tune] best_by_td_error trial={int(best.trial)} "
+            f"gamma={best.gamma} lr={best.learning_rate} "
+            f"alpha={best.cql_alpha} target_update_interval={int(best.target_update_interval)} "
+            f"td_error_val={best.td_error_val:.4f}",
+            flush=True,
+        )
+    print(f"[tune] wrote {output}", flush=True)
+
+
 def saved_policy_paths() -> list[tuple[str, Path]]:
     return [(f"cql_{name}", MODELS / f"cql_{name}.d3") for name in evaluate.OBJECTIVE_WEIGHTS]
 
@@ -627,7 +726,7 @@ def run_data(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["data", "diagnostics", "train", "infer", "fqe", "all"], default="all")
+    parser.add_argument("--stage", choices=["data", "diagnostics", "tune", "train", "infer", "fqe", "all"], default="all")
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--download-url", default=None)
     parser.add_argument("--batch-size", type=int, default=500_000)
@@ -648,6 +747,14 @@ def main() -> None:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--cql-alpha", type=float, default=1.0)
     parser.add_argument("--target-update-interval", type=int, default=8000)
+    parser.add_argument("--tune-policy", choices=list(evaluate.OBJECTIVE_WEIGHTS), default="balanced")
+    parser.add_argument("--tune-steps", type=int, default=2_000)
+    parser.add_argument("--tune-steps-per-epoch", type=int, default=500)
+    parser.add_argument("--tune-batch-size", type=int, default=1024)
+    parser.add_argument("--tune-gammas", default="0.95,0.98,0.99")
+    parser.add_argument("--tune-learning-rates", default="1e-4")
+    parser.add_argument("--tune-cql-alphas", default="2.0")
+    parser.add_argument("--tune-target-update-intervals", default="1000")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--skip-existing", action="store_true", help="During --stage train/all, do not retrain policies whose .d3 file already exists.")
     args = parser.parse_args()
@@ -656,6 +763,8 @@ def main() -> None:
         run_data(args)
     if args.stage in ["diagnostics", "all"]:
         run_diagnostics()
+    if args.stage == "tune":
+        tune_hyperparameters(args)
     if args.stage in ["train", "all"]:
         train_policies(args)
     if args.stage in ["infer", "all"]:
