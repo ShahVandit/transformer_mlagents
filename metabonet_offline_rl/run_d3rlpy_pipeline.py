@@ -647,13 +647,29 @@ def fqe_value(fqe, observations: np.ndarray, actions: np.ndarray, batch_size: in
 def run_fqe(args) -> None:
     _, _, _, _, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator, *_ = _import_d3rlpy()
     RESULTS.mkdir(parents=True, exist_ok=True)
+    config = load_config()
+    labels = config["action_labels"]
     train = load_arrays("train")
     test = load_arrays("test")
     rows = []
     for policy_name, path in existing_policy_paths():
         algo = load_policy(path, args.device)
         pred_test = algo.predict(test["observations"].astype(np.float32)).astype(int).reshape(-1)
-        row = {"policy": policy_name}
+        objective_name = policy_name.removeprefix("cql_")
+        weights = evaluate.OBJECTIVE_WEIGHTS[objective_name]
+        counts = np.bincount(pred_test, minlength=len(labels))
+        total = max(int(counts.sum()), 1)
+        row = {
+            "policy": policy_name,
+            "w_glycemic_effectiveness": weights[0],
+            "w_low_burden": weights[1],
+            "w_hypo_safety": weights[2],
+            "pred_mean_action_bin": float(np.mean(pred_test)) if len(pred_test) else float("nan"),
+            "pred_highest_insulin_percent": float(100 * counts[-1] / total),
+            "pred_above_median_insulin_percent": float(100 * counts[2:].sum() / total),
+        }
+        for idx, label in enumerate(labels):
+            row[f"pred_{label}_percent"] = float(100 * counts[idx] / total)
         for component_idx, component in enumerate(REWARD_COMPONENTS):
             dataset = make_mdp_dataset(train, train["reward_components"][:, component_idx].astype(np.float32))
             eval_dataset = make_mdp_dataset(test, test["reward_components"][:, component_idx].astype(np.float32))
@@ -682,12 +698,48 @@ def run_fqe(args) -> None:
     observed = observed_metrics(test)
     values["observed_test_tir"] = observed["tir"]
     values["observed_test_hypo_safety"] = observed["hypo_safety"]
-    values["pareto"] = evaluate.pareto_mask(values, ["fqe_glycemic_effectiveness", "fqe_low_burden"])
+    values = add_pareto_analysis(values)
     values.to_csv(RESULTS / "policy_values.csv", index=False)
     values[values.pareto].to_csv(RESULTS / "pareto_policies.csv", index=False)
+    values.to_csv(RESULTS / "pareto_analysis.csv", index=False)
     plot_pareto(values, RESULTS / "pareto_frontier.png")
+    plot_pareto_analysis(values, RESULTS / "pareto_frontier_analysis.png")
     print("\nD3RLPY FQE / PARETO POLICY VALUES")
     print(values.round(4).to_string(index=False))
+
+
+def add_pareto_analysis(values: pd.DataFrame) -> pd.DataFrame:
+    values = values.copy()
+    objectives = ["fqe_glycemic_effectiveness", "fqe_low_burden"]
+    values["pareto"] = evaluate.pareto_mask(values, objectives)
+    obj = values[objectives].to_numpy(float)
+    dominated_by = []
+    for i in range(len(values)):
+        dominators = []
+        if np.isfinite(obj[i]).all():
+            for j in range(len(values)):
+                if i == j or not np.isfinite(obj[j]).all():
+                    continue
+                if np.all(obj[j] >= obj[i]) and np.any(obj[j] > obj[i]):
+                    dominators.append(str(values.iloc[j].policy))
+        dominated_by.append(";".join(dominators))
+    values["dominated_by"] = dominated_by
+    values["frontier_order"] = np.nan
+    values["delta_glycemic_from_prev_frontier"] = np.nan
+    values["delta_low_burden_from_prev_frontier"] = np.nan
+    values["burden_cost_per_control_gain"] = np.nan
+    frontier = values[values["pareto"]].sort_values("fqe_glycemic_effectiveness")
+    previous_idx = None
+    for order, idx in enumerate(frontier.index, 1):
+        values.loc[idx, "frontier_order"] = order
+        if previous_idx is not None:
+            dx = values.loc[idx, "fqe_glycemic_effectiveness"] - values.loc[previous_idx, "fqe_glycemic_effectiveness"]
+            dy = values.loc[idx, "fqe_low_burden"] - values.loc[previous_idx, "fqe_low_burden"]
+            values.loc[idx, "delta_glycemic_from_prev_frontier"] = dx
+            values.loc[idx, "delta_low_burden_from_prev_frontier"] = dy
+            values.loc[idx, "burden_cost_per_control_gain"] = -dy / dx if dx != 0 else np.nan
+        previous_idx = idx
+    return values
 
 
 def observed_metrics(arrays: dict[str, np.ndarray]) -> dict[str, float]:
@@ -709,6 +761,38 @@ def plot_pareto(frame: pd.DataFrame, path: Path) -> None:
     ax.set_ylabel("FQE low treatment burden (higher better)")
     ax.set_title("d3rlpy CQL Pareto tradeoff")
     ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def plot_pareto_analysis(frame: pd.DataFrame, path: Path) -> None:
+    if frame.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    pareto = frame["pareto"].to_numpy(bool)
+    scatter = ax.scatter(
+        frame.fqe_glycemic_effectiveness,
+        frame.fqe_low_burden,
+        s=np.where(pareto, 120, 70),
+        c=frame.w_glycemic_effectiveness,
+        cmap="viridis",
+        marker="o",
+        edgecolors=np.where(pareto, "black", "none"),
+        alpha=0.9,
+    )
+    frontier = frame[frame["pareto"]].sort_values("fqe_glycemic_effectiveness")
+    if len(frontier) >= 2:
+        ax.plot(frontier.fqe_glycemic_effectiveness, frontier.fqe_low_burden, color="black", linewidth=1.2, alpha=0.8)
+    for _, row in frame.iterrows():
+        label = f"{row.policy}\nhigh={row.pred_highest_insulin_percent:.1f}%"
+        ax.annotate(label, (row.fqe_glycemic_effectiveness, row.fqe_low_burden), fontsize=7, xytext=(5, 5), textcoords="offset points")
+    ax.set_xlabel("FQE glycemic effectiveness (higher better)")
+    ax.set_ylabel("FQE low insulin burden (higher better)")
+    ax.set_title("Estimated Pareto frontier: glucose control vs insulin burden")
+    ax.grid(alpha=0.25)
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Glycemic-control reward weight")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
