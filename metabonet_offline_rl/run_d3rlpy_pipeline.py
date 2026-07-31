@@ -652,6 +652,7 @@ def run_fqe(args) -> None:
     train = load_arrays("train")
     test = load_arrays("test")
     rows = []
+    metric_rows = []
     for policy_name, path in existing_policy_paths():
         algo = load_policy(path, args.device)
         pred_test = algo.predict(test["observations"].astype(np.float32)).astype(int).reshape(-1)
@@ -670,14 +671,28 @@ def run_fqe(args) -> None:
         }
         for idx, label in enumerate(labels):
             row[f"pred_{label}_percent"] = float(100 * counts[idx] / total)
-        for component_idx, component in enumerate(REWARD_COMPONENTS):
-            dataset = make_mdp_dataset(train, train["reward_components"][:, component_idx].astype(np.float32))
-            eval_dataset = make_mdp_dataset(test, test["reward_components"][:, component_idx].astype(np.float32))
+
+        fqe_jobs: list[tuple[str, np.ndarray, np.ndarray]] = []
+        if args.fqe_mode in ["scalarized", "both"]:
+            fqe_jobs.append(("scalarized", scalar_reward(train, weights), scalar_reward(test, weights)))
+        if args.fqe_mode in ["components", "both"]:
+            for component_idx, component in enumerate(REWARD_COMPONENTS):
+                fqe_jobs.append(
+                    (
+                        component,
+                        train["reward_components"][:, component_idx].astype(np.float32),
+                        test["reward_components"][:, component_idx].astype(np.float32),
+                    )
+                )
+
+        for component, train_reward, test_reward in fqe_jobs:
+            dataset = make_mdp_dataset(train, train_reward)
+            eval_dataset = make_mdp_dataset(test, test_reward)
             fqe = DiscreteFQE(algo=algo, config=FQEConfig(batch_size=args.fqe_batch_size, gamma=args.gamma), device=args.device)
             steps_per_epoch = max(1, min(args.fqe_steps_per_epoch, args.fqe_steps))
             save_interval = max(1, args.fqe_steps // steps_per_epoch + 1)
             print(f"\n[d3rlpy:fqe] policy={policy_name} component={component} steps={args.fqe_steps}", flush=True)
-            fqe.fit(
+            history = fqe.fit(
                 dataset,
                 n_steps=args.fqe_steps,
                 n_steps_per_epoch=steps_per_epoch,
@@ -685,7 +700,21 @@ def run_fqe(args) -> None:
                 with_timestamp=False,
                 show_progress=True,
                 save_interval=save_interval,
+                evaluators={
+                    "initial_state_value_val": InitialStateValueEstimationEvaluator(episodes=eval_dataset.episodes),
+                },
             )
+            for epoch, metrics in history:
+                metric_row = {
+                    "policy": policy_name,
+                    "component": component,
+                    "epoch": int(epoch),
+                    "step": int(epoch) * steps_per_epoch,
+                    "gamma": args.gamma,
+                    "fqe_batch_size": args.fqe_batch_size,
+                }
+                metric_row.update({key: float(value) for key, value in metrics.items()})
+                metric_rows.append(metric_row)
             init_value = InitialStateValueEstimationEvaluator(episodes=eval_dataset.episodes)(fqe, eval_dataset)
             all_state_value = fqe_value(fqe, test["observations"], pred_test)
             row[f"fqe_{component}"] = init_value
@@ -698,14 +727,24 @@ def run_fqe(args) -> None:
     observed = observed_metrics(test)
     values["observed_test_tir"] = observed["tir"]
     values["observed_test_hypo_safety"] = observed["hypo_safety"]
-    values = add_pareto_analysis(values)
+    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
+        values = add_pareto_analysis(values)
+    else:
+        values["pareto"] = np.nan
+        values["dominated_by"] = ""
     values.to_csv(RESULTS / "policy_values.csv", index=False)
-    values[values.pareto].to_csv(RESULTS / "pareto_policies.csv", index=False)
+    pd.DataFrame(metric_rows).to_csv(RESULTS / "fqe_training_metrics.csv", index=False)
+    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
+        values[values.pareto].to_csv(RESULTS / "pareto_policies.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(RESULTS / "pareto_policies.csv", index=False)
     values.to_csv(RESULTS / "pareto_analysis.csv", index=False)
-    plot_pareto(values, RESULTS / "pareto_frontier.png")
-    plot_pareto_analysis(values, RESULTS / "pareto_frontier_analysis.png")
+    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
+        plot_pareto(values, RESULTS / "pareto_frontier.png")
+        plot_pareto_analysis(values, RESULTS / "pareto_frontier_analysis.png")
     print("\nD3RLPY FQE / PARETO POLICY VALUES")
     print(values.round(4).to_string(index=False))
+    print(f"\n[d3rlpy:fqe] wrote metrics={RESULTS / 'fqe_training_metrics.csv'} mode={args.fqe_mode}")
 
 
 def add_pareto_analysis(values: pd.DataFrame) -> pd.DataFrame:
@@ -833,6 +872,12 @@ def main() -> None:
     parser.add_argument("--fqe-steps-per-epoch", type=int, default=10_000)
     parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--fqe-batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--fqe-mode",
+        choices=["scalarized", "components", "both"],
+        default="scalarized",
+        help="scalarized trains 1 FQE per policy; components trains objective-wise FQE for Pareto axes; both runs all.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--cql-alpha", type=float, default=1.0)
