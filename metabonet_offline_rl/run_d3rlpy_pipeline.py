@@ -22,10 +22,14 @@ sys.path.insert(0, str(SRC))
 
 import data as D  # noqa: E402
 import evaluate  # noqa: E402
+import ope  # noqa: E402
 
 
 ACTION_LABELS = ["insulin_q1", "insulin_q2", "insulin_q3", "insulin_q4"]
 REWARD_COMPONENTS = ["glycemic_effectiveness", "low_burden", "hypo_safety"]
+CLINICAL_POLICY_NAME = "cql_clinical"
+CLINICAL_REWARD_NAME = "piecewise_cgm"
+REWARD_VARIANTS = ["current", "piecewise", "tir_binary", "asymmetric", "smooth"]
 OUTCOME_COMPONENTS = [
     "glycemic_effectiveness",
     "low_burden",
@@ -48,10 +52,8 @@ def _import_d3rlpy():
         from d3rlpy.metrics import (
             AverageValueEstimationEvaluator,
             DiscreteActionMatchEvaluator,
-            InitialStateValueEstimationEvaluator,
             TDErrorEvaluator,
         )
-        from d3rlpy.ope import DiscreteFQE, FQEConfig
     except ImportError as exc:
         raise ImportError(
             "d3rlpy is not installed in this Python environment. "
@@ -62,9 +64,6 @@ def _import_d3rlpy():
         DiscreteCQLConfig,
         ActionSpace,
         MDPDataset,
-        DiscreteFQE,
-        FQEConfig,
-        InitialStateValueEstimationEvaluator,
         TDErrorEvaluator,
         AverageValueEstimationEvaluator,
         DiscreteActionMatchEvaluator,
@@ -88,6 +87,26 @@ def _labels_from_edges(edges: np.ndarray) -> list[str]:
         f"insulin_{edges[1]:.3f}_{edges[2]:.3f}",
         f"insulin_gt{edges[2]:.3f}",
     ]
+
+
+def glucose_reward_variants(valid: np.ndarray) -> np.ndarray:
+    """Return reference-style glucose rewards averaged over the future window."""
+    piecewise = np.select(
+        [valid < 40, valid < 70, valid <= 180, valid <= 300],
+        [-1.0, -0.4, 1.0, -0.3], default=-0.6,
+    )
+    tir_binary = ((valid >= 70) & (valid <= 180)).astype(np.float32)
+    asymmetric = np.select(
+        [valid < 40, valid < 70, valid <= 180, valid <= 300],
+        [-2.0, -1.0, 1.0, -0.3], default=-0.6,
+    )
+    smooth = 2.0 * np.exp(-((valid - 110.0) ** 2) / (2 * 45.0 ** 2)) - 1.0
+    return np.asarray([
+        float(np.mean(piecewise)),
+        float(np.mean(tir_binary)),
+        float(np.mean(asymmetric)),
+        float(np.mean(smooth)),
+    ], dtype=np.float32)
 
 
 def _build_group_rows(
@@ -155,6 +174,7 @@ def _build_group_rows(
         glycemic_effectiveness = -float(np.mean(np.maximum(valid - 180.0, 0.0) / 70.0)) - 2.0 * tar250
         low_burden = -interval_insulin
         hypo_safety = -(tbr70 + 3.0 * tbr54)
+        reference_rewards = glucose_reward_variants(valid)
         rows.append(
             {
                 "split": split,
@@ -164,6 +184,7 @@ def _build_group_rows(
                 "observation": _flat_observation(D._encode_window(features, t, history_steps), vectors[t]),
                 "interval_insulin": interval_insulin,
                 "reward_components": np.asarray([glycemic_effectiveness, low_burden, hypo_safety], dtype=np.float32),
+                "reward_variants": reference_rewards,
                 "outcome_components": np.asarray(
                     [glycemic_effectiveness, low_burden, hypo_safety, tir, tbr70, tbr54, tar180, tar250, interval_insulin],
                     dtype=np.float32,
@@ -265,6 +286,9 @@ def build_ordered_dataset(
         reward_components = np.asarray([row["reward_components"] for row in rows], dtype=np.float32)
         if reward_components.size == 0:
             reward_components = np.empty((0, len(REWARD_COMPONENTS)), dtype=np.float32)
+        reward_variants = np.asarray([row["reward_variants"] for row in rows], dtype=np.float32)
+        if reward_variants.size == 0:
+            reward_variants = np.empty((0, 4), dtype=np.float32)
         outcome_components = np.asarray([row["outcome_components"] for row in rows], dtype=np.float32)
         if outcome_components.size == 0:
             outcome_components = np.empty((0, len(OUTCOME_COMPONENTS)), dtype=np.float32)
@@ -276,6 +300,7 @@ def build_ordered_dataset(
             observations=observations,
             actions=actions,
             reward_components=reward_components,
+            reward_variants=reward_variants,
             outcome_components=outcome_components,
             terminals=terminals,
             interval_insulin=interval_insulin,
@@ -301,6 +326,7 @@ def build_ordered_dataset(
         "reward_steps": reward_steps,
         "stride_steps": stride_steps,
         "reward_components": REWARD_COMPONENTS,
+        "reward_variants": ["piecewise", "tir_binary", "asymmetric", "smooth"],
         "outcome_components": OUTCOME_COMPONENTS,
         "counts": counts,
     }
@@ -327,6 +353,33 @@ def load_config() -> dict:
 
 def scalar_reward(arrays: dict[str, np.ndarray], weights: tuple[float, float, float]) -> np.ndarray:
     return (arrays["reward_components"] @ np.asarray(weights, dtype=np.float32)).astype(np.float32)
+
+
+def scalar_reward_variant(
+    arrays: dict[str, np.ndarray],
+    weights: tuple[float, float, float],
+    variant: str,
+) -> np.ndarray:
+    """Scalarize the normal components, optionally replacing glycemic reward."""
+    if variant == "current":
+        return scalar_reward(arrays, weights)
+    if "reward_variants" not in arrays:
+        raise ValueError("Dataset lacks reward_variants; rerun --stage data.")
+    variant_index = {"piecewise": 0, "tir_binary": 1, "asymmetric": 2, "smooth": 3}[variant]
+    components = arrays["reward_components"].copy()
+    components[:, 0] = arrays["reward_variants"][:, variant_index]
+    return (components @ np.asarray(weights, dtype=np.float32)).astype(np.float32)
+
+
+def clinical_piecewise_reward(arrays: dict[str, np.ndarray]) -> np.ndarray:
+    """ICU-reference-style CGM reward for the delayed outcome window.
+
+    The data builder stores this as the first reference reward variant:
+    <40: -1.0, 40-70: -0.4, 70-180: +1.0, 180-300: -0.3, >300: -0.6.
+    """
+    if "reward_variants" not in arrays:
+        raise ValueError("Dataset lacks reference rewards; rerun --stage data.")
+    return arrays["reward_variants"][:, 0].astype(np.float32)
 
 
 def logged_reward_summary(
@@ -393,9 +446,6 @@ def train_policies(args) -> None:
         DiscreteCQLConfig,
         _,
         _,
-        _,
-        _,
-        _,
         TDErrorEvaluator,
         AverageValueEstimationEvaluator,
         DiscreteActionMatchEvaluator,
@@ -403,64 +453,51 @@ def train_policies(args) -> None:
     train = load_arrays("train")
     val = load_arrays("val")
     MODELS.mkdir(parents=True, exist_ok=True)
-    metrics = []
-    for name, weights in evaluate.OBJECTIVE_WEIGHTS.items():
-        model_path = MODELS / f"cql_{name}.d3"
-        if args.skip_existing and model_path.exists():
-            row = {
-                "policy": f"cql_{name}",
-                "model_path": str(model_path),
-                "w_effectiveness": weights[0],
-                "w_burden": weights[1],
-                "w_hypo_safety": weights[2],
-                "skipped_existing": True,
-            }
-            metrics.append(row)
-            print(f"\n[d3rlpy:train] skip existing policy=cql_{name} path={model_path}", flush=True)
-            continue
-        train_reward = scalar_reward(train, weights)
-        val_reward = scalar_reward(val, weights)
-        dataset = make_mdp_dataset(train, train_reward)
-        val_dataset = make_mdp_dataset(val, val_reward)
-        steps_per_epoch = max(1, min(args.n_steps_per_epoch, args.n_steps))
-        save_interval = max(1, args.n_steps // steps_per_epoch + 1)
-        algo = DiscreteCQLConfig(
-            learning_rate=args.learning_rate,
-            batch_size=args.train_batch_size,
-            gamma=args.gamma,
-            alpha=args.cql_alpha,
-            target_update_interval=args.target_update_interval,
-        ).create(device=args.device)
-        reward_summary = logged_reward_summary(train_reward, val_reward, dataset, val_dataset)
-        print(f"\n[d3rlpy:train] policy=cql_{name} weights={weights} steps={args.n_steps} device={args.device}", flush=True)
-        print(
-            "[d3rlpy:train] logged reward "
-            f"train_step={reward_summary['logged_train_avg_step_reward']:.4f} "
-            f"val_step={reward_summary['logged_val_avg_step_reward']:.4f} "
-            f"val_episode_return={reward_summary['logged_val_avg_episode_return']:.4f}",
-            flush=True,
-        )
-        history = algo.fit(
-            dataset,
-            n_steps=args.n_steps,
-            n_steps_per_epoch=steps_per_epoch,
-            experiment_name=f"d3rlpy_cql_{name}",
-            with_timestamp=False,
-            show_progress=True,
-            save_interval=save_interval,
-            evaluators={
-                "td_error_val": TDErrorEvaluator(val_dataset.episodes),
-                "avg_value_val": AverageValueEstimationEvaluator(val_dataset.episodes),
-                "action_match_val": DiscreteActionMatchEvaluator(val_dataset.episodes),
-            },
-        )
-        algo.save(str(model_path))
-        row = {"policy": f"cql_{name}", "model_path": str(model_path), "w_effectiveness": weights[0], "w_burden": weights[1], "w_hypo_safety": weights[2]}
-        row.update(reward_summary)
-        if history:
-            row.update({f"last_{k}": float(v) for k, v in history[-1][1].items()})
-        metrics.append(row)
-    pd.DataFrame(metrics).to_csv(RESULTS / "training_metrics.csv", index=False)
+    model_path = MODELS / f"{CLINICAL_POLICY_NAME}.d3"
+    if args.skip_existing and model_path.exists():
+        print(f"\n[d3rlpy:train] skip existing policy={CLINICAL_POLICY_NAME} path={model_path}", flush=True)
+        return
+    train_reward = clinical_piecewise_reward(train)
+    val_reward = clinical_piecewise_reward(val)
+    dataset = make_mdp_dataset(train, train_reward)
+    val_dataset = make_mdp_dataset(val, val_reward)
+    steps_per_epoch = max(1, min(args.n_steps_per_epoch, args.n_steps))
+    algo = DiscreteCQLConfig(
+        learning_rate=args.learning_rate,
+        batch_size=args.train_batch_size,
+        gamma=args.gamma,
+        alpha=args.cql_alpha,
+        target_update_interval=args.target_update_interval,
+    ).create(device=args.device)
+    reward_summary = logged_reward_summary(train_reward, val_reward, dataset, val_dataset)
+    print(f"\n[d3rlpy:train] policy={CLINICAL_POLICY_NAME} reward={CLINICAL_REWARD_NAME} steps={args.n_steps} device={args.device}", flush=True)
+    print(
+        "[d3rlpy:train] logged reward "
+        f"train_step={reward_summary['logged_train_avg_step_reward']:.4f} "
+        f"val_step={reward_summary['logged_val_avg_step_reward']:.4f} "
+        f"val_episode_return={reward_summary['logged_val_avg_episode_return']:.4f}",
+        flush=True,
+    )
+    history = algo.fit(
+        dataset,
+        n_steps=args.n_steps,
+        n_steps_per_epoch=steps_per_epoch,
+        experiment_name=f"d3rlpy_{CLINICAL_POLICY_NAME}",
+        with_timestamp=False,
+        show_progress=True,
+        save_interval=max(1, args.n_steps // steps_per_epoch + 1),
+        evaluators={
+            "td_error_val": TDErrorEvaluator(val_dataset.episodes),
+            "avg_value_val": AverageValueEstimationEvaluator(val_dataset.episodes),
+            "action_match_val": DiscreteActionMatchEvaluator(val_dataset.episodes),
+        },
+    )
+    algo.save(str(model_path))
+    row = {"policy": CLINICAL_POLICY_NAME, "reward": CLINICAL_REWARD_NAME, "model_path": str(model_path)}
+    row.update(reward_summary)
+    if history:
+        row.update({f"last_{k}": float(v) for k, v in history[-1][1].items()})
+    pd.DataFrame([row]).to_csv(RESULTS / "training_metrics.csv", index=False)
 
 
 def _parse_grid(text: str, cast):
@@ -474,18 +511,14 @@ def tune_hyperparameters(args) -> None:
         DiscreteCQLConfig,
         _,
         _,
-        _,
-        _,
-        _,
         TDErrorEvaluator,
         AverageValueEstimationEvaluator,
         DiscreteActionMatchEvaluator,
     ) = _import_d3rlpy()
     train = load_arrays("train")
     val = load_arrays("val")
-    weights = evaluate.OBJECTIVE_WEIGHTS[args.tune_policy]
-    train_reward = scalar_reward(train, weights)
-    val_reward = scalar_reward(val, weights)
+    train_reward = clinical_piecewise_reward(train)
+    val_reward = clinical_piecewise_reward(val)
     train_dataset = make_mdp_dataset(train, train_reward)
     val_dataset = make_mdp_dataset(val, val_reward)
 
@@ -498,7 +531,7 @@ def tune_hyperparameters(args) -> None:
     rows = []
     for trial, (gamma, learning_rate, alpha, target_update_interval) in enumerate(grid, 1):
         print(
-            f"[tune] trial={trial} policy={args.tune_policy} "
+            f"[tune] trial={trial} policy={CLINICAL_POLICY_NAME} "
             f"gamma={gamma} lr={learning_rate} alpha={alpha} "
             f"target_update_interval={target_update_interval}",
             flush=True,
@@ -515,7 +548,7 @@ def tune_hyperparameters(args) -> None:
             train_dataset,
             n_steps=args.tune_steps,
             n_steps_per_epoch=steps_per_epoch,
-            experiment_name=f"d3rlpy_tune_{args.tune_policy}_{trial}",
+            experiment_name=f"d3rlpy_tune_{CLINICAL_POLICY_NAME}_{trial}",
             with_timestamp=False,
             show_progress=True,
             save_interval=max(1, args.tune_steps // steps_per_epoch + 1),
@@ -531,7 +564,7 @@ def tune_hyperparameters(args) -> None:
                 "trial": trial,
                 "epoch": int(epoch),
                 "step": int(epoch) * steps_per_epoch,
-                "policy": args.tune_policy,
+                "policy": CLINICAL_POLICY_NAME,
                 "gamma": gamma,
                 "learning_rate": learning_rate,
                 "cql_alpha": alpha,
@@ -551,7 +584,7 @@ def tune_hyperparameters(args) -> None:
         )
 
     RESULTS.mkdir(parents=True, exist_ok=True)
-    output = RESULTS / f"hyperparameter_tuning_{args.tune_policy}.csv"
+    output = RESULTS / "hyperparameter_tuning_clinical.csv"
     frame = pd.DataFrame(rows)
     frame.to_csv(output, index=False)
     if not frame.empty and "td_error_val" in frame:
@@ -568,7 +601,7 @@ def tune_hyperparameters(args) -> None:
 
 
 def saved_policy_paths() -> list[tuple[str, Path]]:
-    return [(f"cql_{name}", MODELS / f"cql_{name}.d3") for name in evaluate.OBJECTIVE_WEIGHTS]
+    return [(CLINICAL_POLICY_NAME, MODELS / f"{CLINICAL_POLICY_NAME}.d3")]
 
 
 def existing_policy_paths() -> list[tuple[str, Path]]:
@@ -635,116 +668,133 @@ def run_infer(args) -> None:
     print(pred_frame.round(4).to_string(index=False))
 
 
-def fqe_value(fqe, observations: np.ndarray, actions: np.ndarray, batch_size: int = 8192) -> float:
-    values = []
-    for start in range(0, len(observations), batch_size):
-        obs = observations[start: start + batch_size].astype(np.float32)
-        act = actions[start: start + batch_size].astype(np.int64)
-        values.append(fqe.predict_value(obs, act).reshape(-1))
-    return float(np.concatenate(values).mean()) if values else float("nan")
+def next_observations(observations: np.ndarray, metadata: pd.DataFrame, terminals: np.ndarray) -> np.ndarray:
+    """Construct next observations without crossing patient trajectories."""
+    result = np.zeros_like(observations, dtype=np.float32)
+    for indices in ope.episode_indices(metadata, len(observations), terminals):
+        if len(indices) > 1:
+            result[indices[:-1]] = observations[indices[1:]]
+    return result
 
 
 def run_fqe(args) -> None:
-    _, _, _, _, DiscreteFQE, FQEConfig, InitialStateValueEstimationEvaluator, *_ = _import_d3rlpy()
     RESULTS.mkdir(parents=True, exist_ok=True)
     config = load_config()
     labels = config["action_labels"]
     train = load_arrays("train")
+    val = load_arrays("val")
     test = load_arrays("test")
-    rows = []
+    train_meta = pd.read_parquet(DATA / "d3rlpy_metadata_train.parquet")
+    val_meta = pd.read_parquet(DATA / "d3rlpy_metadata_val.parquet")
+    test_meta = pd.read_parquet(DATA / "d3rlpy_metadata_test.parquet")
+    n_actions = len(labels)
+    test_trajs = ope.episode_indices(test_meta, len(test["observations"]), test["terminals"])
+    behavior_test, _ = ope.behavior_probabilities(
+        train["observations"], train["actions"], test["observations"], n_actions
+    )
+    train_next = next_observations(train["observations"], train_meta, train["terminals"])
+    test_next = next_observations(test["observations"], test_meta, test["terminals"])
+    val_next = next_observations(val["observations"], val_meta, val["terminals"])
+    policy_name, path = existing_policy_paths()[0]
+    algo = load_policy(path, args.device)
+    train_reward = clinical_piecewise_reward(train)
+    val_reward = clinical_piecewise_reward(val)
+    test_reward = clinical_piecewise_reward(test)
+    cql_train_next_q = ope.cql_q_values(algo, train_next, n_actions)
+    cql_val_next_q = ope.cql_q_values(algo, val_next, n_actions)
+    cql_test_q = ope.cql_q_values(algo, test["observations"], n_actions)
+    cql_test_next_q = ope.cql_q_values(algo, test_next, n_actions)
+    target_train_next = ope.softmax_probabilities(cql_train_next_q, args.ope_temperature)
+    target_val_next = ope.softmax_probabilities(cql_val_next_q, args.ope_temperature)
+    target_test = ope.softmax_probabilities(cql_test_q, args.ope_temperature)
+    target_test_next = ope.softmax_probabilities(cql_test_next_q, args.ope_temperature)
+    pred_test = cql_test_q.argmax(axis=1).astype(int)
+
+    steps_per_epoch = max(1, min(args.fqe_steps_per_epoch, args.fqe_steps))
+    print(
+        f"\n[fqe] policy={policy_name} reward={CLINICAL_REWARD_NAME} "
+        f"steps={args.fqe_steps} target=softmax_q(tau={args.ope_temperature})",
+        flush=True,
+    )
+    fqe, history = ope.fit_softmax_fqe(
+        train["observations"],
+        train["actions"],
+        train_reward,
+        train_next,
+        train["terminals"],
+        target_train_next,
+        val["observations"],
+        val["actions"],
+        val_reward,
+        val_next,
+        val["terminals"],
+        target_val_next,
+        n_actions=n_actions,
+        device=args.device,
+        n_steps=args.fqe_steps,
+        batch_size=args.fqe_batch_size,
+        gamma=args.gamma,
+        learning_rate=args.fqe_learning_rate,
+        target_tau=args.fqe_target_tau,
+        steps_per_epoch=steps_per_epoch,
+    )
     metric_rows = []
-    for policy_name, path in existing_policy_paths():
-        algo = load_policy(path, args.device)
-        pred_test = algo.predict(test["observations"].astype(np.float32)).astype(int).reshape(-1)
-        objective_name = policy_name.removeprefix("cql_")
-        weights = evaluate.OBJECTIVE_WEIGHTS[objective_name]
-        counts = np.bincount(pred_test, minlength=len(labels))
-        total = max(int(counts.sum()), 1)
+    for epoch, metrics in enumerate(history, 1):
         row = {
             "policy": policy_name,
-            "w_glycemic_effectiveness": weights[0],
-            "w_low_burden": weights[1],
-            "w_hypo_safety": weights[2],
-            "pred_mean_action_bin": float(np.mean(pred_test)) if len(pred_test) else float("nan"),
-            "pred_highest_insulin_percent": float(100 * counts[-1] / total),
-            "pred_above_median_insulin_percent": float(100 * counts[2:].sum() / total),
+            "reward": CLINICAL_REWARD_NAME,
+            "epoch": epoch,
+            "gamma": args.gamma,
+            "ope_temperature": args.ope_temperature,
+            "fqe_batch_size": args.fqe_batch_size,
+            "fqe_learning_rate": args.fqe_learning_rate,
+            "fqe_target_tau": args.fqe_target_tau,
         }
-        for idx, label in enumerate(labels):
-            row[f"pred_{label}_percent"] = float(100 * counts[idx] / total)
+        row.update({key: float(value) for key, value in metrics.items()})
+        metric_rows.append(row)
 
-        fqe_jobs: list[tuple[str, np.ndarray, np.ndarray]] = []
-        if args.fqe_mode in ["scalarized", "both"]:
-            fqe_jobs.append(("scalarized", scalar_reward(train, weights), scalar_reward(test, weights)))
-        if args.fqe_mode in ["components", "both"]:
-            for component_idx, component in enumerate(REWARD_COMPONENTS):
-                fqe_jobs.append(
-                    (
-                        component,
-                        train["reward_components"][:, component_idx].astype(np.float32),
-                        test["reward_components"][:, component_idx].astype(np.float32),
-                    )
-                )
+    q_test = ope.fqe_q_values(fqe, test["observations"], args.device)
+    q_val = ope.fqe_q_values(fqe, val["observations"], args.device)
+    q_test_next = ope.fqe_q_values(fqe, test_next, args.device)
+    q_val_next = ope.fqe_q_values(fqe, val_next, args.device)
+    test_log_weights = ope.cumulative_log_ratios(test["actions"].astype(int), target_test, behavior_test, test_trajs, args.ope_ratio_clip)
+    clinician_returns = ope.discounted_clinician_returns(test_reward, test_trajs, args.gamma)
+    fqe_returns = np.asarray([float(np.sum(target_test[idx[0]] * q_test[idx[0]])) for idx in test_trajs if len(idx)])
+    trajectory_positions = {id(trajectory): i for i, trajectory in enumerate(test_trajs)}
 
-        for component, train_reward, test_reward in fqe_jobs:
-            dataset = make_mdp_dataset(train, train_reward)
-            eval_dataset = make_mdp_dataset(test, test_reward)
-            fqe = DiscreteFQE(algo=algo, config=FQEConfig(batch_size=args.fqe_batch_size, gamma=args.gamma), device=args.device)
-            steps_per_epoch = max(1, min(args.fqe_steps_per_epoch, args.fqe_steps))
-            save_interval = max(1, args.fqe_steps // steps_per_epoch + 1)
-            print(f"\n[d3rlpy:fqe] policy={policy_name} component={component} steps={args.fqe_steps}", flush=True)
-            history = fqe.fit(
-                dataset,
-                n_steps=args.fqe_steps,
-                n_steps_per_epoch=steps_per_epoch,
-                experiment_name=f"fqe_{policy_name}_{component}",
-                with_timestamp=False,
-                show_progress=True,
-                save_interval=save_interval,
-                evaluators={
-                    "initial_state_value_val": InitialStateValueEstimationEvaluator(episodes=eval_dataset.episodes),
-                },
-            )
-            for epoch, metrics in history:
-                metric_row = {
-                    "policy": policy_name,
-                    "component": component,
-                    "epoch": int(epoch),
-                    "step": int(epoch) * steps_per_epoch,
-                    "gamma": args.gamma,
-                    "fqe_batch_size": args.fqe_batch_size,
-                }
-                metric_row.update({key: float(value) for key, value in metrics.items()})
-                metric_rows.append(metric_row)
-            init_value = InitialStateValueEstimationEvaluator(episodes=eval_dataset.episodes)(fqe, eval_dataset)
-            all_state_value = fqe_value(fqe, test["observations"], pred_test)
-            row[f"fqe_{component}"] = init_value
-            row[f"fqe_initial_{component}"] = init_value
-            row[f"fqe_all_state_{component}"] = all_state_value
-            effective_horizon = 1.0 / (1.0 - args.gamma) if args.gamma < 1.0 else float("nan")
-            row[f"fqe_step_equiv_{component}"] = init_value / effective_horizon if np.isfinite(effective_horizon) else float("nan")
-        rows.append(row)
-    values = pd.DataFrame(rows)
-    observed = observed_metrics(test)
-    values["observed_test_tir"] = observed["tir"]
-    values["observed_test_hypo_safety"] = observed["hypo_safety"]
-    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
-        values = add_pareto_analysis(values)
-    else:
-        values["pareto"] = np.nan
-        values["dominated_by"] = ""
-    values.to_csv(RESULTS / "policy_values.csv", index=False)
+    def wis_estimate(sample):
+        return ope.wis_value(test_reward, sample, [test_log_weights[trajectory_positions[id(x)]] for x in sample], args.gamma)
+
+    def wdr_estimate(sample):
+        return ope.wdr_value(test_reward, test["actions"], sample, [test_log_weights[trajectory_positions[id(x)]] for x in sample], q_test, target_test, args.gamma)
+
+    clinician_point, clinician_lo, clinician_hi = ope.bootstrap_mean(clinician_returns, args.ope_bootstrap)
+    fqe_point, fqe_lo, fqe_hi = ope.bootstrap_mean(fqe_returns, args.ope_bootstrap)
+    wis_point, wis_lo, wis_hi = ope.bootstrap_estimator(wis_estimate, test_trajs, args.ope_bootstrap)
+    wdr_point, wdr_lo, wdr_hi = ope.bootstrap_estimator(wdr_estimate, test_trajs, args.ope_bootstrap)
+    val_residual = ope.fqe_bellman_residual(q_val, q_val_next, val["actions"], val_reward, val["terminals"], target_val_next, args.gamma)
+    test_residual = ope.fqe_bellman_residual(q_test, q_test_next, test["actions"], test_reward, test["terminals"], target_test_next, args.gamma)
+    counts = np.bincount(pred_test, minlength=n_actions)
+    chosen_support = behavior_test[np.arange(len(pred_test)), pred_test]
+    values = pd.DataFrame([{
+        "policy": policy_name, "reward": CLINICAL_REWARD_NAME, "target_policy": "softmax_cql_q",
+        "ope_temperature": args.ope_temperature,
+        "fqe_value": fqe_point, "fqe_ci_low": fqe_lo, "fqe_ci_high": fqe_hi,
+        "clinician_value": clinician_point, "clinician_ci_low": clinician_lo, "clinician_ci_high": clinician_hi,
+        "wis_value": wis_point, "wis_ci_low": wis_lo, "wis_ci_high": wis_hi,
+        "wdr_value": wdr_point, "wdr_ci_low": wdr_lo, "wdr_ci_high": wdr_hi,
+        "fqe_bellman_mse_val": val_residual["bellman_mse"], "fqe_bellman_mae_val": val_residual["bellman_mae"],
+        "fqe_bellman_mse_test": test_residual["bellman_mse"], "fqe_bellman_mae_test": test_residual["bellman_mae"],
+        "behavior_support_mean": float(np.mean(chosen_support)), "behavior_support_p10": float(np.percentile(chosen_support, 10)),
+        "behavior_support_frac_ge_0p05": float(np.mean(chosen_support >= 0.05)),
+        "pred_mean_action_bin": float(np.mean(pred_test)), "pred_highest_insulin_percent": float(100 * counts[-1] / max(int(counts.sum()), 1)),
+    }])
+    values["wdr_vs_clinician"] = np.where(values.wdr_ci_low > values.clinician_value, "ABOVE", np.where(values.wdr_ci_high < values.clinician_value, "BELOW", "OVERLAPS"))
+    values.to_csv(RESULTS / "ope_policy_comparison.csv", index=False)
     pd.DataFrame(metric_rows).to_csv(RESULTS / "fqe_training_metrics.csv", index=False)
-    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
-        values[values.pareto].to_csv(RESULTS / "pareto_policies.csv", index=False)
-    else:
-        pd.DataFrame().to_csv(RESULTS / "pareto_policies.csv", index=False)
-    values.to_csv(RESULTS / "pareto_analysis.csv", index=False)
-    if {"fqe_glycemic_effectiveness", "fqe_low_burden"}.issubset(values.columns):
-        plot_pareto(values, RESULTS / "pareto_frontier.png")
-        plot_pareto_analysis(values, RESULTS / "pareto_frontier_analysis.png")
-    print("\nD3RLPY FQE / PARETO POLICY VALUES")
+    print("\nLEARNED POLICY VS LOGGED CLINICIAN OPE")
     print(values.round(4).to_string(index=False))
-    print(f"\n[d3rlpy:fqe] wrote metrics={RESULTS / 'fqe_training_metrics.csv'} mode={args.fqe_mode}")
+    print(f"\n[fqe] trained 1 softmax-policy FQE model; wrote {RESULTS / 'fqe_training_metrics.csv'}", flush=True)
 
 
 def add_pareto_analysis(values: pd.DataFrame) -> pd.DataFrame:
@@ -786,6 +836,43 @@ def observed_metrics(arrays: dict[str, np.ndarray]) -> dict[str, float]:
     if len(out) == 0:
         return {name: float("nan") for name in OUTCOME_COMPONENTS}
     return {name: float(np.mean(out[:, idx])) for idx, name in enumerate(OUTCOME_COMPONENTS)}
+
+
+def ope_comparison_frame(values: pd.DataFrame) -> pd.DataFrame:
+    """Readable policy-vs-logged-clinician OPE table for the scalarized reward."""
+    required = {
+        "policy", "clinician_return_scalarized", "clinician_return_scalarized_ci_low",
+        "clinician_return_scalarized_ci_high", "fqe_bootstrap_scalarized",
+        "fqe_scalarized_ci_low", "fqe_scalarized_ci_high", "wis_scalarized",
+        "wis_scalarized_ci_low", "wis_scalarized_ci_high", "wdr_scalarized",
+        "wdr_scalarized_ci_low", "wdr_scalarized_ci_high",
+    }
+    if not required.issubset(values.columns):
+        return pd.DataFrame()
+    frame = values[[
+        "policy", "clinician_return_scalarized", "clinician_return_scalarized_ci_low",
+        "clinician_return_scalarized_ci_high", "fqe_bootstrap_scalarized",
+        "fqe_scalarized_ci_low", "fqe_scalarized_ci_high", "wis_scalarized",
+        "wis_scalarized_ci_low", "wis_scalarized_ci_high", "wdr_scalarized",
+        "wdr_scalarized_ci_low", "wdr_scalarized_ci_high", "fqe_bellman_mse_val_scalarized",
+        "fqe_bellman_mae_val_scalarized", "fqe_bellman_mse_test_scalarized",
+        "fqe_bellman_mae_test_scalarized", "behavior_support_mean", "behavior_support_p10",
+        "behavior_support_frac_ge_0p05",
+    ]].copy()
+    frame.columns = [
+        "policy", "clinician_value", "clinician_ci_low", "clinician_ci_high",
+        "fqe_value", "fqe_ci_low", "fqe_ci_high", "wis_value", "wis_ci_low",
+        "wis_ci_high", "wdr_value", "wdr_ci_low", "wdr_ci_high",
+        "fqe_bellman_mse_val", "fqe_bellman_mae_val", "fqe_bellman_mse_test",
+        "fqe_bellman_mae_test", "behavior_support_mean", "behavior_support_p10",
+        "behavior_support_frac_ge_0p05",
+    ]
+    frame["wdr_vs_clinician"] = np.where(
+        frame.wdr_ci_low > frame.clinician_value,
+        "ABOVE",
+        np.where(frame.wdr_ci_high < frame.clinician_value, "BELOW", "OVERLAPS"),
+    )
+    return frame
 
 
 def plot_pareto(frame: pd.DataFrame, path: Path) -> None:
@@ -870,19 +957,12 @@ def main() -> None:
     parser.add_argument("--n-steps-per-epoch", type=int, default=10_000)
     parser.add_argument("--fqe-steps", type=int, default=30_000)
     parser.add_argument("--fqe-steps-per-epoch", type=int, default=10_000)
-    parser.add_argument("--train-batch-size", type=int, default=1024)
+    parser.add_argument("--train-batch-size", type=int, default=512)
     parser.add_argument("--fqe-batch-size", type=int, default=1024)
-    parser.add_argument(
-        "--fqe-mode",
-        choices=["scalarized", "components", "both"],
-        default="scalarized",
-        help="scalarized trains 1 FQE per policy; components trains objective-wise FQE for Pareto axes; both runs all.",
-    )
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--cql-alpha", type=float, default=1.0)
-    parser.add_argument("--target-update-interval", type=int, default=8000)
-    parser.add_argument("--tune-policy", choices=list(evaluate.OBJECTIVE_WEIGHTS), default="balanced")
+    parser.add_argument("--target-update-interval", type=int, default=1000)
     parser.add_argument("--tune-steps", type=int, default=2_000)
     parser.add_argument("--tune-steps-per-epoch", type=int, default=500)
     parser.add_argument("--tune-batch-size", type=int, default=1024)
@@ -891,6 +971,14 @@ def main() -> None:
     parser.add_argument("--tune-cql-alphas", default="2.0")
     parser.add_argument("--tune-target-update-intervals", default="1000")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--ope-temperature", type=float, default=0.5,
+                        help="softmax temperature for the frozen CQL target policy used by FQE, WIS, and WDR")
+    parser.add_argument("--ope-ratio-clip", type=float, default=5.0,
+                        help="clip per-step log importance ratios")
+    parser.add_argument("--ope-bootstrap", type=int, default=200,
+                        help="patient-level bootstrap replicates for OPE intervals")
+    parser.add_argument("--fqe-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--fqe-target-tau", type=float, default=0.005)
     parser.add_argument("--skip-existing", action="store_true", help="During --stage train/all, do not retrain policies whose .d3 file already exists.")
     args = parser.parse_args()
 
