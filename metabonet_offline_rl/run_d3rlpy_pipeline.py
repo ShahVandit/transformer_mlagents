@@ -30,6 +30,7 @@ REWARD_COMPONENTS = ["glycemic_effectiveness", "low_burden", "hypo_safety"]
 CLINICAL_POLICY_NAME = "cql_clinical"
 CLINICAL_REWARD_NAME = "piecewise_cgm"
 REWARD_VARIANTS = ["current", "piecewise", "tir_binary", "asymmetric", "smooth"]
+TRANSITION_CAP_FRACTIONS = {"train": 0.80, "val": 0.10, "test": 0.10}
 OUTCOME_COMPONENTS = [
     "glycemic_effectiveness",
     "low_burden",
@@ -87,6 +88,19 @@ def _labels_from_edges(edges: np.ndarray) -> list[str]:
         f"insulin_{edges[1]:.3f}_{edges[2]:.3f}",
         f"insulin_gt{edges[2]:.3f}",
     ]
+
+
+def transition_caps(max_transitions: int | None) -> dict[str, int] | None:
+    """Allocate a total transition budget without wasting training capacity."""
+    if max_transitions is None:
+        return None
+    train_cap = int(max_transitions * TRANSITION_CAP_FRACTIONS["train"])
+    val_cap = int(max_transitions * TRANSITION_CAP_FRACTIONS["val"])
+    return {
+        "train": train_cap,
+        "val": val_cap,
+        "test": max_transitions - train_cap - val_cap,
+    }
 
 
 def glucose_reward_variants(valid: np.ndarray) -> np.ndarray:
@@ -216,7 +230,7 @@ def build_ordered_dataset(
     columns = sorted(set(D.REQUIRED_COLUMNS) | (set(D.OPTIONAL_COLUMNS) & set(dataset.schema.names)))
     scanner = dataset.scanner(columns=columns, batch_size=batch_size, use_threads=True)
 
-    target_per_split = None if max_transitions is None else max(1, max_transitions // 3)
+    split_caps = transition_caps(max_transitions)
     split_rows: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     subject_counts: dict[str, int] = {}
     tails: dict[str, pd.DataFrame] = {}
@@ -251,8 +265,8 @@ def build_ordered_dataset(
             if not rows:
                 continue
             split = rows[0]["split"]
-            if target_per_split is not None:
-                remaining_split = target_per_split - len(split_rows[split])
+            if split_caps is not None:
+                remaining_split = split_caps[split] - len(split_rows[split])
                 if remaining_split <= 0:
                     continue
                 rows = rows[:remaining_split]
@@ -266,7 +280,7 @@ def build_ordered_dataset(
         if batch_idx == 1 or batch_idx % 20 == 0:
             counts_now = {split: len(rows) for split, rows in split_rows.items()}
             print(f"[d3rlpy:data] batch={batch_idx} transitions={counts_now} elapsed={time.perf_counter() - started:.1f}s", flush=True)
-        if target_per_split is not None and all(len(split_rows[s]) >= target_per_split for s in ["train", "val", "test"]):
+        if split_caps is not None and all(len(split_rows[s]) >= split_caps[s] for s in ["train", "val", "test"]):
             break
 
     train_insulin = np.asarray([row["interval_insulin"] for row in split_rows["train"]], dtype=np.float32)
@@ -331,7 +345,7 @@ def build_ordered_dataset(
         "counts": counts,
     }
     (output_dir / "d3rlpy_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    print(f"[d3rlpy:data] transitions={counts}", flush=True)
+    print(f"[d3rlpy:data] transitions={counts} caps={split_caps}", flush=True)
     print(f"[d3rlpy:data] train insulin quantile edges={edges.round(4).tolist()}", flush=True)
     return counts
 
