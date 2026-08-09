@@ -25,7 +25,7 @@ import evaluate  # noqa: E402
 import ope  # noqa: E402
 
 
-ACTION_LABELS = ["insulin_q1", "insulin_q2", "insulin_q3", "insulin_q4"]
+ACTION_LABELS = ["bolus_q1", "bolus_q2", "bolus_q3", "bolus_q4"]
 REWARD_COMPONENTS = ["glycemic_effectiveness", "low_burden", "hypo_safety"]
 CLINICAL_POLICY_NAME = "cql_clinical"
 CLINICAL_REWARD_NAME = "piecewise_cgm"
@@ -40,7 +40,7 @@ OUTCOME_COMPONENTS = [
     "tbr54",
     "tar180",
     "tar250",
-    "insulin_units",
+    "bolus_units",
 ]
 
 
@@ -75,18 +75,18 @@ def _flat_observation(seq: np.ndarray, static: np.ndarray) -> np.ndarray:
     return np.concatenate([seq.reshape(-1), static], dtype=np.float32)
 
 
-def _encode_quantile_actions(interval_insulin: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    return np.digitize(interval_insulin, edges, right=True).astype(np.int64)
+def _encode_quantile_actions(interval_dose: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    return np.digitize(interval_dose, edges, right=True).astype(np.int64)
 
 
 def _labels_from_edges(edges: np.ndarray) -> list[str]:
     if len(edges) != 3:
         return ACTION_LABELS
     return [
-        f"insulin_le{edges[0]:.3f}",
-        f"insulin_{edges[0]:.3f}_{edges[1]:.3f}",
-        f"insulin_{edges[1]:.3f}_{edges[2]:.3f}",
-        f"insulin_gt{edges[2]:.3f}",
+        f"bolus_le{edges[0]:.3f}",
+        f"bolus_{edges[0]:.3f}_{edges[1]:.3f}",
+        f"bolus_{edges[1]:.3f}_{edges[2]:.3f}",
+        f"bolus_gt{edges[2]:.3f}",
     ]
 
 
@@ -183,10 +183,10 @@ def _build_group_rows(
         tbr54 = float(np.mean(valid < 54))
         tar180 = float(np.mean(valid > 180))
         tar250 = float(np.mean(valid > 250))
-        interval_insulin = float(np.nansum(insulin[t + 1: action_end + 1]))
+        interval_bolus = float(np.nansum(bolus[t + 1: action_end + 1]))
 
         glycemic_effectiveness = -float(np.mean(np.maximum(valid - 180.0, 0.0) / 70.0)) - 2.0 * tar250
-        low_burden = -interval_insulin
+        low_burden = -interval_bolus
         hypo_safety = -(tbr70 + 3.0 * tbr54)
         reference_rewards = glucose_reward_variants(valid)
         rows.append(
@@ -196,11 +196,11 @@ def _build_group_rows(
                 "id": subject_id,
                 "date": group.date.iloc[t],
                 "observation": _flat_observation(D._encode_window(features, t, history_steps), vectors[t]),
-                "interval_insulin": interval_insulin,
+                "interval_bolus": interval_bolus,
                 "reward_components": np.asarray([glycemic_effectiveness, low_burden, hypo_safety], dtype=np.float32),
                 "reward_variants": reference_rewards,
                 "outcome_components": np.asarray(
-                    [glycemic_effectiveness, low_burden, hypo_safety, tir, tbr70, tbr54, tar180, tar250, interval_insulin],
+                    [glycemic_effectiveness, low_burden, hypo_safety, tir, tbr70, tbr54, tar180, tar250, interval_bolus],
                     dtype=np.float32,
                 ),
             }
@@ -283,10 +283,10 @@ def build_ordered_dataset(
         if split_caps is not None and all(len(split_rows[s]) >= split_caps[s] for s in ["train", "val", "test"]):
             break
 
-    train_insulin = np.asarray([row["interval_insulin"] for row in split_rows["train"]], dtype=np.float32)
-    if len(train_insulin) == 0:
+    train_bolus = np.asarray([row["interval_bolus"] for row in split_rows["train"]], dtype=np.float32)
+    if len(train_bolus) == 0:
         raise RuntimeError("No train rows were built. Increase --max-transitions or check parquet columns.")
-    edges = np.quantile(train_insulin, [0.25, 0.50, 0.75]).astype(np.float32)
+    edges = np.quantile(train_bolus, [0.25, 0.50, 0.75]).astype(np.float32)
     labels = _labels_from_edges(edges)
 
     counts: dict[str, int] = {}
@@ -295,8 +295,8 @@ def build_ordered_dataset(
         observations = np.asarray([row["observation"] for row in rows], dtype=np.float32)
         if observations.size == 0:
             observations = np.empty((0, observation_dim), dtype=np.float32)
-        interval_insulin = np.asarray([row["interval_insulin"] for row in rows], dtype=np.float32)
-        actions = _encode_quantile_actions(interval_insulin, edges)
+        interval_bolus = np.asarray([row["interval_bolus"] for row in rows], dtype=np.float32)
+        actions = _encode_quantile_actions(interval_bolus, edges)
         reward_components = np.asarray([row["reward_components"] for row in rows], dtype=np.float32)
         if reward_components.size == 0:
             reward_components = np.empty((0, len(REWARD_COMPONENTS)), dtype=np.float32)
@@ -317,10 +317,10 @@ def build_ordered_dataset(
             reward_variants=reward_variants,
             outcome_components=outcome_components,
             terminals=terminals,
-            interval_insulin=interval_insulin,
+            interval_bolus=interval_bolus,
             n_actions=np.asarray(4, dtype=np.int64),
         )
-        meta = pd.DataFrame([{k: row[k] for k in ["source_file", "id", "date", "split", "interval_insulin"]} for row in rows])
+        meta = pd.DataFrame([{k: row[k] for k in ["source_file", "id", "date", "split", "interval_bolus"]} for row in rows])
         if len(meta):
             meta["action"] = actions
             meta["label"] = [labels[int(a)] for a in actions]
@@ -328,9 +328,9 @@ def build_ordered_dataset(
         counts[split] = int(len(rows))
 
     config = {
-        "action_mode": "insulin4_quantile",
+        "action_mode": "bolus4_quantile",
         "action_labels": labels,
-        "insulin_quantile_edges": edges.tolist(),
+        "bolus_quantile_edges": edges.tolist(),
         "observation_dim": observation_dim,
         "seq_features": D.SEQ_FEATURES,
         "static_features": D.VECTOR_FEATURES,
@@ -346,7 +346,7 @@ def build_ordered_dataset(
     }
     (output_dir / "d3rlpy_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     print(f"[d3rlpy:data] transitions={counts} caps={split_caps}", flush=True)
-    print(f"[d3rlpy:data] train insulin quantile edges={edges.round(4).tolist()}", flush=True)
+    print(f"[d3rlpy:data] train bolus quantile edges={edges.round(4).tolist()}", flush=True)
     return counts
 
 
