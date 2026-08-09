@@ -25,7 +25,7 @@ import evaluate  # noqa: E402
 import ope  # noqa: E402
 
 
-ACTION_LABELS = ["bolus_q1", "bolus_q2", "bolus_q3", "bolus_q4"]
+ACTION_LABELS = ["no_bolus", "bolus_low", "bolus_medium", "bolus_high"]
 REWARD_COMPONENTS = ["glycemic_effectiveness", "low_burden", "hypo_safety"]
 CLINICAL_POLICY_NAME = "cql_clinical"
 CLINICAL_REWARD_NAME = "piecewise_cgm"
@@ -76,17 +76,20 @@ def _flat_observation(seq: np.ndarray, static: np.ndarray) -> np.ndarray:
 
 
 def _encode_quantile_actions(interval_dose: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    return np.digitize(interval_dose, edges, right=True).astype(np.int64)
+    actions = np.zeros(len(interval_dose), dtype=np.int64)
+    positive = interval_dose > 1e-9
+    actions[positive] = 1 + np.digitize(interval_dose[positive], edges, right=True)
+    return actions
 
 
 def _labels_from_edges(edges: np.ndarray) -> list[str]:
-    if len(edges) != 3:
+    if len(edges) != 2:
         return ACTION_LABELS
     return [
+        "no_bolus",
         f"bolus_le{edges[0]:.3f}",
         f"bolus_{edges[0]:.3f}_{edges[1]:.3f}",
-        f"bolus_{edges[1]:.3f}_{edges[2]:.3f}",
-        f"bolus_gt{edges[2]:.3f}",
+        f"bolus_gt{edges[1]:.3f}",
     ]
 
 
@@ -286,7 +289,10 @@ def build_ordered_dataset(
     train_bolus = np.asarray([row["interval_bolus"] for row in split_rows["train"]], dtype=np.float32)
     if len(train_bolus) == 0:
         raise RuntimeError("No train rows were built. Increase --max-transitions or check parquet columns.")
-    edges = np.quantile(train_bolus, [0.25, 0.50, 0.75]).astype(np.float32)
+    positive_train_bolus = train_bolus[train_bolus > 1e-9]
+    if len(positive_train_bolus) == 0:
+        raise RuntimeError("No positive train bolus rows were built. Cannot define reactive bolus actions.")
+    edges = np.quantile(positive_train_bolus, [1 / 3, 2 / 3]).astype(np.float32)
     labels = _labels_from_edges(edges)
 
     counts: dict[str, int] = {}
@@ -318,7 +324,7 @@ def build_ordered_dataset(
             outcome_components=outcome_components,
             terminals=terminals,
             interval_bolus=interval_bolus,
-            n_actions=np.asarray(4, dtype=np.int64),
+            n_actions=np.asarray(len(labels), dtype=np.int64),
         )
         meta = pd.DataFrame([{k: row[k] for k in ["source_file", "id", "date", "split", "interval_bolus"]} for row in rows])
         if len(meta):
@@ -330,7 +336,7 @@ def build_ordered_dataset(
     config = {
         "action_mode": "bolus4_quantile",
         "action_labels": labels,
-        "bolus_quantile_edges": edges.tolist(),
+        "positive_bolus_quantile_edges": edges.tolist(),
         "observation_dim": observation_dim,
         "seq_features": D.SEQ_FEATURES,
         "static_features": D.VECTOR_FEATURES,

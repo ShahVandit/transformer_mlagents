@@ -41,7 +41,7 @@ def test_d3rlpy_flat_observation_shape():
 
 
 def test_d3rlpy_quantile_action_encoding():
-    edges = np.asarray([0.0, 0.3, 0.7], dtype=np.float32)
+    edges = np.asarray([0.3, 0.7], dtype=np.float32)
     actions = d3pipe._encode_quantile_actions(np.asarray([0.0, 0.2, 0.5, 1.0], dtype=np.float32), edges)
     assert actions.tolist() == [0, 1, 2, 3]
 
