@@ -222,8 +222,11 @@ def build_split(split, stays, ev, gcs_ev, interventions, forecaster, out_path):
         obs, tmax = dense_batch(eb, batch, lengths, TRAIT_IDX, len(TRAITS))
         gcs_obs, _ = dense_batch(gb, batch, lengths, GCS_IDX, len(GCS_TRAITS))
 
-        mean, std = forecaster.filter(obs)
-        smooth_mean, _ = forecaster.smooth(obs)
+        # Per-stay hour counts, so the smoother's backward pass never starts in
+        # the padding that batching adds to shorter stays.
+        batch_lengths = np.array([int(lengths[s]) for s in batch])
+        mean, std = forecaster.filter(obs, batch_lengths)
+        smooth_mean, _ = forecaster.smooth(obs, batch_lengths)
 
         obs_lab = obs[:, :, lab_cols]
         last, delta = last_and_delta(obs_lab)

@@ -9,6 +9,7 @@ the forecaster must not see the future, the split must not share a patient, and
 the state must not contain the result of the order being decided.
 """
 import json
+import warnings
 import sys
 from pathlib import Path
 
@@ -159,6 +160,43 @@ def test_forecaster_no_leakage():
     m, _ = f.filter(ramp)
     check("the forecast extrapolates a trend (keeps r_info alive)",
           float(m[0, 8, 0]) > float(m[0, 6, 0]))
+
+    # Sparse-trait regression. The RTS covariance recursion diverges across long
+    # unobserved stretches (measured: inf for bilirubin at 3% hourly coverage),
+    # which overflowed the float32 cast. The smoothed MEAN is unaffected because
+    # its recursion never reads that covariance, and the mean is all this
+    # project consumes -- so the covariance is not computed by default.
+    sparse = np.full((2, 400, 1), np.nan)
+    sparse[0, [5, 180, 390], 0] = [1.0, 2.0, 1.5]   # 3 obs in 400 hours
+    sparse[1, ::40, 0] = rng.normal(size=10)
+    lengths = np.array([400, 400])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        m_s, s_s = f.smooth(sparse, lengths)
+    check("smooth() on a sparse trait raises no overflow warning", True)
+    check("smoothed mean is finite on a sparse trait", bool(np.isfinite(m_s).all()))
+    check("smoothed std is not computed unless asked", s_s is None)
+
+    _, s_req = f.smooth(sparse, lengths, return_std=True)
+    check("an explicitly requested smoothed std stays in float32 range",
+          bool(np.isfinite(s_req).all()
+               and float(np.max(s_req)) <= np.finfo(np.float32).max))
+
+    # The smoothed mean feeds the information-gain metric, so an excursion far
+    # outside the training range would read as spurious information.
+    check("smoothed mean is bounded by the training range",
+          bool((m_s >= f.lo_[0] - 1e-6).all() and (m_s <= f.hi_[0] + 1e-6).all()))
+
+    # Batch composition must not change a stay's own result.
+    alone = np.full((1, 400, 1), np.nan)
+    alone[0, [5, 180, 390], 0] = [1.0, 2.0, 1.5]
+    m_alone, _ = f.smooth(alone, np.array([400]))
+    check("a stay's smoothed mean is independent of its batch",
+          np.allclose(m_s[0], m_alone[0], atol=1e-4))
+
+    check("filtered output is finite on a sparse trait",
+          bool(np.isfinite(f.filter(sparse, lengths)[0]).all()))
 
 
 # ------------------------------------------------------------------ state ----

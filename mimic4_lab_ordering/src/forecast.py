@@ -135,11 +135,20 @@ def _kalman_pass(y, q_level, q_slope, r, p0_level=1.0, p0_slope=0.1):
 
 
 def _inv2(M):
-    """Batched inverse of [n,2,2], with a ridge against singularity."""
+    """Batched inverse of [n,2,2] with a SCALE-AWARE ridge.
+
+    A fixed absolute floor on the determinant is not enough here. Across a long
+    stretch with no observations the predictive covariance of a local trend model
+    grows without bound (the level's variance goes as t^3), so `det` grows huge
+    while the matrix becomes increasingly ill-conditioned. The ridge therefore
+    scales with the magnitude of the matrix itself.
+    """
     a, b = M[:, 0, 0], M[:, 0, 1]
     c, d = M[:, 1, 0], M[:, 1, 1]
+    scale = np.maximum(np.abs(a) + np.abs(d), 1.0)
     det = a * d - b * c
-    det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+    floor = 1e-10 * scale * scale
+    det = np.where(np.abs(det) < floor, np.sign(det) * floor + (det == 0) * floor, det)
     out = np.empty_like(M)
     out[:, 0, 0] = d / det
     out[:, 0, 1] = -b / det
@@ -148,20 +157,51 @@ def _inv2(M):
     return out
 
 
-def _rts_smooth(x_pred, P_pred, x_filt, P_filt):
-    """Backward pass using every observation in the stay. G = P_filt F' P_pred^-1."""
+def _rts_smooth(x_pred, P_pred, x_filt, P_filt, valid=None, want_cov=False):
+    """Backward pass using every observation in the stay. G = P_filt F' P_pred^-1.
+
+    Returns (smoothed_mean, smoothed_cov_or_None).
+
+    `want_cov` defaults to False, and that is a numerical decision, not laziness.
+    The covariance recursion
+
+        Ps[t] = Pf + G (Ps[t+1] - P_pred[t+1]) G'
+
+    is self-referential and compounds multiplicatively backward through every
+    hour. Across the long unobserved stretches that sparse traits produce, G
+    picks up directions with gain above one and the recursion diverges: measured
+    on a real 1,000-stay batch it reaches inf for bilirubin (observed in 3.0% of
+    hours), 2.4e14 for PaO2 (8.7%) and 3.1e11 for lactate (5.6%), while densely
+    charted traits stay near 1e3. It overflows float32 on cast.
+
+    The MEAN recursion is unaffected, because it depends only on forward-pass
+    quantities (x_filt, x_pred, P_filt, P_pred) and never reads Ps. Since the
+    smoothed mean is the only thing this project consumes -- it supplies the
+    "approximate true value" in the Sec. 3.1 information-gain metric -- the
+    covariance is simply not computed unless a caller asks for it.
+
+    `valid[i, t]` marks the hours that are real for stay i, so a padded batch
+    starts each stay's backward pass at its own final hour. That keeps a stay's
+    result independent of which other stays share its batch; it is not what
+    fixes the divergence above.
+    """
     n, T, _ = x_filt.shape
     xs = x_filt.copy()
-    Ps = P_filt.copy()
+    Ps = P_filt.copy() if want_cov else None
     # F' = [[1,0],[1,1]], so (P F')[:,:,0] = P[:,:,0] and [:,:,1] = P[:,:,0]+P[:,:,1]
     for t in range(T - 2, -1, -1):
         Pf = P_filt[:, t]
         PFt = np.stack([Pf[:, :, 0], Pf[:, :, 0] + Pf[:, :, 1]], axis=2)
         G = PFt @ _inv2(P_pred[:, t + 1])
         dx = (xs[:, t + 1] - x_pred[:, t + 1])[:, :, None]
-        xs[:, t] = x_filt[:, t] + (G @ dx)[:, :, 0]
-        dP = Ps[:, t + 1] - P_pred[:, t + 1]
-        Ps[:, t] = Pf + G @ dP @ np.transpose(G, (0, 2, 1))
+        x_new = x_filt[:, t] + (G @ dx)[:, :, 0]
+        g = None if valid is None else valid[:, t + 1]
+
+        xs[:, t] = x_new if g is None else np.where(g[:, None], x_new, x_filt[:, t])
+        if want_cov:
+            dP = Ps[:, t + 1] - P_pred[:, t + 1]
+            P_new = Pf + G @ dP @ np.transpose(G, (0, 2, 1))
+            Ps[:, t] = P_new if g is None else np.where(g[:, None, None], P_new, Pf)
     return xs, Ps
 
 
@@ -187,6 +227,8 @@ class LocalTrendForecaster(Forecaster):
         self.fit_max_stays = fit_max_stays
         self.fit_max_hours = fit_max_hours
         self.mu_ = None    # [K] train mean per trait
+        self.lo_ = None    # [K] lower bound for the smoothed mean
+        self.hi_ = None    # [K] upper bound for the smoothed mean
         self.sd_ = None    # [K] train std per trait
         self.q_level_ = None
         self.q_slope_ = None
@@ -202,6 +244,16 @@ class LocalTrendForecaster(Forecaster):
         self.sd_ = np.nanstd(flat, axis=0)
         self.sd_ = np.where(~np.isfinite(self.sd_) | (self.sd_ < 1e-6), 1.0, self.sd_)
         self.mu_ = np.where(np.isfinite(self.mu_), self.mu_, 0.0)
+
+        # Range the training data actually spans, used to bound the smoothed
+        # mean (see _run). Percentiles rather than min/max so one bad value
+        # cannot widen the bound.
+        with np.errstate(all="ignore"):
+            lo = np.nanpercentile(flat, 0.1, axis=0)
+            hi = np.nanpercentile(flat, 99.9, axis=0)
+        span = np.where(np.isfinite(hi - lo), hi - lo, 1.0)
+        self.lo_ = np.where(np.isfinite(lo), lo - 0.5 * span, -np.inf)
+        self.hi_ = np.where(np.isfinite(hi), hi + 0.5 * span, np.inf)
 
         rng = np.random.default_rng(self.seed)
         idx = np.arange(n)
@@ -233,48 +285,81 @@ class LocalTrendForecaster(Forecaster):
         return (obs - self.mu_) / self.sd_
 
     # -- inference ---------------------------------------------------------- #
-    def filter(self, obs):
+    def filter(self, obs, lengths=None):
         """One-step-ahead predictive (mean, std) of the OBSERVATION at hour t.
 
         std is sqrt(P_pred[0,0] + r), the spread of the value a draw would
         return, because sigma_t normalizes |m_t - y_t| where y_t is an observed
         value rather than a latent one.
         """
-        return self._run(obs, smooth=False)
+        return self._run(obs, smooth=False, lengths=lengths)
 
-    def smooth(self, obs):
-        """All-observation posterior (mean, std). EVALUATION ONLY."""
-        return self._run(obs, smooth=True)
+    def smooth(self, obs, lengths=None, return_std=False):
+        """All-observation posterior mean. EVALUATION ONLY.
 
-    def _run(self, obs, smooth):
+        Returns (mean, std), where std is None unless `return_std=True`. The
+        smoothed covariance diverges on sparsely observed traits and nothing in
+        this project consumes it; see _rts_smooth for the measured magnitudes.
+
+        Pass `lengths` (hours per stay) whenever the batch is padded, so a stay's
+        result does not depend on which other stays share its batch.
+        """
+        return self._run(obs, smooth=True, lengths=lengths, want_cov=return_std)
+
+    def _run(self, obs, smooth, lengths=None, want_cov=True):
         if self.r_ is None:
             raise RuntimeError("call fit() before filter()/smooth()")
         n, T, K = obs.shape
+        valid = None
+        if lengths is not None:
+            valid = np.arange(T)[None, :] < np.asarray(lengths)[:, None]
+
         z = self._standardize(obs)
         mean = np.empty((n, T, K), dtype=np.float32)
-        std = np.empty((n, T, K), dtype=np.float32)
+        std = np.empty((n, T, K), dtype=np.float32) if want_cov else None
+        f32_max = float(np.finfo(np.float32).max)
         for k in range(K):
             ql, qs, r = self.q_level_[k], self.q_slope_[k], self.r_[k]
             x_pred, P_pred, x_filt, P_filt = _kalman_pass(z[:, :, k], ql, qs, r)
             if smooth:
-                xs, Ps = _rts_smooth(x_pred, P_pred, x_filt, P_filt)
-                m, v = xs[:, :, 0], Ps[:, :, 0, 0] + r
+                xs, Ps = _rts_smooth(x_pred, P_pred, x_filt, P_filt, valid, want_cov)
+                m = xs[:, :, 0]
+                v = None if Ps is None else Ps[:, :, 0, 0] + r
             else:
                 m, v = x_pred[:, :, 0], P_pred[:, :, 0, 0] + r
-            mean[:, :, k] = m * self.sd_[k] + self.mu_[k]
-            std[:, :, k] = np.maximum(np.sqrt(np.maximum(v, 0.0)) * self.sd_[k],
-                                      cfg.FORECAST_MIN_STD)
+
+            m = m * self.sd_[k] + self.mu_[k]
+            if smooth:
+                # A trait seen a handful of times across a 20-day stay lets the
+                # smoother extrapolate far outside anything the assay can report
+                # (PaO2 reached 4,460 mmHg on a real batch, against a ceiling of
+                # ~700). Since this mean is the "approximate true value" the
+                # information-gain metric scores orders against, an unbounded
+                # excursion would show up as spurious information. Hold it to
+                # the range the training data actually spans.
+                m = np.clip(m, self.lo_[k], self.hi_[k])
+            m = np.nan_to_num(m, nan=self.mu_[k], posinf=f32_max, neginf=-f32_max)
+            mean[:, :, k] = np.clip(m, -f32_max, f32_max)
+
+            if want_cov:
+                s = np.sqrt(np.maximum(v, 0.0)) * self.sd_[k]
+                s = np.nan_to_num(s, nan=cfg.FORECAST_MIN_STD,
+                                  posinf=f32_max, neginf=cfg.FORECAST_MIN_STD)
+                std[:, :, k] = np.clip(np.maximum(s, cfg.FORECAST_MIN_STD),
+                                       cfg.FORECAST_MIN_STD, f32_max)
         return mean, std
 
     # -- persistence -------------------------------------------------------- #
     def state_dict(self):
         return {"trait_names": self.trait_names, "mu": self.mu_, "sd": self.sd_,
+                "lo": self.lo_, "hi": self.hi_,
                 "q_level": self.q_level_, "q_slope": self.q_slope_, "r": self.r_}
 
     @classmethod
     def from_state_dict(cls, d):
         f = cls(list(d["trait_names"]))
         f.mu_, f.sd_ = d["mu"], d["sd"]
+        f.lo_, f.hi_ = d["lo"], d["hi"]
         f.q_level_, f.q_slope_, f.r_ = d["q_level"], d["q_slope"], d["r"]
         return f
 
