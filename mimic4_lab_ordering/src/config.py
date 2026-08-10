@@ -1,0 +1,140 @@
+"""
+Central configuration: every path and hyperparameter the pipeline uses.
+
+Generated artifacts (parquet caches, RL tensors, models, reports, figures) live
+inside the project folder. The one input that may not be redistributed is read
+from a location you can set with an environment variable:
+
+    MIMIC4_DIR   folder holding the MIMIC-IV v3.1 *.csv.gz files
+
+PowerShell example:
+    $env:MIMIC4_DIR = "C:\\data\\mimiciv\\3.1"
+
+Bash example:
+    export MIMIC4_DIR=/data/mimiciv/3.1
+
+If unset, it defaults to ../mimiciv/3.1 relative to this repository.
+
+Every constant traceable to the paper carries its section or equation number:
+  Cheng L-F, Prasad N, Engelhardt BE. "An Optimal Policy for Patient Laboratory
+  Tests in Intensive Care Units." Pac Symp Biocomput. 2019;24:320-331.
+"""
+import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# ---------------------------------------------------------------- inputs ----
+# Credentialed data. Never stored in this repository (see README, Data access).
+MIMIC4_DIR = Path(
+    os.environ.get("MIMIC4_DIR", PROJECT_ROOT.parent / "mimiciv" / "3.1")
+)
+
+ICUSTAYS_CSV = MIMIC4_DIR / "icustays.csv.gz"
+PATIENTS_CSV = MIMIC4_DIR / "patients.csv.gz"
+ADMISSIONS_CSV = MIMIC4_DIR / "admissions.csv.gz"
+CHARTEVENTS_CSV = MIMIC4_DIR / "chartevents.csv.gz"
+LABEVENTS_CSV = MIMIC4_DIR / "labevents.csv.gz"
+INPUTEVENTS_CSV = MIMIC4_DIR / "inputevents.csv.gz"
+PROCEDUREEVENTS_CSV = MIMIC4_DIR / "procedureevents.csv.gz"
+PRESCRIPTIONS_CSV = MIMIC4_DIR / "prescriptions.csv.gz"
+
+# ---------------------------------------------------- generated artifacts ----
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_CACHE_DIR = DATA_DIR / "cache"        # stage 1 parquet caches
+PROCESSED_DIR = DATA_DIR / "processed"    # stage 2 hourly grids
+RL_DIR = DATA_DIR / "rl"                  # stage 3 npz tensors, per lab per split
+MODELS_DIR = PROJECT_ROOT / "models"
+REPORTS_DIR = PROJECT_ROOT / "reports"
+FIGURES_DIR = PROJECT_ROOT / "figures"
+
+COHORT_PARQUET = RAW_CACHE_DIR / "cohort.parquet"
+CHART_PARQUET = RAW_CACHE_DIR / "chartevents_filtered.parquet"
+LAB_PARQUET = RAW_CACHE_DIR / "labevents_filtered.parquet"
+INTERVENTIONS_PARQUET = RAW_CACHE_DIR / "interventions.parquet"
+SPLITS_JSON = DATA_DIR / "splits.json"
+HOURLY_DIR = PROCESSED_DIR / "hourly"     # one parquet shard per split
+
+SEED = 0
+
+# ------------------------------------------------- cohort selection (Sec. 2.1) ----
+MIN_AGE = 18
+MIN_LOS_DAYS = 1.0        # paper: ICU stay between one and twenty days
+MAX_LOS_DAYS = 20.0
+REQUIRE_ALL_TRAITS = True  # paper: at least one recorded measure of each trait
+
+# Chunk size for the single full scan of chartevents/labevents. These are the
+# 3.5 GB and 2.6 GB files; the scan runs once and caches to parquet.
+SCAN_CHUNK_ROWS = 5_000_000
+
+# ------------------------------------------------------ splits (Sec. 3) ----
+# BY SUBJECT, not by stay: 65,366 subjects hold 94,458 ICU stays, so splitting on
+# stay_id would leak a patient across train and test. The paper split 3,636/2,424
+# admissions (60/40) without stating subject grouping; we keep roughly that
+# train/test proportion and carve a validation split for tuning EPS_COST and C_L.
+TRAIN_FRAC = 0.50
+VAL_FRAC = 0.10
+TEST_FRAC = 0.40
+
+# ------------------------------------------------- decision process (Sec. 2.2) ----
+BIN_HOURS = 1              # paper resamples to a one-hour grid
+GAMMA = 0.9                # discount factor used by FQI (Sec. 3)
+INCLUDE_VITAL_STD = False  # False -> 21-dim state (paper); True -> 25-dim variant
+
+# ------------------------------------------------------- reward (Sec. 2.2) ----
+SOFA_DELTA_THRESHOLD = 2.0   # Eq. 3: a SOFA rise >= 2 is the critical sepsis index
+COST_DECAY_GAMMA = 6.0       # Eq. 6: Gamma_l, hours; paper sets 6 for all labs
+TREAT_LOOKAHEAD_BINS = 1     # Eq. 4: intervention started at s_{t+1}
+# Eq. 5: c_l, the minimum prediction error that triggers an information reward.
+# Set at run time to the median prediction error over labs ordered in TRAIN.
+REWARD_DIMS = ["r_sofa", "r_treat", "r_info", "neg_r_cost"]
+
+# --------------------------------------------------------- forecaster (Sec. 2.1) ----
+# The paper uses a multi-output Gaussian process. It feeds exactly two things:
+# (m_t, sigma_t) in the state, and the normalizer in r_info. Any forecaster
+# emitting an hourly predictive mean and std satisfies that contract.
+FORECASTER = "local_trend"   # "local_trend" | "mogp"
+FORECAST_MIN_STD = 1e-3      # floor on sigma_t so r_info cannot divide by ~0
+
+# ------------------------------------------------------------ MO-FQI (Sec. 2.3) ----
+FQI_ITERATIONS = 200
+FQI_SAMPLE_PER_ITER = 100_000   # transitions drawn each iteration
+FQI_N_TREES = 50
+FQI_MIN_SAMPLES_LEAF = 5
+FQI_MAX_DEPTH = None
+FQI_N_JOBS = -1
+
+# Eq. 7: order iff Q_d(s,1) + eps_d > Q_d(s,0) for ALL d. Only the cost slack is
+# tuned; the paper tunes it so the recommended order count approximates the
+# observed count. Search grid is over eps_cost only, on the VAL split.
+EPS_GRID = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+BUDGET_HOURS = 24            # force one order per 24h window with no recommendation
+
+# ------------------------------------------------- off-policy evaluation ----
+# Tier 1 replicates the paper: per-step WIS with an undiscounted horizon.
+WIS_GAMMA = 1.0
+RANDOM_BASELINE_PS = [0.01, None, 0.5]   # None -> empirical order rate p_emp
+RANDOM_BASELINE_TRIALS = 10
+
+# Tier 2 additions the paper does not have.
+OPE_EPSILON = 0.05        # epsilon-greedy softening of the deterministic policy
+OPE_RATIO_CLIP = 5.0      # clip on the per-step log importance ratio
+OPE_PROB_FLOOR = 1e-3     # floor on estimated behavior-policy probability
+OPE_N_BOOTSTRAP = 200     # patient-level bootstrap resamples
+FQE_EPOCHS = 40
+FQE_MIN_STEPS = 4000    # floor on gradient steps, so small splits still converge
+FQE_LR = 1e-3
+FQE_BATCH = 1024
+FQE_HIDDEN = 128
+
+# ------------------------------------------------- clinical metrics (Sec. 3.1) ----
+TREATMENT_LOOKBACK_HOURS = 48   # trace back from an intervention onset to an order
+
+LABS = ["creatinine", "bun", "wbc", "lactate"]
+
+
+def ensure_dirs():
+    """Create the output folders if they do not exist yet."""
+    for d in (RAW_CACHE_DIR, PROCESSED_DIR, HOURLY_DIR, RL_DIR,
+              MODELS_DIR, REPORTS_DIR, FIGURES_DIR):
+        d.mkdir(parents=True, exist_ok=True)
