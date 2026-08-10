@@ -451,9 +451,8 @@ def main():
     args = ap.parse_args()
 
     cfg.ensure_dirs()
+    cfg.check_inputs()
     print(f"reading MIMIC-IV from {cfg.MIMIC4_DIR}")
-    if not cfg.ICUSTAYS_CSV.exists():
-        raise SystemExit(f"{cfg.ICUSTAYS_CSV} not found; set MIMIC4_DIR")
 
     print("\n[1/5] cohort")
     stays = build_cohort(args.limit_icustays)

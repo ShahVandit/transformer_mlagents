@@ -26,9 +26,29 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------- inputs ----
 # Credentialed data. Never stored in this repository (see README, Data access).
-MIMIC4_DIR = Path(
-    os.environ.get("MIMIC4_DIR", PROJECT_ROOT.parent / "mimiciv" / "3.1")
-)
+#
+# $MIMIC4_DIR wins outright. Otherwise try the usual places, because the data
+# and the checkout do not necessarily sit next to each other: a clone at
+# ~/transformer_mlagents with data at ~/mimiciv/3.1 is the common server layout,
+# and a project-relative default alone would silently miss it.
+_CANDIDATES = [
+    PROJECT_ROOT.parent / "mimiciv" / "3.1",   # data beside the checkout
+    Path.home() / "mimiciv" / "3.1",           # data in the home directory
+    PROJECT_ROOT / "data" / "mimiciv" / "3.1",
+]
+
+
+def _resolve_mimic_dir():
+    env = os.environ.get("MIMIC4_DIR")
+    if env:
+        return Path(env).expanduser()
+    for c in _CANDIDATES:
+        if (c / "icustays.csv.gz").exists():
+            return c
+    return _CANDIDATES[0]          # report this one in the error message
+
+
+MIMIC4_DIR = _resolve_mimic_dir()
 
 ICUSTAYS_CSV = MIMIC4_DIR / "icustays.csv.gz"
 PATIENTS_CSV = MIMIC4_DIR / "patients.csv.gz"
@@ -131,6 +151,37 @@ FQE_HIDDEN = 128
 TREATMENT_LOOKBACK_HOURS = 48   # trace back from an intervention onset to an order
 
 LABS = ["creatinine", "bun", "wbc", "lactate"]
+
+
+REQUIRED_INPUTS = {
+    "icustays": ICUSTAYS_CSV, "patients": PATIENTS_CSV,
+    "admissions": ADMISSIONS_CSV, "chartevents": CHARTEVENTS_CSV,
+    "labevents": LABEVENTS_CSV, "inputevents": INPUTEVENTS_CSV,
+    "procedureevents": PROCEDUREEVENTS_CSV, "prescriptions": PRESCRIPTIONS_CSV,
+}
+
+
+def check_inputs():
+    """Fail immediately, and loudly, if any source table is missing.
+
+    Stage 1 spends the better part of an hour scanning chartevents, so a wrong
+    MIMIC4_DIR should surface in the first second rather than after the scan.
+    """
+    missing = [n for n, p in REQUIRED_INPUTS.items() if not p.exists()]
+    if not missing:
+        return
+    tried = "\n".join(f"    {c}" for c in _CANDIDATES)
+    raise SystemExit(
+        f"\nMIMIC-IV files not found under:\n    {MIMIC4_DIR}\n\n"
+        f"Missing: {', '.join(missing)}\n\n"
+        f"Set MIMIC4_DIR to the folder holding the .csv.gz files, e.g.\n"
+        f"    export MIMIC4_DIR=~/mimiciv/3.1\n\n"
+        f"Searched by default:\n{tried}\n\n"
+        f"The pipeline expects a flat layout. If yours has hosp/ and icu/ "
+        f"subfolders, either point MIMIC4_DIR at a directory of symlinks or "
+        f"flatten it:\n"
+        f"    mkdir -p flat && find hosp icu -name '*.csv.gz' "
+        f"-exec ln -s ../{{}} flat/ \\;\n")
 
 
 def ensure_dirs():
