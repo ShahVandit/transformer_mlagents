@@ -89,12 +89,12 @@ SCAN_CHUNK_ROWS = 5_000_000
 
 # ------------------------------------------------------ splits (Sec. 3) ----
 # BY SUBJECT, not by stay: 65,366 subjects hold 94,458 ICU stays, so splitting on
-# stay_id would leak a patient across train and test. The paper split 3,636/2,424
-# admissions (60/40) without stating subject grouping; we keep roughly that
-# train/test proportion and carve a validation split for tuning EPS_COST and C_L.
-TRAIN_FRAC = 0.50
-VAL_FRAC = 0.10
-TEST_FRAC = 0.40
+# stay_id would leak a patient across train and test. The paper used a large
+# held-out set; this project uses more training support for CQL/FQE while keeping
+# validation and test patient-disjoint.
+TRAIN_FRAC = 0.70
+VAL_FRAC = 0.15
+TEST_FRAC = 0.15
 
 # ------------------------------------------------- decision process (Sec. 2.2) ----
 BIN_HOURS = 1              # paper resamples to a one-hour grid
@@ -108,6 +108,22 @@ TREAT_LOOKAHEAD_BINS = 1     # Eq. 4: intervention started at s_{t+1}
 # Eq. 5: c_l, the minimum prediction error that triggers an information reward.
 # Set at run time to the median prediction error over labs ordered in TRAIN.
 REWARD_DIMS = ["r_sofa", "r_treat", "r_info", "neg_r_cost"]
+
+# ------------------------------------------------ joint-panel Pareto track ----
+JOINT_PANEL_BITS = ["0000", "1110", "0001", "1111", "1100", "0010", "1101", "0011"]
+JOINT_PANEL_NAMES = [
+    "none",
+    "creatinine+bun+wbc",
+    "lactate",
+    "all_four",
+    "creatinine+bun",
+    "wbc",
+    "creatinine+bun+lactate",
+    "wbc+lactate",
+]
+JOINT_REWARD_DIMS = ["detection", "burden"]
+JOINT_DETECTION_LOOKAHEAD_HOURS = 12
+JOINT_LAMBDAS = [0.1, 0.3, 0.5, 0.7, 0.9]
 
 # --------------------------------------------------------- forecaster (Sec. 2.1) ----
 # The paper uses a multi-output Gaussian process. It feeds exactly two things:

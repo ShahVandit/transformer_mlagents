@@ -43,13 +43,14 @@ class QNet(nn.Module):
     network in stage 5.
     """
 
-    def __init__(self, state_dim, hidden=cfg.CQL_HIDDEN):
+    def __init__(self, state_dim, hidden=cfg.CQL_HIDDEN, n_actions=N_ACTIONS):
         super().__init__()
+        self.n_actions = int(n_actions)
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
         )
-        self.head = nn.Linear(hidden, N_ACTIONS)
+        self.head = nn.Linear(hidden, self.n_actions)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
@@ -71,16 +72,20 @@ class GreedyQPolicy:
         self.net = net
         self.mu = mu
         self.sd = sd
-        self.bias = float(bias)
+        self.bias = bias
 
     def q_values(self, states):
         z = (np.asarray(states, dtype=np.float32) - self.mu) / self.sd
         self.net.eval()
         with torch.no_grad():
             q = self.net(torch.tensor(z, dtype=torch.float32)).numpy()
-        q[:, 1] += self.bias
+        if np.isscalar(self.bias):
+            if q.shape[1] > 1:
+                q[:, 1] += float(self.bias)
+        else:
+            q += np.asarray(self.bias, dtype=np.float32)
         return q
 
     def predict(self, states):
         q = self.q_values(states)
-        return (q[:, 1] > q[:, 0]).astype(np.int64)
+        return q.argmax(axis=1).astype(np.int64)
