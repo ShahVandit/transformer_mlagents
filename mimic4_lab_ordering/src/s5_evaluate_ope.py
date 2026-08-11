@@ -57,6 +57,12 @@ D = len(cfg.REWARD_DIMS)
 DIM_NAMES = list(cfg.REWARD_DIMS)
 
 
+def policy_label(learner):
+    """Row/series name for the learned policy. Hard-coding "MO-FQI" mislabels
+    the CQL arm's own results as the paper's method."""
+    return {"mofqi": "MO-FQI", "cql": "CQL"}.get(learner, learner.upper())
+
+
 def evaluation_reward(split, learner):
     """The reward matrix every estimator scores against, and its column names."""
     if learner == "cql":
@@ -376,7 +382,7 @@ def main():
         test, trajs, epsilon_greedy_probs(det_test, 1e-6), pi_b_test)
 
     # ---- tier 1: the paper's comparison ----
-    policies = {"MO-FQI": pi_e_test}
+    policies = {policy_label(args.learner): pi_e_test}
     for p in cfg.RANDOM_BASELINE_PS:
         pv = p_emp if p is None else p
         policies[f"random p={pv:.3f}"] = constant_probs(len(test["action"]), pv)

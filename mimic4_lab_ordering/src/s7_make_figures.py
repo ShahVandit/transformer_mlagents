@@ -34,6 +34,10 @@ LEARNER = "mofqi"
 SFX = ""
 
 
+def policy_label():
+    return {"mofqi": "MO-FQI", "cql": "CQL"}.get(LEARNER, LEARNER.upper())
+
+
 def _have(path):
     return Path(path).exists()
 
@@ -103,7 +107,7 @@ def fig3_trajectory(lab):
 
     ax2.plot(h, d["state"][sel, sofa_col], color="#B5651D", lw=1.0, label="SOFA")
     for y, mask, c, lbl in [(-0.8, d["action"][sel] == 1, "#222", "clinician order"),
-                            (-1.6, rec[sel] == 1, "#4878A6", "MO-FQI"),
+                            (-1.6, rec[sel] == 1, "#4878A6", policy_label()),
                             (-2.4, budget[sel] == 1, "#8FBF6A", "+ budget")]:
         xs = h[mask]
         ax2.scatter(xs, np.full(len(xs), y), s=8, marker="|", color=c, label=lbl)
@@ -133,7 +137,7 @@ def fig4_ope_values(labs):
             ax = axes[i][j]
             vals = [res["tier1"][n]["mean"][j] for n in names]
             errs = [res["tier1"][n]["std"][j] for n in names]
-            colors = ["#B5651D" if n == "MO-FQI" else
+            colors = ["#B5651D" if n == policy_label() else
                       "#222" if n.startswith("clinician") else "#9AA5B1"
                       for n in names]
             ax.barh(np.arange(len(names)), vals, xerr=errs, color=colors,
@@ -167,7 +171,7 @@ def fig5_information_gain(labs):
                              squeeze=False)
     for ax, (lab, d) in zip(axes[0], data.items()):
         for v, c, lbl in [(d["ig_clin"], "#222", "clinician"),
-                          (d["ig_pol"], "#B5651D", "MO-FQI")]:
+                          (d["ig_pol"], "#B5651D", policy_label())]:
             v = v[np.isfinite(v)]
             if len(v) == 0:
                 continue
@@ -190,7 +194,7 @@ def fig6_time_to_treatment(labs):
                              squeeze=False)
     for ax, (lab, d) in zip(axes[0], data.items()):
         for v, c, lbl in [(d["tt_clin"], "#222", "clinician"),
-                          (d["tt_pol"], "#B5651D", "MO-FQI")]:
+                          (d["tt_pol"], "#B5651D", policy_label())]:
             if len(v) == 0:
                 continue
             ax.hist(v, bins=24, histtype="step", density=True, color=c, label=lbl)

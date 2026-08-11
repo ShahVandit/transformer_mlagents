@@ -42,6 +42,11 @@ import config as cfg
 import mofqi
 
 
+def policy_label(learner):
+    """Row name for the learned policy; see s5_evaluate_ope.policy_label."""
+    return {"mofqi": "MO-FQI", "cql": "CQL"}.get(learner, learner.upper())
+
+
 def load_split(lab, split):
     d = np.load(cfg.RL_DIR / f"{lab}_{split}.npz")
     return {k: d[k] for k in d.files}
@@ -192,9 +197,10 @@ def main():
 
     L += ["\n## 2. Information gain per order (paper Fig. 5)\n\n",
           "| | n orders | mean | median |\n|---|---|---|---|\n"]
-    for name, v in [("clinician (raw)", ig_clin), ("MO-FQI (raw)", ig_pol),
+    lbl = policy_label(args.learner)
+    for name, v in [("clinician (raw)", ig_clin), (f"{lbl} (raw)", ig_pol),
                     ("clinician (sigma-normalized)", ig_clin_n),
-                    ("MO-FQI (sigma-normalized)", ig_pol_n)]:
+                    (f"{lbl} (sigma-normalized)", ig_pol_n)]:
         d = describe(v)
         L.append(f"| {name} | {d['n']:,} | {d['mean']:.4f} | {d['median']:.4f} |\n")
     L.append(
@@ -208,7 +214,7 @@ def main():
           f"Lookback window {cfg.TREATMENT_LOOKBACK_HOURS}h, over initiations of "
           f"vasopressors, antibiotics, ventilation or dialysis.\n\n",
           "| | n onsets matched | mean hours | median hours |\n|---|---|---|---|\n"]
-    for name, v in [("clinician", tt_clin), ("MO-FQI", tt_pol)]:
+    for name, v in [("clinician", tt_clin), (lbl, tt_pol)]:
         d = describe(v)
         L.append(f"| {name} | {d['n']:,} | {d['mean']:.2f} | {d['median']:.2f} |\n")
     L.append(
