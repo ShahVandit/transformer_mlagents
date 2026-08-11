@@ -20,6 +20,20 @@ import config as cfg
 N_ACTIONS = 2
 
 
+def scalarize(reward, weights=None):
+    """Collapse the 4-vector reward into the single number CQL trains on.
+
+    This is where the multi-objective claim is given up, so it lives in one
+    function and both the trainer and the evaluator call it. Evaluating a CQL
+    policy against the 4-vector reward would score it on objectives it never
+    optimized; stage 5 therefore uses this for the CQL arm.
+    """
+    import numpy as _np
+    w = weights or cfg.REWARD_WEIGHTS
+    vec = _np.array([w[d] for d in cfg.REWARD_DIMS], dtype=_np.float64)
+    return (reward.astype(_np.float64) * vec).sum(axis=1).astype(_np.float32)
+
+
 class QNet(nn.Module):
     """Scalar Q, one value per action.
 

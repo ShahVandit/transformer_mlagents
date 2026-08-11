@@ -170,7 +170,9 @@ def main():
                         counts=np.array(list(counts.values())))
 
     L = [
-        f"# Clinical metrics: {lab}\n\n",
+        f"# Clinical metrics: {lab}"
+        + (f" ({args.learner.upper()} arm)" if args.learner != "mofqi" else "")
+        + "\n\n",
         f"Test split, {len(np.unique(test['stay_id'])):,} ICU stays, "
         f"{len(clinician):,} hourly decisions.\n\n",
         "## 1. Order counts (paper Sec. 3.1)\n\n",

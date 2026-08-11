@@ -47,7 +47,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as cfg
 
 N_ACTIONS = 2
+
+# Number of reward dimensions the estimators score against. Set in main() from
+# the learner: the MO-FQI arm keeps the paper's 4-vector, the CQL arm collapses
+# to the single scalarized reward it was actually trained on. Evaluating a CQL
+# policy on four separate objectives would report it against goals it never
+# optimized, and would train four FQE heads where one is called for.
 D = len(cfg.REWARD_DIMS)
+DIM_NAMES = list(cfg.REWARD_DIMS)
+
+
+def evaluation_reward(split, learner):
+    """The reward matrix every estimator scores against, and its column names."""
+    if learner == "cql":
+        from cql_policy import scalarize
+        return scalarize(split["reward"]).reshape(-1, 1), ["scalarized"]
+    return split["reward"], list(cfg.REWARD_DIMS)
 
 
 # ------------------------------------------------------------------- data ----
@@ -185,26 +200,28 @@ class QNet(nn.Module):
     rather than merely a noisy one. Starting at zero removes that failure mode.
     """
 
-    def __init__(self, state_dim, hidden=cfg.FQE_HIDDEN):
+    def __init__(self, state_dim, n_dims=None, hidden=cfg.FQE_HIDDEN):
         super().__init__()
+        self.n_dims = D if n_dims is None else n_dims
         self.trunk = nn.Sequential(
             nn.Linear(state_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
         )
-        self.head = nn.Linear(hidden, N_ACTIONS * D)
+        self.head = nn.Linear(hidden, N_ACTIONS * self.n_dims)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, s):
-        return self.head(self.trunk(s)).view(-1, N_ACTIONS, D)
+        return self.head(self.trunk(s)).view(-1, N_ACTIONS, self.n_dims)
 
 
 def train_fqe(train, pi_e_next, epochs=cfg.FQE_EPOCHS, gamma=cfg.GAMMA):
     """Fitted Q evaluation of the target policy, all reward dimensions at once."""
     torch.manual_seed(cfg.SEED)
     sd = train["state"].shape[1]
-    q = QNet(sd)
-    q_tgt = QNet(sd)
+    n_dims = train["reward"].shape[1]
+    q = QNet(sd, n_dims)
+    q_tgt = QNet(sd, n_dims)
     q_tgt.load_state_dict(q.state_dict())
     opt = torch.optim.Adam(q.parameters(), lr=cfg.FQE_LR)
 
@@ -326,6 +343,16 @@ def main():
 
     train = load_split(lab, "train")
     test = load_split(lab, "test")
+
+    global D, DIM_NAMES
+    train["reward"], DIM_NAMES = evaluation_reward(train, args.learner)
+    test["reward"], _ = evaluation_reward(test, args.learner)
+    D = len(DIM_NAMES)
+    if args.learner == "cql":
+        w = ", ".join(f"{k}={v}" for k, v in cfg.REWARD_WEIGHTS.items())
+        print(f"  evaluating on the SCALARIZED reward ({w}), matching what the "
+              f"CQL policy was trained on: one FQE, one value per estimator.")
+
     trajs = to_trajectories(test)
     subj_of_traj = [int(test["subject_id"][tr[0]]) for tr in trajs]
     print(f"{lab}: {len(trajs):,} test stays, "
@@ -373,7 +400,7 @@ def main():
     tier1["clinician (factual)"] = {"mean": beh_factual, "std": np.zeros(D)}
 
     print("\ntier 1: PS-WIS per reward component (gamma_WIS=1.0)")
-    print(f"  {'policy':22s} " + " ".join(f"{d:>12s}" for d in cfg.REWARD_DIMS))
+    print(f"  {'policy':22s} " + " ".join(f"{d:>12s}" for d in DIM_NAMES))
     for name, v in tier1.items():
         print(f"  {name:22s} " + " ".join(f"{x:12.4f}" for x in v["mean"]))
 
@@ -385,7 +412,7 @@ def main():
 
     idx_of = {id(tr): k for k, tr in enumerate(trajs)}
     tier2 = {}
-    for d, dim_name in enumerate(cfg.REWARD_DIMS):
+    for d, dim_name in enumerate(DIM_NAMES):
         clin = factual_return(test, trajs, d, cfg.GAMMA)
 
         def clin_est(sample, clin=clin):
@@ -445,7 +472,7 @@ def main():
     qv_b = q_values(qnet_b, test["state"])
     fqe_b_v0 = fqe_initial_values(qv_b, pi_b_test, trajs)
     calib = {}
-    for d, dim_name in enumerate(cfg.REWARD_DIMS):
+    for d, dim_name in enumerate(DIM_NAMES):
         clin = factual_return(test, trajs, d, cfg.GAMMA)
 
         def f_est(sample, d=d):
@@ -463,7 +490,7 @@ def main():
 
     results = {
         "lab": lab, "epsilon": args.epsilon,
-        "reward_dims": cfg.REWARD_DIMS,
+        "reward_dims": DIM_NAMES,
         "tier1": {k: {"mean": v["mean"].tolist(), "std": v["std"].tolist()}
                   for k, v in tier1.items()},
         "tier2": {k: {e: list(v) for e, v in row.items()}
@@ -488,16 +515,24 @@ def main():
 def write_report(lab, args, tier1, tier2, ess_soft, ess_det, support, calib,
                  det_test, test, n_traj, n_subj, sfx=""):
     L = [
-        f"# Off-policy evaluation: {lab}\n\n",
+        f"# Off-policy evaluation: {lab}"
+        + (f" ({args.learner.upper()} arm)" if args.learner != "mofqi" else "")
+        + "\n\n",
         f"Test split, patient-disjoint. {n_traj:,} ICU stays from {n_subj:,} patients, "
         f"{len(test['action']):,} hourly decisions.\n\n",
         f"Learned policy order rate {det_test.mean():.4f} vs clinician "
         f"{test['action'].mean():.4f}.\n\n",
-        "## Tier 1 - the paper's comparison (Fig. 4)\n\n",
-        f"Per-step weighted importance sampling, `gamma_WIS = {cfg.WIS_GAMMA}`, one "
-        f"column per reward component. Randomized baselines are averaged over "
+        ("## Tier 1 - the paper's comparison (Fig. 4)\n\n"
+         if args.learner == "mofqi" else
+         "## Tier 1 - importance sampling on the scalarized reward\n\n"
+         "This arm trained on a single scalarized reward, so it is evaluated on "
+         "that same scalar rather than on the paper's four components: scoring it "
+         "per objective would report it against goals it never optimized, and "
+         "would fit four FQE heads where one is called for.\n\n"),
+        f"Per-step weighted importance sampling, `gamma_WIS = {cfg.WIS_GAMMA}`. "
+        f"Randomized baselines are averaged over "
         f"{cfg.RANDOM_BASELINE_TRIALS} trials.\n\n",
-        "| policy | " + " | ".join(cfg.REWARD_DIMS) + " |\n",
+        "| policy | " + " | ".join(DIM_NAMES) + " |\n",
         "|---" * (D + 1) + "|\n",
     ]
     for name, v in tier1.items():

@@ -47,7 +47,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as cfg
 import mofqi
-from cql_policy import QNet, GreedyQPolicy
+from cql_policy import QNet, GreedyQPolicy, scalarize
 
 N_ACTIONS = 2
 
@@ -58,17 +58,6 @@ def load_split(lab, split):
         raise SystemExit(f"{p} not found; run stage 3 first")
     d = np.load(p)
     return {k: d[k] for k in d.files}
-
-
-def scalarize(reward, weights=None):
-    """Collapse the 4-vector reward to the single number CQL needs.
-
-    This is the step that forfeits the multi-objective claim. It is isolated in
-    one function so it is obvious where the preference is being imposed.
-    """
-    w = weights or cfg.REWARD_WEIGHTS
-    vec = np.array([w[d] for d in cfg.REWARD_DIMS], dtype=np.float64)
-    return (reward.astype(np.float64) * vec).sum(axis=1).astype(np.float32)
 
 
 def train_cql(train, steps=cfg.CQL_STEPS, alpha=cfg.CQL_ALPHA, gamma=cfg.GAMMA,
