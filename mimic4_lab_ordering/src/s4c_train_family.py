@@ -77,8 +77,49 @@ def summarize_policy(algo, split):
     return {
         "draw_rate": float(any_draw.mean()),
         "draws_per_patient_day": float(any_draw.sum() / days),
+        "replay_detection_mean": float(split["reward"][:, 0][any_draw].mean()
+                                       if any_draw.any() else 0.0),
+        "replay_burden_mean": float(split["reward"][:, 1][any_draw].mean()
+                                    if any_draw.any() else 0.0),
         "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
+
+
+def summarize_policy_with_lambda(algo, split, lam):
+    actions = algo.predict(split["state"].astype(np.float32)).astype(np.int64)
+    any_draw = actions != 0
+    days = max(1e-6, len(actions) / 24.0)
+    r_norm = split["reward_norm"]
+    scalar = r_norm[:, 0] - float(lam) * r_norm[:, 1]
+    return {
+        "draw_rate": float(any_draw.mean()),
+        "draws_per_patient_day": float(any_draw.sum() / days),
+        "replay_scalar_mean": float(scalar.mean()),
+        "replay_detection_sum": float(split["reward"][:, 0][any_draw].sum()),
+        "replay_burden_sum": float(split["reward"][:, 1][any_draw].sum()),
+        "replay_detection_mean_on_draws": float(split["reward"][:, 0][any_draw].mean()
+                                                if any_draw.any() else 0.0),
+        "replay_burden_mean_on_draws": float(split["reward"][:, 1][any_draw].mean()
+                                             if any_draw.any() else 0.0),
+        "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
+    }
+
+
+def make_epoch_callback(lam, val, rows):
+    def _callback(algo, epoch, total_step):
+        s = summarize_policy_with_lambda(algo, val, lam)
+        rec = {"epoch": int(epoch), "step": int(total_step), **s}
+        rows.append(rec)
+        print(
+            f"  val epoch={epoch} step={total_step} "
+            f"draws/day={s['draws_per_patient_day']:.3f} "
+            f"draw_rate={s['draw_rate']:.4f} "
+            f"det_sum={s['replay_detection_sum']:+.1f} "
+            f"burden_sum={s['replay_burden_sum']:+.1f} "
+            f"scalar_mean={s['replay_scalar_mean']:+.4f}",
+            flush=True,
+        )
+    return _callback
 
 
 def main():
@@ -109,6 +150,8 @@ def main():
         reward = scalar_reward(train, lam)
         dataset = make_dataset(train, reward)
         algo = make_cql(args.device, args.alpha)
+        epoch_rows = []
+        cb = make_epoch_callback(lam, val, epoch_rows)
 
         t0 = time.time()
         history = algo.fit(
@@ -119,10 +162,11 @@ def main():
             with_timestamp=False,
             show_progress=args.progress,
             save_interval=max(1, args.steps // max(1, cfg.CQL_EVAL_EVERY)),
+            epoch_callback=cb,
         )
         elapsed = time.time() - t0
 
-        val_summary = summarize_policy(algo, val)
+        val_summary = summarize_policy_with_lambda(algo, val, lam)
         print(f"  done in {elapsed:.1f}s")
         print(f"  val draws/patient-day={val_summary['draws_per_patient_day']:.3f}  "
               f"draw rate={val_summary['draw_rate']:.4f}")
@@ -146,6 +190,7 @@ def main():
             "steps": args.steps,
             "history": [(int(e), {k: float(v) for k, v in m.items()})
                         for e, m in history],
+            "epoch_validation": epoch_rows,
             "val_summary": val_summary,
         }
         meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
