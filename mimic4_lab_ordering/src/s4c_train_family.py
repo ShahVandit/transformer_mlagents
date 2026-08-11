@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "d3rlpy"))
 
 import config as cfg
+import objectives
 
 import d3rlpy
 from d3rlpy.constants import ActionSpace
@@ -89,18 +90,18 @@ def summarize_policy_with_lambda(algo, split, lam):
     actions = algo.predict(split["state"].astype(np.float32)).astype(np.int64)
     any_draw = actions != 0
     days = max(1e-6, len(actions) / 24.0)
-    r_norm = split["reward_norm"]
-    scalar = r_norm[:, 0] - float(lam) * r_norm[:, 1]
+    det = objectives.detection_objective(split, actions)[0]
+    bur = objectives.burden_objective(split, actions)
+    scalar = det - float(lam) * bur
     return {
         "draw_rate": float(any_draw.mean()),
         "draws_per_patient_day": float(any_draw.sum() / days),
+        "replay_detection_sum": float(det.sum()),
+        "replay_burden_sum": float(bur.sum()),
+        "replay_scalar_sum": float(scalar.sum()),
+        "replay_detection_mean": float(det.mean()),
+        "replay_burden_mean": float(bur.mean()),
         "replay_scalar_mean": float(scalar.mean()),
-        "replay_detection_sum": float(split["reward"][:, 0][any_draw].sum()),
-        "replay_burden_sum": float(split["reward"][:, 1][any_draw].sum()),
-        "replay_detection_mean_on_draws": float(split["reward"][:, 0][any_draw].mean()
-                                                if any_draw.any() else 0.0),
-        "replay_burden_mean_on_draws": float(split["reward"][:, 1][any_draw].mean()
-                                             if any_draw.any() else 0.0),
         "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
 
@@ -116,7 +117,7 @@ def make_epoch_callback(lam, val, rows):
             f"draw_rate={s['draw_rate']:.4f} "
             f"det_sum={s['replay_detection_sum']:+.1f} "
             f"burden_sum={s['replay_burden_sum']:+.1f} "
-            f"scalar_mean={s['replay_scalar_mean']:+.4f}",
+            f"scalar_sum={s['replay_scalar_sum']:+.1f}",
             flush=True,
         )
     return _callback
