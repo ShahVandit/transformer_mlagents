@@ -30,6 +30,9 @@ import mofqi
 plt.rcParams.update({"figure.dpi": 130, "font.size": 8,
                      "axes.spines.top": False, "axes.spines.right": False})
 
+LEARNER = "mofqi"
+SFX = ""
+
 
 def _have(path):
     return Path(path).exists()
@@ -38,12 +41,13 @@ def _have(path):
 def fig2_feature_importance(labs):
     bundles = {}
     for lab in labs:
-        p = cfg.MODELS_DIR / f"{lab}_mofqi.pkl"
+        p = cfg.MODELS_DIR / f"{lab}_{LEARNER}.pkl"
         if not _have(p):
             continue
         with open(p, "rb") as fh:
             b = pickle.load(fh)
-        if b["policy"] is not None:
+        # The CQL arm's policy is a Q-network, which has no Gini importances.
+        if getattr(b.get("policy"), "feature_importances_", None) is not None:
             bundles[lab] = (b["state_cols"], b["policy"].feature_importances_)
     if not bundles:
         return
@@ -59,13 +63,13 @@ def fig2_feature_importance(labs):
         ax.set_xlabel("Gini importance")
     fig.suptitle("Policy feature importances (paper Fig. 2)", fontsize=9)
     fig.tight_layout()
-    fig.savefig(cfg.FIGURES_DIR / "fig2_feature_importance.png")
+    fig.savefig(cfg.FIGURES_DIR / f"fig2_feature_importance{SFX}.png")
     plt.close(fig)
 
 
 def fig3_trajectory(lab):
     p = cfg.RL_DIR / f"{lab}_test.npz"
-    mp = cfg.MODELS_DIR / f"{lab}_mofqi.pkl"
+    mp = cfg.MODELS_DIR / f"{lab}_{LEARNER}.pkl"
     if not (_have(p) and _have(mp)):
         return
     d = {k: v for k, v in np.load(p).items()}
@@ -107,14 +111,14 @@ def fig3_trajectory(lab):
     ax2.set_xlabel("hours since ICU admission")
     ax2.legend(fontsize=6, loc="upper right", ncol=4)
     fig.tight_layout()
-    fig.savefig(cfg.FIGURES_DIR / f"fig3_trajectory_{lab}.png")
+    fig.savefig(cfg.FIGURES_DIR / f"fig3_trajectory_{lab}{SFX}.png")
     plt.close(fig)
 
 
 def fig4_ope_values(labs):
     data = {}
     for lab in labs:
-        p = cfg.REPORTS_DIR / f"ope_{lab}.json"
+        p = cfg.REPORTS_DIR / f"ope_{lab}{SFX}.json"
         if _have(p):
             data[lab] = json.loads(Path(p).read_text())
     if not data:
@@ -142,14 +146,14 @@ def fig4_ope_values(labs):
                 ax.set_ylabel(lab, fontsize=8)
     fig.suptitle("PS-WIS value per reward component (paper Fig. 4)", fontsize=9)
     fig.tight_layout()
-    fig.savefig(cfg.FIGURES_DIR / "fig4_ope_values.png")
+    fig.savefig(cfg.FIGURES_DIR / f"fig4_ope_values{SFX}.png")
     plt.close(fig)
 
 
 def _clinical(labs):
     out = {}
     for lab in labs:
-        p = cfg.RL_DIR / f"{lab}_clinical.npz"
+        p = cfg.RL_DIR / f"{lab}_clinical{SFX}.npz"
         if _have(p):
             out[lab] = {k: v for k, v in np.load(p).items()}
     return out
@@ -174,7 +178,7 @@ def fig5_information_gain(labs):
         ax.legend(fontsize=6)
     fig.suptitle("Information gain per order (paper Fig. 5)", fontsize=9)
     fig.tight_layout()
-    fig.savefig(cfg.FIGURES_DIR / "fig5_information_gain.png")
+    fig.savefig(cfg.FIGURES_DIR / f"fig5_information_gain{SFX}.png")
     plt.close(fig)
 
 
@@ -196,16 +200,20 @@ def fig6_time_to_treatment(labs):
         ax.legend(fontsize=6)
     fig.suptitle("Time to treatment onset (paper Fig. 6)", fontsize=9)
     fig.tight_layout()
-    fig.savefig(cfg.FIGURES_DIR / "fig6_time_to_treatment.png")
+    fig.savefig(cfg.FIGURES_DIR / f"fig6_time_to_treatment{SFX}.png")
     plt.close(fig)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labs", nargs="+", default=ids.TARGET_LABS)
+    ap.add_argument("--learner", default="mofqi", choices=["mofqi", "cql"])
     args = ap.parse_args()
 
     cfg.ensure_dirs()
+    global LEARNER, SFX
+    LEARNER = args.learner
+    SFX = "" if args.learner == "mofqi" else f"_{args.learner}"
     fig2_feature_importance(args.labs)
     for lab in args.labs:
         fig3_trajectory(lab)

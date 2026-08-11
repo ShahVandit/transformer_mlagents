@@ -127,8 +127,28 @@ FQI_N_JOBS = -1
 # Eq. 7: order iff Q_d(s,1) + eps_d > Q_d(s,0) for ALL d. Only the cost slack is
 # tuned; the paper tunes it so the recommended order count approximates the
 # observed count. Search grid is over eps_cost only, on the VAL split.
-EPS_GRID = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+EPS_GRID = [0.0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0]
+EPS_BISECT_STEPS = 40   # refine inside the bracketing interval; the grid alone
+                        # is too coarse (lactate jumps 0 -> 104k across one step)
 BUDGET_HOURS = 24            # force one order per 24h window with no recommendation
+
+# ------------------------------------------- CQL arm (optional, non-paper) ----
+# Conservative Q-Learning is NOT part of Cheng et al. It is an alternative
+# learner behind --learner cql, kept separate so the replication stays intact.
+#
+# CQL is scalar-Q, so the paper's 4-vector reward has to be collapsed to one
+# number by these weights. That collapse is exactly what the paper's Pareto
+# pruning exists to avoid, so running this arm means giving up the
+# multi-objective claim and fixing a preference by hand instead.
+REWARD_WEIGHTS = {"r_sofa": 1.0, "r_treat": 1.0, "r_info": 1.0, "neg_r_cost": 1.0}
+
+CQL_ALPHA = 1.0            # weight on the conservative penalty
+CQL_STEPS = 20_000         # gradient steps
+CQL_LR = 1e-4
+CQL_BATCH = 1024
+CQL_HIDDEN = 128
+CQL_TARGET_TAU = 0.005     # Polyak rate for the target network
+CQL_EVAL_EVERY = 2_000
 
 # ------------------------------------------------- off-policy evaluation ----
 # Tier 1 replicates the paper: per-step WIS with an undiscounted horizon.

@@ -123,11 +123,13 @@ def describe(v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lab", required=True)
+    ap.add_argument("--learner", default="mofqi", choices=["mofqi", "cql"],
+                    help="which stage-4 bundle to evaluate")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
     lab = args.lab
-    with open(cfg.MODELS_DIR / f"{lab}_mofqi.pkl", "rb") as fh:
+    with open(cfg.MODELS_DIR / f"{lab}_{args.learner}.pkl", "rb") as fh:
         bundle = pickle.load(fh)
     test = load_split(lab, "test")
 
@@ -161,7 +163,8 @@ def main():
           f"{describe(tt_clin)['mean']:.2f} (n={len(tt_clin)})  policy "
           f"{describe(tt_pol)['mean']:.2f} (n={len(tt_pol)})")
 
-    np.savez_compressed(cfg.RL_DIR / f"{lab}_clinical.npz",
+    sfx = "" if args.learner == "mofqi" else f"_{args.learner}"
+    np.savez_compressed(cfg.RL_DIR / f"{lab}_clinical{sfx}.npz",
                         ig_clin=ig_clin, ig_pol=ig_pol,
                         tt_clin=tt_clin, tt_pol=tt_pol,
                         counts=np.array(list(counts.values())))
@@ -214,7 +217,7 @@ def main():
         "nothing here is counterfactual, and a policy that simply orders more "
         "often has more chances to land early in the window.\n")
 
-    out = cfg.REPORTS_DIR / f"clinical_{lab}.md"
+    out = cfg.REPORTS_DIR / f"clinical_{lab}{sfx}.md"
     out.write_text("".join(L), encoding="utf-8")
     print(f"\nwrote report -> {out}")
 

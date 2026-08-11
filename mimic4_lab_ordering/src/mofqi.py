@@ -167,9 +167,18 @@ class MOFittedQ:
         objective. `eps` relaxes that per objective; the paper tunes only the
         cost slack.
         """
-        Q = self.q_all_actions(states)
-        eps = np.asarray(eps, dtype=np.float64).reshape(1, -1)
-        return np.all(Q[:, 1, :] + eps > Q[:, 0, :], axis=1).astype(np.int8)
+        return collapse_from_q(self.q_all_actions(states), eps)
+
+
+def collapse_from_q(Q, eps):
+    """Eq. 7 applied to precomputed Q-values.
+
+    Q does not depend on eps, so tuning the slack means re-running this
+    comparison, not re-running the forest. Splitting it out turns a search over
+    eps from minutes of prediction into milliseconds of arithmetic.
+    """
+    eps = np.asarray(eps, dtype=np.float64).reshape(1, -1)
+    return np.all(Q[:, 1, :] + eps > Q[:, 0, :], axis=1).astype(np.int8)
 
 
 def apply_budget(actions, stay_ids, hours, budget_hours=cfg.BUDGET_HOURS):

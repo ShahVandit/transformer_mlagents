@@ -49,21 +49,61 @@ def tune_eps(model, val, meta):
 
     Only the cost slack moves, per the paper: "if cost is a softer constraint,
     setting eps_cost > 0 is an intuitive way to specify this preference".
+
+    A fixed grid is not enough. The count is monotonic in eps_cost but its slope
+    varies enormously by lab: for lactate it went from 0 orders at eps=0 to
+    104,351 at eps=0.01, straddling the 15,117 target with no grid point in
+    between, so the grid search selected eps=0 and produced a policy that never
+    orders at all. The grid is therefore kept only for the report table, and the
+    actual choice comes from a bisection inside the bracketing interval.
     """
+    cost_i = cfg.REWARD_DIMS.index("neg_r_cost")
     target = int(val["action"].sum())
-    rows = []
-    best = (None, None)
-    for e in cfg.EPS_GRID:
+
+    # Q is independent of eps, so evaluate the forest once and reuse it.
+    Q = model.q_all_actions(val["state"])
+
+    def n_orders(e):
         eps = np.zeros(len(cfg.REWARD_DIMS))
-        eps[cfg.REWARD_DIMS.index("neg_r_cost")] = e
-        rec = model.collapse(val["state"], eps)
-        n_rec = int(rec.sum())
-        gap = abs(n_rec - target)
-        rows.append({"eps_cost": e, "n_recommended": n_rec, "n_observed": target,
-                     "abs_gap": gap, "order_rate": float(rec.mean())})
-        if best[1] is None or gap < best[1]:
-            best = (e, gap)
-    return best[0], rows
+        eps[cost_i] = e
+        return int(mofqi.collapse_from_q(Q, eps).sum())
+
+    rows = [{"eps_cost": e, "n_recommended": n_orders(e), "n_observed": target}
+            for e in cfg.EPS_GRID]
+    for r in rows:
+        r["abs_gap"] = abs(r["n_recommended"] - target)
+        r["order_rate"] = r["n_recommended"] / max(len(Q), 1)
+
+    # Bracket the target, then bisect. Monotonicity in eps makes this exact.
+    lo = max([r["eps_cost"] for r in rows if r["n_recommended"] <= target],
+             default=cfg.EPS_GRID[0])
+    hi = min([r["eps_cost"] for r in rows if r["n_recommended"] >= target],
+             default=cfg.EPS_GRID[-1])
+    if hi < lo:
+        lo, hi = cfg.EPS_GRID[0], cfg.EPS_GRID[-1]
+    for _ in range(cfg.EPS_BISECT_STEPS):
+        mid = 0.5 * (lo + hi)
+        if n_orders(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    best = min([lo, hi], key=lambda e: abs(n_orders(e) - target))
+
+    # A policy that never orders, or always orders, is not a policy. If the
+    # search lands on one, take the closest non-degenerate eps instead.
+    n_best = n_orders(best)
+    if n_best == 0 or n_best == len(Q):
+        cand = [(abs(n_orders(e) - target), e) for e in cfg.EPS_GRID
+                if 0 < n_orders(e) < len(Q)]
+        if cand:
+            best = min(cand)[1]
+            print(f"  WARNING: bisection landed on a degenerate policy "
+                  f"({n_best} orders); falling back to eps_cost={best}")
+
+    rows.append({"eps_cost": round(best, 6), "n_recommended": n_orders(best),
+                 "n_observed": target, "abs_gap": abs(n_orders(best) - target),
+                 "order_rate": n_orders(best) / max(len(Q), 1), "bisected": True})
+    return best, rows
 
 
 def main():
@@ -93,9 +133,9 @@ def main():
     print("\n[2/4] tuning eps_cost on val (Eq. 7)")
     eps_cost, eps_rows = tune_eps(model, val, meta)
     for r in eps_rows:
-        mark = " <-" if r["eps_cost"] == eps_cost else ""
-        print(f"  eps_cost={r['eps_cost']:<5} recommended={r['n_recommended']:6,} "
-              f"observed={r['n_observed']:6,} gap={r['abs_gap']:6,}{mark}")
+        mark = "  <- bisected" if r.get("bisected") else ""
+        print(f"  eps_cost={r['eps_cost']:<9} recommended={r['n_recommended']:7,} "
+              f"observed={r['n_observed']:7,} gap={r['abs_gap']:7,}{mark}")
     eps = np.zeros(len(cfg.REWARD_DIMS))
     eps[cfg.REWARD_DIMS.index("neg_r_cost")] = eps_cost
 

@@ -314,12 +314,14 @@ def factual_return(split, trajs, dim, gamma):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lab", required=True)
+    ap.add_argument("--learner", default="mofqi", choices=["mofqi", "cql"],
+                    help="which stage-4 bundle to evaluate")
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
     args = ap.parse_args()
 
     cfg.ensure_dirs()
     lab = args.lab
-    with open(cfg.MODELS_DIR / f"{lab}_mofqi.pkl", "rb") as fh:
+    with open(cfg.MODELS_DIR / f"{lab}_{args.learner}.pkl", "rb") as fh:
         bundle = pickle.load(fh)
 
     train = load_split(lab, "train")
@@ -475,15 +477,16 @@ def main():
         "order_rate_clinician": float(test["action"].mean()),
         "n_trajectories": len(trajs), "n_patients": len(set(subj_of_traj)),
     }
-    (cfg.REPORTS_DIR / f"ope_{lab}.json").write_text(json.dumps(results, indent=2),
-                                                     encoding="utf-8")
+    sfx = "" if args.learner == "mofqi" else f"_{args.learner}"
+    (cfg.REPORTS_DIR / f"ope_{lab}{sfx}.json").write_text(
+        json.dumps(results, indent=2), encoding="utf-8")
 
     write_report(lab, args, tier1, tier2, ess_soft, ess_det, support, calib,
-                 det_test, test, len(trajs), len(set(subj_of_traj)))
+                 det_test, test, len(trajs), len(set(subj_of_traj)), sfx)
 
 
 def write_report(lab, args, tier1, tier2, ess_soft, ess_det, support, calib,
-                 det_test, test, n_traj, n_subj):
+                 det_test, test, n_traj, n_subj, sfx=""):
     L = [
         f"# Off-policy evaluation: {lab}\n\n",
         f"Test split, patient-disjoint. {n_traj:,} ICU stays from {n_subj:,} patients, "
@@ -570,7 +573,7 @@ def write_report(lab, args, tier1, tier2, ess_soft, ess_det, support, calib,
         "so the rule is not a Markov policy and none of these estimators apply to "
         "it. Its effect on order counts is in the stage-6 report.\n")
 
-    out = cfg.REPORTS_DIR / f"ope_{lab}.md"
+    out = cfg.REPORTS_DIR / f"ope_{lab}{sfx}.md"
     out.write_text("".join(L), encoding="utf-8")
     print(f"\nwrote report -> {out}")
 
