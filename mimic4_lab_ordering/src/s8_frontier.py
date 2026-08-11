@@ -122,10 +122,13 @@ def train_fqe(train_dataset, policy, n_steps, device="cpu", gamma=cfg.GAMMA):
         observation_scaler=StandardObservationScaler(),
     )
     fqe = DiscreteFQE(algo=policy, config=cfg_fqe, device=device)
+    capped_steps = min(n_steps, cfg.FQE_STEPS)
+    print(f"  FQE budget: {capped_steps:,} steps "
+          f"({cfg.FQE_STEPS_PER_EPOCH:,} steps/epoch cap)")
     fqe.fit(
         train_dataset,
-        n_steps=n_steps,
-        n_steps_per_epoch=cfg.FQE_BATCH,
+        n_steps=capped_steps,
+        n_steps_per_epoch=cfg.FQE_STEPS_PER_EPOCH,
         experiment_name="joint_fqe",
         with_timestamp=False,
         show_progress=False,
