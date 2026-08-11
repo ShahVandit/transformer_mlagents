@@ -1,6 +1,8 @@
 """
 Stage 8: evaluate the joint CQL policy family and build the Pareto frontier.
 
+Uses d3rlpy for policy loading and FQE; WIS/WDR remain custom.
+
 Outputs:
   reports/joint_frontier.csv
   reports/joint_frontier.json
@@ -10,7 +12,6 @@ Outputs:
 """
 import argparse
 import json
-import pickle
 import sys
 from pathlib import Path
 
@@ -18,7 +19,14 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "d3rlpy"))
+
 import config as cfg
+import d3rlpy
+from d3rlpy.constants import ActionSpace
+from d3rlpy.dataset import MDPDataset
+from d3rlpy.ope import DiscreteFQE, FQEConfig
+from d3rlpy.preprocessing import StandardObservationScaler
 import s5_evaluate_ope as ope
 from s4c_train_family import lam_slug
 
@@ -34,12 +42,22 @@ def load_split(split):
     return {k: d[k] for k in d.files}
 
 
-def load_bundle(lam):
-    p = cfg.MODELS_DIR / f"joint_cql_lam{lam_slug(lam)}.pkl"
+def load_policy(lam, device="cpu"):
+    p = cfg.MODELS_DIR / f"joint_cql_lam{lam_slug(lam)}.d3"
     if not p.exists():
         raise SystemExit(f"{p} not found; run stage 4c first")
-    with open(p, "rb") as fh:
-        return pickle.load(fh)
+    return d3rlpy.load_learnable(str(p), device=device)
+
+
+def make_dataset(split, reward):
+    return MDPDataset(
+        observations=split["state"].astype(np.float32),
+        actions=split["action"].astype(np.int64),
+        rewards=np.asarray(reward, dtype=np.float32).reshape(-1, 1),
+        terminals=split["done"].astype(np.float32),
+        action_space=ActionSpace.DISCRETE,
+        action_size=N_ACTIONS,
+    )
 
 
 def patient_days(split):
@@ -80,31 +98,62 @@ def non_dominated(df):
     return keep
 
 
-def make_policy_probs(actions, epsilon):
-    return ope.epsilon_greedy_probs(actions, epsilon)
+def epsilon_greedy_probs(actions, epsilon):
+    p = np.full((len(actions), N_ACTIONS), epsilon / N_ACTIONS, dtype=np.float32)
+    p[np.arange(len(actions)), actions] += 1.0 - epsilon
+    return p
 
 
-def evaluate_policy(name, bundle, train, test, beh, pi_b_test, trajs, subj_of_traj,
-                    epsilon):
-    if bundle is None:
-        det_actions = test["action"].astype(int)
-        pi_e_test = pi_b_test
-        pi_e_next = ope.behavior_probs(beh, train["next_state"])
-    else:
-        det_actions = bundle["policy"].predict(test["state"]).astype(int)
-        pi_e_test = make_policy_probs(det_actions, epsilon)
-        pi_e_next = make_policy_probs(
-            bundle["policy"].predict(train["next_state"]).astype(int), epsilon)
+def fqe_q_values(fqe, states):
+    out = []
+    for a in range(N_ACTIONS):
+        aa = np.full(len(states), a, dtype=np.int64)
+        q = np.asarray(fqe.predict_value(states.astype(np.float32), aa)).reshape(-1)
+        out.append(q)
+    return np.stack(out, axis=1)
+
+
+def train_fqe(train_dataset, policy, n_steps, device="cpu", gamma=cfg.GAMMA):
+    cfg_fqe = FQEConfig(
+        learning_rate=cfg.FQE_LR,
+        batch_size=cfg.FQE_BATCH,
+        gamma=gamma,
+        target_update_interval=100,
+        observation_scaler=StandardObservationScaler(),
+    )
+    fqe = DiscreteFQE(algo=policy, config=cfg_fqe, device=device)
+    fqe.fit(
+        train_dataset,
+        n_steps=n_steps,
+        n_steps_per_epoch=cfg.FQE_BATCH,
+        experiment_name="joint_fqe",
+        with_timestamp=False,
+        show_progress=False,
+    )
+    return fqe
+
+
+def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_traj,
+                    epsilon, reward_dim, device="cpu"):
+    det_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
+    pi_e_test = epsilon_greedy_probs(det_actions, epsilon)
 
     logw = ope.per_step_log_weights(test, trajs, pi_e_test, pi_b_test)
-    qnet = ope.train_fqe(train, pi_e_next)
-    qv_test = ope.q_values(qnet, test["state"])
-    fqe_v0 = ope.fqe_initial_values(qv_test, pi_e_test, trajs)
+    fqe = train_fqe(
+        make_dataset(train, train["reward"][:, reward_dim]),
+        policy,
+        n_steps=max(cfg.FQE_MIN_STEPS, len(train["action"]) // 8),
+        device=device,
+        gamma=cfg.GAMMA,
+    )
+    qv_test = fqe_q_values(fqe, test["state"])
+    qv_test_3d = qv_test[:, :, None]
+    fqe_v0 = ope.fqe_initial_values(qv_test_3d, pi_e_test, trajs)
     idx_of = {id(tr): k for k, tr in enumerate(trajs)}
 
     row = {
         "policy": name,
-        "lambda": np.nan if bundle is None else float(bundle["lambda"]),
+        "lambda": np.nan if policy is None else float(name.split("lam")[-1].replace("p", ".")) if "lam" in name else np.nan,
         "draws_per_patient_day": float((det_actions != 0).sum() / patient_days(test)),
         "draw_rate": float((det_actions != 0).mean()),
         "event_coverage_replay": event_coverage(test, det_actions),
@@ -113,33 +162,33 @@ def evaluate_policy(name, bundle, train, test, beh, pi_b_test, trajs, subj_of_tr
     row["ess_final"] = ess["ess_final"]
     row["ess_mean"] = ess["ess_mean_over_steps"]
 
-    for d, dim_name in enumerate(cfg.JOINT_REWARD_DIMS):
-        clin = ope.factual_return(test, trajs, d, cfg.GAMMA)
+    dim_name = cfg.JOINT_REWARD_DIMS[reward_dim]
+    clin = ope.factual_return(test, trajs, reward_dim, cfg.GAMMA)
 
-        def clin_est(sample, clin=clin):
-            return float(np.mean([clin[idx_of[id(tr)]] for tr in sample]))
+    def clin_est(sample, clin=clin):
+        return float(np.mean([clin[idx_of[id(tr)]] for tr in sample]))
 
-        def fqe_est(sample, d=d):
-            return float(np.mean([fqe_v0[idx_of[id(tr)], d] for tr in sample]))
+    def fqe_est(sample):
+        return float(np.mean([fqe_v0[idx_of[id(tr)], 0] for tr in sample]))
 
-        def wis_est(sample, d=d):
-            lw = [logw[idx_of[id(tr)]] for tr in sample]
-            return ope.ps_wis(test, sample, lw, d)
+    def wis_est(sample):
+        lw = [logw[idx_of[id(tr)]] for tr in sample]
+        return ope.ps_wis(test, sample, lw, reward_dim)
 
-        def wdr_est(sample, d=d):
-            lw = [logw[idx_of[id(tr)]] for tr in sample]
-            return ope.wdr(test, sample, lw, qv_test, pi_e_test, d)
+    def wdr_est(sample):
+        lw = [logw[idx_of[id(tr)]] for tr in sample]
+        return ope.wdr(test, sample, lw, qv_test_3d, pi_e_test, 0)
 
-        for prefix, est in [
-            ("clinician", clin_est),
-            ("fqe", fqe_est),
-            ("wis", wis_est),
-            ("wdr", wdr_est),
-        ]:
-            pt, lo, hi = ope.subject_bootstrap(est, trajs, subj_of_traj)
-            row[f"{prefix}_{dim_name}"] = pt
-            row[f"{prefix}_{dim_name}_lo"] = lo
-            row[f"{prefix}_{dim_name}_hi"] = hi
+    for prefix, est in [
+        ("clinician", clin_est),
+        ("fqe", fqe_est),
+        ("wis", wis_est),
+        ("wdr", wdr_est),
+    ]:
+        pt, lo, hi = ope.subject_bootstrap(est, trajs, subj_of_traj)
+        row[f"{prefix}_{dim_name}"] = pt
+        row[f"{prefix}_{dim_name}_lo"] = lo
+        row[f"{prefix}_{dim_name}_hi"] = hi
     return row
 
 
@@ -160,7 +209,7 @@ def maybe_plot(df):
                 yerr=[pol["wdr_detection"] - pol["wdr_detection_lo"],
                       pol["wdr_detection_hi"] - pol["wdr_detection"]],
                 fmt="o", label="CQL policies")
-    ax.scatter([clin["clinician_burden"]], [clin["clinician_detection"]],
+    ax.scatter([clin["wdr_burden"]], [clin["wdr_detection"]],
                marker="x", s=80, label="clinician")
     ax.set_xlabel("Burden return, lower is better")
     ax.set_ylabel("Detection return, higher is better")
@@ -205,9 +254,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lambdas", nargs="+", type=float, default=cfg.JOINT_LAMBDAS)
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
+    ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
+    d3rlpy.seed(cfg.SEED)
     train = load_split("train")
     test = load_split("test")
 
@@ -224,14 +275,37 @@ def main():
 
     rows = []
     print("\n[clinician]")
-    rows.append(evaluate_policy("clinician", None, train, test, beh, pi_b_test,
-                                trajs, subj_of_traj, args.epsilon))
+    clin_det = ope.factual_return(test, trajs, 0, cfg.GAMMA).mean()
+    clin_bur = ope.factual_return(test, trajs, 1, cfg.GAMMA).mean()
+    rows.append({
+        "policy": "clinician",
+        "lambda": np.nan,
+        "draws_per_patient_day": float((test["action"] != 0).sum() / patient_days(test)),
+        "draw_rate": float((test["action"] != 0).mean()),
+        "event_coverage_replay": event_coverage(test, test["action"]),
+        "wdr_detection": float(clin_det),
+        "wdr_burden": float(clin_bur),
+        "ess_final": np.nan,
+    })
 
     for lam in args.lambdas:
         print(f"\n[lambda={lam}]")
-        bundle = load_bundle(lam)
-        rows.append(evaluate_policy(f"cql_lam{lam_slug(lam)}", bundle, train, test,
-                                    beh, pi_b_test, trajs, subj_of_traj, args.epsilon))
+        policy = load_policy(lam, device=args.device)
+        row = {"policy": f"cql_lam{lam_slug(lam)}", "lambda": float(lam)}
+        det_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
+        row["draws_per_patient_day"] = float((det_actions != 0).sum() / patient_days(test))
+        row["draw_rate"] = float((det_actions != 0).mean())
+        row["event_coverage_replay"] = event_coverage(test, det_actions)
+
+        for reward_dim in range(len(cfg.JOINT_REWARD_DIMS)):
+            est = evaluate_policy(
+                row["policy"], policy, train, test, beh, pi_b_test, trajs,
+                subj_of_traj, args.epsilon, reward_dim, device=args.device
+            )
+            for k, v in est.items():
+                if k not in row:
+                    row[k] = v
+        rows.append(row)
 
     df = pd.DataFrame(rows)
     learned = df["policy"] != "clinician"

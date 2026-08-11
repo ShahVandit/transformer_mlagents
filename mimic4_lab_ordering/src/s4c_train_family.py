@@ -1,26 +1,31 @@
 """
-Stage 4c: train a family of joint-panel CQL policies.
+Stage 4c: train a family of joint-panel CQL policies with d3rlpy.
 
 Each policy uses the same two raw objectives and the same normalized reward:
 
     r_lambda = z_detection - lambda * z_burden
 
-Output: models/joint_cql_lam{lambda}.pkl
+Output:
+  models/joint_cql_lam{lambda}.d3
+  models/joint_cql_lam{lambda}.json
 """
 import argparse
 import json
-import pickle
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "d3rlpy"))
+
 import config as cfg
-from cql_policy import GreedyQPolicy, QNet
+
+import d3rlpy
+from d3rlpy.constants import ActionSpace
+from d3rlpy.dataset import MDPDataset
+from d3rlpy.preprocessing import StandardObservationScaler
 
 
 N_ACTIONS = len(cfg.JOINT_PANEL_BITS)
@@ -43,70 +48,36 @@ def scalar_reward(split, lam):
     return (r[:, 0] - float(lam) * r[:, 1]).astype(np.float32)
 
 
-def train_cql(train, lam, steps=cfg.CQL_STEPS, alpha=cfg.CQL_ALPHA,
-              gamma=cfg.GAMMA, verbose_every=cfg.CQL_EVAL_EVERY):
-    torch.manual_seed(cfg.SEED)
-    mu = train["state"].mean(axis=0)
-    sd = train["state"].std(axis=0)
-    sd[sd < 1e-6] = 1.0
-
-    s = torch.tensor((train["state"] - mu) / sd, dtype=torch.float32)
-    s2 = torch.tensor((train["next_state"] - mu) / sd, dtype=torch.float32)
-    a = torch.tensor(train["action"], dtype=torch.long)
-    r = torch.tensor(scalar_reward(train, lam), dtype=torch.float32)
-    done = torch.tensor(train["done"], dtype=torch.float32)
-
-    net = QNet(s.shape[1], n_actions=N_ACTIONS)
-    tgt = QNet(s.shape[1], n_actions=N_ACTIONS)
-    tgt.load_state_dict(net.state_dict())
-    opt = torch.optim.Adam(net.parameters(), lr=cfg.CQL_LR)
-
-    n = len(a)
-    rng = np.random.default_rng(cfg.SEED)
-    history = []
-    for step in range(1, steps + 1):
-        idx = torch.tensor(rng.integers(0, n, cfg.CQL_BATCH), dtype=torch.long)
-        with torch.no_grad():
-            a_next = net(s2[idx]).argmax(dim=1)
-            q_next = tgt(s2[idx]).gather(1, a_next[:, None]).squeeze(1)
-            target = r[idx] + gamma * (1 - done[idx]) * q_next
-
-        q_all = net(s[idx])
-        q_sa = q_all.gather(1, a[idx][:, None]).squeeze(1)
-        td = F.mse_loss(q_sa, target)
-        conservative = (torch.logsumexp(q_all, dim=1) - q_sa).mean()
-        loss = td + alpha * conservative
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        with torch.no_grad():
-            for p, tp in zip(net.parameters(), tgt.parameters()):
-                tp.data.mul_(1 - cfg.CQL_TARGET_TAU).add_(cfg.CQL_TARGET_TAU * p.data)
-
-        if step % verbose_every == 0 or step == 1:
-            rec = {
-                "step": step,
-                "loss": float(loss),
-                "td_loss": float(td),
-                "conservative_loss": float(conservative),
-                "q_mean": float(q_all.mean()),
-            }
-            history.append(rec)
-            print(f"    step {step:6d}/{steps}  loss={rec['loss']:8.4f}  "
-                  f"td={rec['td_loss']:8.4f}  cons={rec['conservative_loss']:7.4f}  "
-                  f"q_mean={rec['q_mean']:7.4f}", flush=True)
-    return net, mu, sd, history
+def make_dataset(split, reward):
+    return MDPDataset(
+        observations=split["state"].astype(np.float32),
+        actions=split["action"].astype(np.int64),
+        rewards=np.asarray(reward, dtype=np.float32).reshape(-1, 1),
+        terminals=split["done"].astype(np.float32),
+        action_space=ActionSpace.DISCRETE,
+        action_size=N_ACTIONS,
+    )
 
 
-def summarize_policy(policy, split):
-    a = policy.predict(split["state"])
-    any_draw = a != 0
-    days = max(1e-6, len(a) / 24.0)
+def make_cql(device, alpha):
+    return d3rlpy.algos.DiscreteCQLConfig(
+        learning_rate=cfg.CQL_LR,
+        batch_size=cfg.CQL_BATCH,
+        gamma=cfg.GAMMA,
+        alpha=alpha,
+        target_update_interval=cfg.CQL_EVAL_EVERY,
+        observation_scaler=StandardObservationScaler(),
+    ).create(device=device)
+
+
+def summarize_policy(algo, split):
+    actions = algo.predict(split["state"].astype(np.float32)).astype(np.int64)
+    any_draw = actions != 0
+    days = max(1e-6, len(actions) / 24.0)
     return {
         "draw_rate": float(any_draw.mean()),
         "draws_per_patient_day": float(any_draw.sum() / days),
-        "action_counts": {str(i): int((a == i).sum()) for i in range(N_ACTIONS)},
+        "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
 
 
@@ -115,33 +86,57 @@ def main():
     ap.add_argument("--lambdas", nargs="+", type=float, default=cfg.JOINT_LAMBDAS)
     ap.add_argument("--steps", type=int, default=cfg.CQL_STEPS)
     ap.add_argument("--alpha", type=float, default=cfg.CQL_ALPHA)
+    ap.add_argument("--device", default=False,
+                    help="d3rlpy device argument: False, cpu, cuda:0, or GPU id")
+    ap.add_argument("--progress", action="store_true")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
+    d3rlpy.seed(cfg.SEED)
+
     meta = json.loads((cfg.RL_DIR / "joint_meta.json").read_text())
     train = load_split("train")
     val = load_split("val")
 
-    print(f"joint CQL family: train n={len(train['action']):,}, "
+    print(f"joint d3rlpy CQL family: train n={len(train['action']):,}, "
           f"state dim={train['state'].shape[1]}, actions={N_ACTIONS}")
     print("reward: z_detection - lambda * z_burden")
 
     rows = []
     for lam in args.lambdas:
-        print(f"\n[lambda={lam}] CQL, {args.steps:,} steps, alpha={args.alpha}")
+        print(f"\n[lambda={lam}] d3rlpy DiscreteCQL, "
+              f"{args.steps:,} steps, alpha={args.alpha}")
+        reward = scalar_reward(train, lam)
+        dataset = make_dataset(train, reward)
+        algo = make_cql(args.device, args.alpha)
+
         t0 = time.time()
-        net, mu, sd, history = train_cql(train, lam, steps=args.steps, alpha=args.alpha)
-        policy = GreedyQPolicy(net, mu, sd)
-        val_summary = summarize_policy(policy, val)
-        print(f"  done in {time.time() - t0:.1f}s")
+        history = algo.fit(
+            dataset,
+            n_steps=args.steps,
+            n_steps_per_epoch=cfg.CQL_EVAL_EVERY,
+            experiment_name=f"joint_cql_lam{lam_slug(lam)}",
+            with_timestamp=False,
+            show_progress=args.progress,
+            save_interval=max(1, args.steps // max(1, cfg.CQL_EVAL_EVERY)),
+        )
+        elapsed = time.time() - t0
+
+        val_summary = summarize_policy(algo, val)
+        print(f"  done in {elapsed:.1f}s")
         print(f"  val draws/patient-day={val_summary['draws_per_patient_day']:.3f}  "
               f"draw rate={val_summary['draw_rate']:.4f}")
 
-        bundle = {
+        stem = cfg.MODELS_DIR / f"joint_cql_lam{lam_slug(lam)}"
+        model_path = stem.with_suffix(".d3")
+        meta_path = stem.with_suffix(".json")
+        algo.save(str(model_path))
+        payload = {
             "track": "joint",
-            "learner": "cql",
+            "library": "d3rlpy",
+            "learner": "DiscreteCQL",
+            "model_path": str(model_path),
             "lambda": float(lam),
-            "policy": policy,
             "n_actions": N_ACTIONS,
             "panel_bits": cfg.JOINT_PANEL_BITS,
             "panel_names": cfg.JOINT_PANEL_NAMES,
@@ -149,16 +144,15 @@ def main():
             "state_cols": meta["state_cols"],
             "alpha": args.alpha,
             "steps": args.steps,
-            "history": history,
+            "history": [(int(e), {k: float(v) for k, v in m.items()})
+                        for e, m in history],
             "val_summary": val_summary,
         }
-        out = cfg.MODELS_DIR / f"joint_cql_lam{lam_slug(lam)}.pkl"
-        with open(out, "wb") as fh:
-            pickle.dump(bundle, fh)
-        print(f"  saved -> {out}")
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"  saved -> {model_path}")
         rows.append({"lambda": float(lam), **val_summary})
 
-    report = ["# Joint CQL policy family\n\n",
+    report = ["# Joint d3rlpy CQL policy family\n\n",
               "| lambda | val draws/patient-day | val draw rate |\n",
               "|---|---:|---:|\n"]
     for row in rows:
