@@ -9,6 +9,18 @@ import itemids as ids
 import panels
 
 
+def _col(obj, name):
+    if isinstance(obj, dict):
+        return obj[name]
+    if hasattr(obj, "__getitem__"):
+        return obj[name]
+    raise TypeError(f"unsupported data container for column {name!r}")
+
+
+def _to_numpy(x):
+    return x.to_numpy() if hasattr(x, "to_numpy") else np.asarray(x)
+
+
 def _future_any_by_stay(values, stay_ids, lookahead):
     """For row t, true if any event occurs in (t, t + lookahead]."""
     out = np.zeros(len(values), dtype=bool)
@@ -47,19 +59,19 @@ def _recent_any_by_stay(values, stay_ids, lookback):
 
 def deterioration_events(df):
     onset_cols = [f"onset_{k}" for k in ids.INTERVENTION_KINDS]
-    onset = df[onset_cols].to_numpy().sum(axis=1) > 0
-    sofa = df["sofa_delta"].to_numpy() >= cfg.SOFA_DELTA_THRESHOLD
+    onset = np.column_stack([_to_numpy(_col(df, c)) for c in onset_cols]).sum(axis=1) > 0
+    sofa = _to_numpy(_col(df, "sofa_delta")) >= cfg.SOFA_DELTA_THRESHOLD
     return onset | sofa
 
 
 def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
-    stay = df["stay_id"].to_numpy()
+    stay = _to_numpy(_col(df, "stay_id"))
     event = deterioration_events(df)
     future_event = _future_any_by_stay(event, stay, lookahead)
     any_draw = np.asarray(actions) != 0
     recent_draw = _recent_any_by_stay(any_draw, stay, lookahead)
 
-    r = np.zeros(len(df), dtype=np.float32)
+    r = np.zeros(len(stay), dtype=np.float32)
     r[future_event & any_draw] = 1.0
     r[future_event & ~any_draw & ~recent_draw] = -1.0
     return r, future_event.astype(np.int8), event.astype(np.int8)
@@ -69,7 +81,7 @@ def burden_objective(df, actions):
     bits = panels.action_bits(actions).astype(np.float32)
     deltas = []
     for lab in panels.LABS:
-        d = df[f"delta_{lab}"].to_numpy(dtype=np.float32)
+        d = _to_numpy(_col(df, f"delta_{lab}")).astype(np.float32)
         d = np.where(np.isfinite(d), d, np.inf)
         deltas.append(d)
     deltas = np.stack(deltas, axis=1)
