@@ -99,7 +99,7 @@ def main():
             script, name = "s4b_train_cql.py", "train CQL"
         base = [PY, str(SRC / script)]
         if args.reuse_cache and num == 1:
-            base += ["--reuse-cache"]
+            base += ["--skip-scan"]
         if args.track == "perlab" and num in (5, 6, 7) and args.learner != "mofqi":
             base += ["--learner", args.learner]
         if args.quick and num == 1:
