@@ -73,15 +73,41 @@ def deterioration_events(df):
 
 
 def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
+    """One credit per deterioration event, one penalty per uncovered one.
+
+        +1  draw, event ahead, nothing drawn recently   (this draw claims the event)
+        -1  no draw, event ahead, nothing drawn recently (the event goes uncovered)
+         0  otherwise
+
+    The `not recent_draw` gate on the POSITIVE branch is the important part.
+    Without it, `+1` fired on every hour with an event inside the lookahead
+    window, and since events occur in ~3% of hours but "an event within 12h"
+    covers ~32% of them, a policy that drew every single hour collected +1 on a
+    third of all hours. One event could pay out twelve times. That is a direct,
+    large incentive to draw constantly, and it produced policies ordering ~10
+    times a day against a clinician rate of 2.9.
+
+    With the gate, the first draw in a window claims the event and later draws
+    in the same window earn nothing, so the payout is capped at roughly one per
+    event. Crediting the FIRST draw rather than the last also rewards
+    anticipation rather than a last-minute order, which matches the paper's
+    time-to-treatment framing.
+
+    Both branches now share the same gate, so the objective is symmetric: within
+    a window you are paid once for covering it, or charged once for not. The
+    gate stays Markov because `recent_draw` is derivable from the `delta_*`
+    terms already in the state.
+    """
     stay = _to_numpy(_col(df, "stay_id"))
     event = deterioration_events(df)
     future_event = _future_any_by_stay(event, stay, lookahead)
     any_draw = np.asarray(actions) != 0
     recent_draw = _recent_any_by_stay(any_draw, stay, lookahead)
 
+    claimable = future_event & ~recent_draw
     r = np.zeros(len(stay), dtype=np.float32)
-    r[future_event & any_draw] = 1.0
-    r[future_event & ~any_draw & ~recent_draw] = -1.0
+    r[claimable & any_draw] = 1.0
+    r[claimable & ~any_draw] = -1.0
     return r, future_event.astype(np.int8), event.astype(np.int8)
 
 
@@ -98,10 +124,18 @@ def burden_objective(df, actions):
             for j in range(start, i):
                 if bits[j].sum() == 0:
                     continue
+                # A lab never drawn before carries NO redundancy: infinite
+                # elapsed time, so exp(-delta/Gamma) is 0 and the draw costs
+                # just the base 1.0. Imputing `hour + 1` here (which is right in
+                # the STATE, where Delta stands in for time since admission)
+                # charges a first-ever draw as though the lab had been taken an
+                # hour earlier: a 3-lab panel at hour 0 came to 3.54 instead of
+                # 1.00. That falls hardest on admission labs, biasing every
+                # policy in the family against early testing.
                 delta = np.where(
                     np.isfinite(last_seen),
                     hour[j] - last_seen,
-                    hour[j] + 1.0,
+                    np.inf,
                 )
                 out[j] = 1.0 + float(
                     (bits[j] * np.exp(-delta / cfg.COST_DECAY_GAMMA)).sum()

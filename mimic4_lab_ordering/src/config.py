@@ -123,7 +123,23 @@ JOINT_PANEL_NAMES = [
 ]
 JOINT_REWARD_DIMS = ["detection", "burden"]
 JOINT_DETECTION_LOOKAHEAD_HOURS = 12
-JOINT_LAMBDAS = [0.1, 0.3, 0.5, 0.7, 0.9]
+# Preference weights on the simplex: (w_detection, w_burden), summing to 1.
+#
+# Replaces a bare lambda multiplying burden, for two reasons measured on this
+# data. First, lambda = w_burden / w_detection, so a sweep of lambda in
+# [0.1, 0.9] only reaches w_burden in [0.09, 0.47]: it never crosses the
+# balanced point and never asks for a burden-dominant policy, leaving half the
+# frontier unexplored. Second, with w_detection pinned at 1 the reward
+# magnitude grows with lambda, while CQL_ALPHA is a fixed weight against the TD
+# loss, so conservatism silently weakens as lambda rises. On the simplex |r|
+# stays roughly constant and alpha means the same thing at every point.
+JOINT_PREFERENCES = [(0.9, 0.1), (0.7, 0.3), (0.5, 0.5), (0.3, 0.7), (0.1, 0.9)]
+
+# A policy only joins the frontier if it beats both trivial baselines on its own
+# weighted objective. Without this a diverged run is indistinguishable from a
+# preference that genuinely wants more testing.
+VALIDITY_BASELINES = ("never_draw", "always_draw")
+VALIDITY_MARGIN = 0.0     # required improvement over the best trivial baseline
 
 # --------------------------------------------------------- forecaster (Sec. 2.1) ----
 # The paper uses a multi-output Gaussian process. It feeds exactly two things:
@@ -159,7 +175,7 @@ BUDGET_HOURS = 24            # force one order per 24h window with no recommenda
 REWARD_WEIGHTS = {"r_sofa": 1.0, "r_treat": 1.0, "r_info": 1.0, "neg_r_cost": 1.0}
 
 CQL_ALPHA = 1.0            # weight on the conservative penalty
-CQL_STEPS = 20_000         # gradient steps
+CQL_STEPS = 40_000         # gradient steps
 CQL_LR = 1e-4
 CQL_BATCH = 1024
 CQL_HIDDEN = 128
@@ -168,7 +184,18 @@ CQL_EVAL_EVERY = 2_000
 
 # ------------------------------------------------- off-policy evaluation ----
 # Tier 1 replicates the paper: per-step WIS with an undiscounted horizon.
+# Paper-faithful setting for the PER-LAB replication in s5_evaluate_ope.py only:
+# "The discount factor was set to gamma_WIS = 1.0, so all time steps contribute
+# equally to the value of a trajectory" (Sec. 3.1). Do not use it anywhere the
+# clinician's discounted factual return appears in the same table.
 WIS_GAMMA = 1.0
+
+# The joint Pareto track discounts everything at GAMMA. Mixing a discounted
+# clinician value with an undiscounted policy estimate introduces a fixed scale
+# factor of (stay length)/(1/(1-GAMMA)) -- about 15x on this cohort -- which
+# reads as the policies beating the clinician 15-fold on both objectives when
+# their per-step values are in fact comparable.
+JOINT_WIS_GAMMA = GAMMA
 RANDOM_BASELINE_PS = [0.01, None, 0.5]   # None -> empirical order rate p_emp
 RANDOM_BASELINE_TRIALS = 10
 

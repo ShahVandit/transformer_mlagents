@@ -248,6 +248,144 @@ def test_batch_slicing():
     check("slicing matches an isin filter", np.array_equal(np.sort(a), np.sort(b)))
 
 
+def test_joint_panels():
+    print("\njoint panel encoding (Pareto track)")
+    import panels
+    import objectives
+    import pandas as pd
+
+    for i in range(16):
+        bits = np.array([int(c) for c in format(i, "04b")], dtype=np.int8)
+        a = int(panels.encode_bits(bits[None, :])[0])
+        if bits.sum() > 0 and a == 0:
+            check(f"combination {format(i,'04b')} is not collapsed to `none`", False)
+            break
+    else:
+        check("no real draw is ever encoded as the empty panel", True)
+
+    check("the empty combination maps to `none`",
+          int(panels.encode_bits(np.zeros((1, 4), np.int8))[0]) == 0)
+    check("creatinine alone maps to the panel it rides on",
+          panels.PANEL_BITS[int(panels.encode_bits(
+              np.array([[1, 0, 0, 0]], np.int8))[0])] == "1100")
+
+    # every retained panel round-trips
+    ok = all(int(panels.encode_bits(panels.PANEL_ARRAY[i][None, :])[0]) == i
+             for i in range(len(panels.PANEL_BITS)))
+    check("every retained panel encodes to its own id", ok)
+
+    # rare combinations land within Hamming distance 2
+    worst = 0
+    for i in range(16):
+        bits = np.array([int(c) for c in format(i, "04b")], dtype=np.int8)
+        a = int(panels.encode_bits(bits[None, :])[0])
+        worst = max(worst, int(np.abs(panels.PANEL_ARRAY[a] - bits).sum()))
+    check("every combination maps within Hamming distance 2", worst <= 2, str(worst))
+
+    # burden: zero for no draw, larger for a repeat than for a stale draw.
+    # Deltas are derived from stay_id/hour, not read from delta_* columns.
+    n = 30
+    d1 = {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}
+    a1 = np.zeros(n, dtype=int)
+    a1[0] = 4          # creatinine+bun, first ever
+    a1[1] = 4          # repeated one hour later
+    a1[25] = 4         # repeated a day later
+    bb = objectives.burden_objective(d1, a1)
+    check("burden is 0 for the empty panel", float(bb[5]) == 0.0)
+    check("burden penalises a repeat draw more than a stale one", bb[1] > bb[25])
+    b = np.array([bb[1], bb[25]])
+    check("burden is at least 1 whenever blood is drawn", bool((b >= 1.0).all()))
+
+    # A first-ever draw carries no redundancy at any hour. Imputing `hour + 1`
+    # for a never-drawn lab charged a 3-lab panel at hour 0 as 3.54 instead of
+    # 1.00, which falls hardest on admission labs.
+    for h0 in (0, 2, 6, 24):
+        n = h0 + 2
+        d2 = {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}
+        a2 = np.zeros(n, dtype=int)
+        a2[h0] = 1                                   # creatinine+bun+wbc
+        got = float(objectives.burden_objective(d2, a2)[h0])
+        if abs(got - 1.0) > 1e-6:
+            check(f"a first-ever draw at hour {h0} costs exactly the base 1.0",
+                  False, f"got {got:.4f}")
+            break
+    else:
+        check("a first-ever draw costs exactly the base 1.0 at any hour", True)
+
+    # redundancy decays with elapsed time between repeats
+    n = 12
+    d3 = {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}
+    a3 = np.zeros(n, dtype=int)
+    a3[5] = 1
+    a3[6] = 1
+    a3[10] = 1
+    b3 = objectives.burden_objective(d3, a3)
+    check("redundancy decays as the gap between repeats grows",
+          b3[5] < b3[10] < b3[6])
+
+    # the redundancy clock does not leak across stays
+    d4 = {"stay_id": np.array([0, 0, 1, 1]), "hour": np.array([0.0, 1.0, 0.0, 1.0])}
+    a4 = np.array([1, 0, 1, 0])
+    b4 = objectives.burden_objective(d4, a4)
+    check("a new stay starts with a clean redundancy clock",
+          abs(float(b4[2]) - 1.0) < 1e-6)
+
+    # detection: +1 only on a draw before an event, -1 only on an uncovered miss
+    n = 30
+    d = pd.DataFrame({
+        "stay_id": np.zeros(n, dtype=int),
+        "sofa_delta": np.zeros(n),
+        **{f"onset_{k}": np.zeros(n, dtype=int) for k in
+           __import__("itemids").INTERVENTION_KINDS},
+    })
+    d.loc[20, "onset_vasopressor"] = 1          # event at hour 20
+    acts = np.zeros(n, dtype=int)
+    acts[15] = 1                                 # a draw 5h before the event
+    r, fut, ev = objectives.detection_objective(d, acts, lookahead=12)
+    check("a draw inside the window before an event scores +1", r[15] == 1.0)
+    check("the event hour itself is flagged", ev[20] == 1)
+    check("hours with no upcoming event score 0", r[0] == 0.0)
+    # hour 10: the event at 20 is inside the (10, 22] window, and the draw at 15
+    # has not happened yet, so nothing covers it
+    check("an uncovered hour before an event is penalised", r[10] == -1.0)
+    # hour 19: also inside the window, but the draw at 15 is recent, so no penalty
+    check("a recent draw suppresses the miss penalty", r[19] == 0.0)
+    check("an hour covered by a recent draw is not penalised", r[16] == 0.0)
+
+    # One credit per event. Before the gate on the positive branch, +1 fired on
+    # EVERY hour with an event in the lookahead window, so a policy drawing every
+    # hour collected +1 on ~32% of all hours and one event could pay out twelve
+    # times. That is what drove policies to ~10 draws/day.
+    acts2 = np.zeros(n, dtype=int)
+    acts2[15] = 1
+    acts2[16] = 1                       # second draw inside the same window
+    acts2[17] = 1
+    r2, _, _ = objectives.detection_objective(d, acts2, lookahead=12)
+    check("the first draw in a window claims the event", r2[15] == 1.0)
+    check("a second draw in the same window earns nothing", r2[16] == 0.0)
+    check("a third draw in the same window earns nothing", r2[17] == 0.0)
+
+    # The credit is capped at one per event, but the PENALTY accrues for every
+    # hour spent uncovered while an event is approaching. That asymmetry is
+    # deliberate: being blind for seven hours before a deterioration is worse
+    # than being blind for one. Its consequence is that detection alone is
+    # maximised by always drawing, which is exactly why burden has to be the
+    # counterweight. Before the cap, always-draw also accumulated unbounded
+    # POSITIVE credit, so detection rose without limit as the policy drew more.
+    all_draw = np.ones(n, dtype=int)
+    r_all, _, _ = objectives.detection_objective(d, all_draw, lookahead=12)
+    r_one, _, _ = objectives.detection_objective(d, acts, lookahead=12)
+    r_none, _, _ = objectives.detection_objective(d, np.zeros(n, dtype=int),
+                                                  lookahead=12)
+    check("always-draw maximises detection (burden is the counterweight)",
+          float(r_all.sum()) >= float(r_one.sum()) >= float(r_none.sum()),
+          f"all={r_all.sum():.1f} one={r_one.sum():.1f} none={r_none.sum():.1f}")
+    check("total positive credit never exceeds the number of events",
+          float(r_all[r_all > 0].sum()) <= float(np.asarray(ev).sum()) + 1e-6)
+    check("an uncovered stretch is penalised once per hour of exposure",
+          float(r_none.sum()) < -1.0)
+
+
 def test_sofa():
     print("\nSOFA")
     z = np.zeros(1)
@@ -364,6 +502,7 @@ def main():
     test_forecaster_no_leakage()
     test_state_and_delta()
     test_batch_slicing()
+    test_joint_panels()
     test_sofa()
     test_ope_helpers()
     test_run_filter()

@@ -81,6 +81,26 @@ python metabonet_offline_rl/run_d3rlpy_pipeline.py \
   --device cuda:0
 ```
 
+The d3rlpy path also supports the ICU reference reward definitions:
+
+```bash
+python metabonet_offline_rl/run_d3rlpy_pipeline.py \
+  --stage train \
+  --parquet /scratch/metabonet_public.parquet \
+  --reward-variant piecewise \
+  --device cuda:0
+```
+
+Available variants are `current`, `piecewise`, `tir_binary`, `asymmetric`, and
+`smooth`. Run `--stage data` once after pulling the reward-variant code so the
+cached arrays contain all reward definitions.
+
+The FQE stage additionally reports the factual logged-policy return, FQE, WIS,
+weighted doubly robust estimates, patient-level bootstrap intervals, behavior
+support, and held-out FQE Bellman residuals in `ope_policy_comparison.csv`.
+Reward-variant runs write separate files such as
+`ope_policy_comparison_piecewise.csv`, so ablation results remain comparable.
+
 ## Outputs
 
 Outputs are written to `metabonet_offline_rl/results/`.
