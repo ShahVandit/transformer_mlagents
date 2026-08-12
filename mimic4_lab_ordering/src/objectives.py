@@ -21,6 +21,12 @@ def _to_numpy(x):
     return x.to_numpy() if hasattr(x, "to_numpy") else np.asarray(x)
 
 
+def _has_col(obj, name):
+    if isinstance(obj, dict):
+        return name in obj
+    return hasattr(obj, "columns") and name in obj.columns
+
+
 def _future_any_by_stay(values, stay_ids, lookahead):
     """For row t, true if any event occurs in (t, t + lookahead]."""
     out = np.zeros(len(values), dtype=bool)
@@ -58,7 +64,7 @@ def _recent_any_by_stay(values, stay_ids, lookback):
 
 
 def deterioration_events(df):
-    if "event" in df if isinstance(df, dict) else getattr(df, "columns", []):
+    if _has_col(df, "event"):
         return _to_numpy(_col(df, "event")).astype(bool)
     onset_cols = [f"onset_{k}" for k in ids.INTERVENTION_KINDS]
     onset = np.column_stack([_to_numpy(_col(df, c)) for c in onset_cols]).sum(axis=1) > 0
