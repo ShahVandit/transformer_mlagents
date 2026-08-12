@@ -144,24 +144,122 @@ def burden_objective(df, actions):
     return out
 
 
-def normalize_rewards(train_reward, *splits):
-    """Scale objectives without centering, preserving zero as neutral.
+def assert_rewards_current(split, norm_meta=None, name="split", tol=1e-3):
+    """Fail loudly if a cached npz predates the current objectives code.
 
-    Mean-centering sparse event rewards makes every ordinary zero-reward hour
-    nonzero. Summing those offsets over stays of different lengths obscures the
-    actual event score and creates large, hard-to-interpret episode returns.
-    Scale-only normalization keeps ``+1`` and ``-1`` symmetric and leaves a
-    neutral transition at exactly zero.
+    Both objectives are recomputed under the split's own LOGGED actions and
+    compared against the stored `reward` array. They must agree exactly, because
+    that is precisely how stage 3b produced them.
+
+    This guard exists because the failure it catches is silent and expensive.
+    Editing `detection_objective` or `burden_objective` without re-running stage
+    3b leaves the training-derived objective ranges in joint_meta.json describing
+    a DIFFERENT reward function than the one `scalar_policy_reward` recomputes at
+    evaluation time.
     """
+    stored = np.asarray(_col(split, "reward"), dtype=np.float64)
+    acts = _to_numpy(_col(split, "action"))
+    fresh = np.stack([detection_objective(split, acts)[0],
+                      burden_objective(split, acts)], axis=1).astype(np.float64)
+    if stored.shape != fresh.shape:
+        raise SystemExit(
+            f"\n{name}: stored reward has shape {stored.shape} but the current "
+            f"objectives produce {fresh.shape}.\nRe-run stage 3b:\n"
+            f"    python src/s3b_build_joint_mdp.py\n")
+
+    worst = np.abs(stored - fresh).max(axis=0)
+    if (worst > tol).any():
+        names = cfg.JOINT_REWARD_DIMS
+        detail = "  ".join(f"{n}: max|diff|={w:.4g}" for n, w in zip(names, worst))
+        raise SystemExit(
+            f"\n{name}: the cached reward does NOT match the current objectives.\n"
+            f"  {detail}\n\n"
+            f"data/rl/joint_*.npz was built by an older objectives.py, so the\n"
+            f"normalization in joint_meta.json describes a different reward.\n"
+            f"Every downstream number is measured against the wrong zero point.\n\n"
+            f"Re-run stage 3b:\n    python src/s3b_build_joint_mdp.py\n")
+
+    if norm_meta is not None:
+        mu = np.asarray(norm_meta["reward_mean"], dtype=np.float64)
+        sd = np.asarray(norm_meta["reward_sd"], dtype=np.float64)
+        sd = np.where(sd < 1e-6, 1.0, sd)
+        if _has_col(split, "reward_norm"):
+            got = np.asarray(_col(split, "reward_norm"), dtype=np.float64)
+            want = (stored - mu) / sd
+            if np.abs(got - want).max() > tol:
+                raise SystemExit(
+                    f"\n{name}: reward_norm does not match "
+                    f"reward divided by the stored objective range.\n"
+                    f"Re-run stage 3b:\n    python src/s3b_build_joint_mdp.py\n")
+    return True
+
+
+def clinician_reward_sanity(split, norm_meta, name="split", tol=2.0):
+    """Return the clinician's mean scaled per-stay objective values."""
+    stay = _to_numpy(_col(split, "stay_id"))
+    stored = np.asarray(_col(split, "reward"), dtype=np.float64)
+    mu = np.asarray(norm_meta["reward_mean"], dtype=np.float64)
+    sd = np.asarray(norm_meta["reward_sd"], dtype=np.float64)
+    sd = np.where(sd < 1e-6, 1.0, sd)
+    z = (stored - mu) / sd
+
+    out = []
+    for d in range(z.shape[1]):
+        s = pd.Series(z[:, d]).groupby(stay).sum()
+        out.append(float(s.mean()))
+    return out
+
+
+def _mean_stay_returns(values, stay_ids):
+    values = np.asarray(values, dtype=np.float64)
+    stay_ids = np.asarray(stay_ids)
+    _, inverse = np.unique(stay_ids, return_inverse=True)
+    totals = np.zeros((inverse.max() + 1, values.shape[1]), dtype=np.float64)
+    np.add.at(totals, inverse, values)
+    return totals.mean(axis=0)
+
+
+def normalize_rewards(train_split, *splits):
+    """Scale each objective by its training-set per-stay achievable range.
+
+    The anchors are the two extreme constant policies: never draw and always
+    draw. This makes a simplex weight describe a fraction of each objective's
+    achievable per-stay span instead of mixing objectives with very different
+    accumulation rates. Zero remains neutral and no validation/test outcomes
+    are used to fit the scale.
+    """
+    train_reward = np.asarray(_col(train_split, "reward"), dtype=np.float32)
+    stay = _to_numpy(_col(train_split, "stay_id"))
+    n = len(stay)
+    never = np.zeros(n, dtype=np.int64)
+    always = np.ones(n, dtype=np.int64)
+
+    never_reward = np.stack([
+        detection_objective(train_split, never)[0],
+        burden_objective(train_split, never),
+    ], axis=1)
+    always_reward = np.stack([
+        detection_objective(train_split, always)[0],
+        burden_objective(train_split, always),
+    ], axis=1)
+    never_return = _mean_stay_returns(never_reward, stay)
+    always_return = _mean_stay_returns(always_reward, stay)
+    objective_range = np.abs(always_return - never_return).astype(np.float32)
+    objective_range[objective_range < 1e-6] = 1.0
+
+    out = [(np.asarray(x, dtype=np.float32) / objective_range).astype(np.float32)
+           for x in splits]
     raw_mu = train_reward.mean(axis=0).astype(np.float32)
-    sd = train_reward.std(axis=0).astype(np.float32)
-    sd[sd < 1e-6] = 1.0
-    out = [(x / sd).astype(np.float32) for x in splits]
     return out, {
         "reward_mean": np.zeros_like(raw_mu).tolist(),
-        "reward_sd": sd.tolist(),
+        # Kept for compatibility with downstream readers; this is now a range,
+        # not a standard deviation.
+        "reward_sd": objective_range.tolist(),
+        "reward_scale": objective_range.tolist(),
         "raw_reward_mean": raw_mu.tolist(),
-        "normalization": "scale_only",
+        "never_draw_return": never_return.tolist(),
+        "always_draw_return": always_return.tolist(),
+        "normalization": "per_stay_extreme_range",
     }
 
 

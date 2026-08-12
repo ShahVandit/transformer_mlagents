@@ -69,27 +69,27 @@ def main():
     assert totals["always"][1] > totals["timely_repeated"][1]
     assert totals["always"][2] < totals["timely_once"][2]
 
-    raw = np.array([[1.0, 1.0], [-1.0, 0.0], [0.0, 0.0]], dtype=np.float32)
-    normed, meta = objectives.normalize_rewards(raw, raw)
-    assert np.array_equal(normed[0][2], np.zeros(2, dtype=np.float32))
-    assert abs(float(normed[0][0, 0])) == abs(float(normed[0][1, 0]))
-    assert meta["normalization"] == "scale_only"
-
     # The epoch callback recomputes rewards under policy actions. When those
     # actions equal the logged clinician actions, both paths must be identical.
     clinician_actions = cases["timely_once"]
     clinician_det, clinician_bur, _ = score(frame, clinician_actions)
     clinician_raw = np.stack([clinician_det, clinician_bur], axis=1)
-    clinician_normed, clinician_meta = objectives.normalize_rewards(
-        clinician_raw, clinician_raw)
     split = {
         "stay_id": frame["stay_id"].to_numpy(),
         "hour": frame["hour"].to_numpy(),
         "event": objectives.deterioration_events(frame).astype(np.int8),
         "action": clinician_actions,
         "reward": clinician_raw,
-        "reward_norm": clinician_normed[0],
     }
+    clinician_normed, clinician_meta = objectives.normalize_rewards(
+        split, clinician_raw)
+    split["reward_norm"] = clinician_normed[0]
+    assert np.array_equal(split["reward_norm"][0], np.zeros(2, dtype=np.float32))
+    assert clinician_meta["normalization"] == "per_stay_extreme_range"
+    assert np.allclose(
+        np.asarray(clinician_meta["reward_scale"]),
+        np.abs(np.asarray(clinician_meta["always_draw_return"]) -
+               np.asarray(clinician_meta["never_draw_return"])))
     for pref in ((0.9, 0.1), (0.5, 0.5), (0.1, 0.9)):
         stored = train_family.scalar_reward(split, pref)
         replayed = train_family.scalar_policy_reward(

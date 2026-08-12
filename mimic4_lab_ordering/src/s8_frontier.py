@@ -28,6 +28,7 @@ from d3rlpy.constants import ActionSpace
 from d3rlpy.dataset import MDPDataset
 from d3rlpy.ope import DiscreteFQE, FQEConfig
 from d3rlpy.preprocessing import StandardObservationScaler
+import objectives
 import s5_evaluate_ope as ope
 import s4c_train_family as tf
 from s4c_train_family import clean_tag, lam_slug, pref_slug
@@ -499,6 +500,10 @@ def main():
     ope.N_ACTIONS = N_ACTIONS
     ope.D = len(cfg.JOINT_REWARD_DIMS)
     ope.DIM_NAMES = list(cfg.JOINT_REWARD_DIMS)
+
+    for nm, sp in (("train", train), ("val", val), ("test", test)):
+        objectives.assert_rewards_current(sp, norm_meta, name=f"joint_{nm}.npz")
+    print("reward cache matches the current objectives")
 
     print(f"joint frontier: {len(test['action']):,} test transitions, "
           f"{len(np.unique(test['stay_id'])):,} test stays")

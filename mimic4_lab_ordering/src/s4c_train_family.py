@@ -58,8 +58,8 @@ def validate_joint_artifacts(meta, *splits):
     if meta.get("panel_bits") != cfg.JOINT_PANEL_BITS:
         raise SystemExit("joint MDP uses the old action mapping; rerun stage 3b")
     norm = meta.get("reward_normalization", {})
-    if norm.get("normalization") != "scale_only":
-        raise SystemExit("joint MDP uses the old centered rewards; rerun stage 3b")
+    if norm.get("normalization") != "per_stay_extreme_range":
+        raise SystemExit("joint MDP uses the old reward scaling; rerun stage 3b")
     for split in splits:
         if len(split["action"]) and int(np.max(split["action"])) >= N_ACTIONS:
             raise SystemExit("joint MDP contains stale panel actions; rerun stage 3b")
@@ -292,6 +292,15 @@ def main():
         prefs = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
     else:
         prefs = [tuple(x) for x in cfg.JOINT_PREFERENCES]
+
+    # Fail now, not after 40k steps, if the cached MDP predates objectives.py.
+    for nm, sp in (("train", train), ("val", val)):
+        objectives.assert_rewards_current(sp, norm_meta, name=f"joint_{nm}.npz")
+    print("reward cache matches the current objectives")
+    for nm, sp in (("train", train), ("val", val)):
+        z = objectives.clinician_reward_sanity(sp, norm_meta, name=f"joint_{nm}.npz")
+        print(f"  {nm}: clinician scaled per-stay returns "
+              f"det={z[0]:+.3f} bur={z[1]:+.3f}")
 
     print(f"joint d3rlpy CQL family: train n={len(train['action']):,}, "
           f"state dim={train['state'].shape[1]}, actions={N_ACTIONS}")

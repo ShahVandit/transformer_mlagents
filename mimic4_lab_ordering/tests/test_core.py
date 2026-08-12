@@ -315,6 +315,7 @@ def test_joint_panels():
     n = 30
     d = pd.DataFrame({
         "stay_id": np.zeros(n, dtype=int),
+        "hour": np.arange(n, dtype=float),
         "sofa_delta": np.zeros(n),
         **{f"onset_{k}": np.zeros(n, dtype=int) for k in
            __import__("itemids").INTERVENTION_KINDS},
@@ -372,16 +373,22 @@ def test_joint_panels():
     check("an event at the first hour is not an impossible penalty",
           float(r_head.sum()) == 0.0)
 
-    # Scale-only normalization leaves neutral transitions at zero and preserves
-    # symmetry between one covered and one missed event.
-    train_r = np.array([[1.0, 1.0], [-1.0, 0.0], [0.0, 0.0]], dtype=np.float32)
-    normed, norm_meta = objectives.normalize_rewards(train_r, train_r)
+    # Per-stay range normalization leaves neutral transitions at zero and
+    # preserves symmetry between one covered and one missed event.
+    train_r = np.stack([r_one, objectives.burden_objective(d, acts)], axis=1)
+    train_split = {
+        "stay_id": d["stay_id"].to_numpy(),
+        "hour": d["hour"].to_numpy(),
+        "event": ev,
+        "reward": train_r,
+    }
+    normed, norm_meta = objectives.normalize_rewards(train_split, train_r)
     check("normalization keeps neutral rewards at exactly zero",
           bool(np.array_equal(normed[0][2], np.zeros(2, dtype=np.float32))))
     check("normalization preserves symmetric detection magnitude",
           abs(float(normed[0][0, 0])) == abs(float(normed[0][1, 0])))
-    check("normalization records scale-only semantics",
-          norm_meta.get("normalization") == "scale_only")
+    check("normalization records per-stay range semantics",
+          norm_meta.get("normalization") == "per_stay_extreme_range")
 
 
 def test_sofa():

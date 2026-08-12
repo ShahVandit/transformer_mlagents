@@ -70,7 +70,7 @@ def main():
               f"future_event_rate={d['future_event'].mean():.4f}")
 
     normed, norm_meta = objectives.normalize_rewards(
-        built["train"]["reward"],
+        built["train"],
         built["train"]["reward"],
         built["val"]["reward"],
         built["test"]["reward"],
