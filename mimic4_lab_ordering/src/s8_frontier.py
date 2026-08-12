@@ -71,8 +71,8 @@ def event_coverage(split, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS)
     return objectives.event_coverage(split, actions, lookback)
 
 
-def non_dominated(df, det_col="wdr_detection", bur_col="wdr_burden"):
-    vals = df[[det_col, bur_col]].to_numpy(dtype=float)
+def non_dominated(df, utility_col="wdr_utility", bur_col="wdr_burden"):
+    vals = df[[utility_col, bur_col]].to_numpy(dtype=float)
     keep = np.ones(len(vals), dtype=bool)
     for i, (det_i, bur_i) in enumerate(vals):
         for j, (det_j, bur_j) in enumerate(vals):
@@ -110,6 +110,9 @@ def validity_from_sidecar(pref, tag, val, norm_meta, cache):
                  f"joint_cql_{pref_slug(pref)}{clean_tag(tag)}.json")
     if meta_path.exists():
         payload = json.loads(meta_path.read_text())
+        if payload.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
+            raise SystemExit(
+                f"{meta_path} was trained on the old reward; rerun stage 4c")
         verdict = payload.get("beats_trivial")
         if verdict is not None:
             return bool(verdict), "stage4c_val"
@@ -170,10 +173,10 @@ def fqe_calibration_check(train, test, beh, pi_b_test, trajs, subj_of_traj,
 
 
 def hypervolume_2d(points, ref):
-    """Dominated area for (maximize detection, minimize burden).
+    """Dominated area for (maximize utility, minimize burden).
 
     Burden is negated so both axes maximize, then the standard 2-D sweep
-    applies. `ref` is (detection_ref, burden_ref) in the original orientation
+    applies. `ref` is (utility_ref, burden_ref) in the original orientation
     and must be worse than every point on both axes.
     """
     pts = [(d, -b) for d, b in points]
@@ -261,8 +264,8 @@ def train_fqe(train_dataset, policy, n_steps, device="cpu", gamma=cfg.GAMMA):
 
 def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_traj,
                     epsilon, reward_dim, device="cpu", ope_mode="all"):
-    det_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
-    pi_e_test = epsilon_greedy_probs(det_actions, epsilon)
+    policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
+    pi_e_test = epsilon_greedy_probs(policy_actions, epsilon)
 
     logw = ope.per_step_log_weights(test, trajs, pi_e_test, pi_b_test)
     idx_of = {id(tr): k for k, tr in enumerate(trajs)}
@@ -270,9 +273,9 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
     row = {
         "policy": name,
         "lambda": lambda_from_name(name),
-        "draws_per_patient_day": float((det_actions != 0).sum() / patient_days(test)),
-        "draw_rate": float((det_actions != 0).mean()),
-        "event_coverage_replay": event_coverage(test, det_actions),
+        "draws_per_patient_day": float((policy_actions != 0).sum() / patient_days(test)),
+        "draw_rate": float((policy_actions != 0).mean()),
+        "event_coverage_replay": event_coverage(test, policy_actions),
     }
     ess = ope.effective_sample_size(trajs, logw)
     row["ess_final"] = ess["ess_final"]
@@ -337,20 +340,20 @@ def maybe_plot(df):
         print(f"matplotlib unavailable; skipping plots ({exc})")
         return
 
-    if "wdr_detection" in df.columns and "wdr_burden" in df.columns:
+    if "wdr_utility" in df.columns and "wdr_burden" in df.columns:
         prefix = "wdr"
         label = "WDR"
-    elif "wis_detection" in df.columns and "wis_burden" in df.columns:
+    elif "wis_utility" in df.columns and "wis_burden" in df.columns:
         prefix = "wis"
         label = "WIS"
     else:
         print("WIS/WDR columns unavailable; skipping OPE plot")
         return
 
-    det_col = f"{prefix}_detection"
+    utility_col = f"{prefix}_utility"
     bur_col = f"{prefix}_burden"
-    det_lo_col = f"{det_col}_lo"
-    det_hi_col = f"{det_col}_hi"
+    utility_lo_col = f"{utility_col}_lo"
+    utility_hi_col = f"{utility_col}_hi"
     bur_lo_col = f"{bur_col}_lo"
     bur_hi_col = f"{bur_col}_hi"
 
@@ -363,15 +366,15 @@ def maybe_plot(df):
     if all(c in pol.columns for c in [bur_lo_col, bur_hi_col]):
         xerr = [pol[bur_col] - pol[bur_lo_col],
                 pol[bur_hi_col] - pol[bur_col]]
-    if all(c in pol.columns for c in [det_lo_col, det_hi_col]):
-        yerr = [pol[det_col] - pol[det_lo_col],
-                pol[det_hi_col] - pol[det_col]]
-    ax.errorbar(pol[bur_col], pol[det_col], xerr=xerr, yerr=yerr,
+    if all(c in pol.columns for c in [utility_lo_col, utility_hi_col]):
+        yerr = [pol[utility_col] - pol[utility_lo_col],
+                pol[utility_hi_col] - pol[utility_col]]
+    ax.errorbar(pol[bur_col], pol[utility_col], xerr=xerr, yerr=yerr,
                 fmt="o", label=f"CQL policies ({label})")
-    ax.scatter([clin[bur_col]], [clin[det_col]],
+    ax.scatter([clin[bur_col]], [clin[utility_col]],
                marker="x", s=80, label="clinician")
     ax.set_xlabel("Burden return, lower is better")
-    ax.set_ylabel("Detection return, higher is better")
+    ax.set_ylabel("Information utility return, higher is better")
     ax.legend()
     fig.tight_layout()
     fig.savefig(cfg.REPORTS_DIR / "joint_frontier_ope.png", dpi=160)
@@ -390,28 +393,28 @@ def maybe_plot(df):
 
 
 def write_report(df, metrics=None):
-    det_col = "wdr_detection" if "wdr_detection" in df.columns else "wis_detection"
+    utility_col = "wdr_utility" if "wdr_utility" in df.columns else "wis_utility"
     bur_col = "wdr_burden" if "wdr_burden" in df.columns else "wis_burden"
-    label = "WDR" if det_col.startswith("wdr") else "WIS"
-    cols = ["policy", "w_detection", "w_burden", "draws_per_patient_day",
-            "event_coverage_replay", det_col, bur_col, "ess_final",
+    label = "WDR" if utility_col.startswith("wdr") else "WIS"
+    cols = ["policy", "w_utility", "w_burden", "draws_per_patient_day",
+            "event_coverage_replay", utility_col, bur_col, "ess_final",
             "beats_trivial", "non_dominated"]
     cols = [c for c in cols if c in df.columns]
     L = ["# Joint-panel Pareto frontier\n\n",
-         "Detection is better higher. Burden is better lower. "
-         "Non-dominated means no other learned policy has both higher detection "
+         "Information utility is better higher. Burden is better lower. "
+         "Non-dominated means no other learned policy has both higher utility "
          f"and lower burden under {label} point estimates.\n\n",
-         f"| policy | w_det/w_bur | draws/day | replay coverage | {label} detection "
+         f"| policy | w_utility/w_bur | draws/day | replay coverage | {label} utility "
          f"| {label} burden | ESS final | valid | non-dominated |\n",
          "|---|---|---:|---:|---:|---:|---:|---|---|\n"]
     for _, r in df[cols].iterrows():
-        w = ("" if pd.isna(r.get("w_detection", np.nan))
-             else f"{r['w_detection']:.1f}/{r['w_burden']:.1f}")
+        w = ("" if pd.isna(r.get("w_utility", np.nan))
+             else f"{r['w_utility']:.1f}/{r['w_burden']:.1f}")
         nd = "yes" if bool(r.get("non_dominated")) else ""
         bt = r.get("beats_trivial")
         valid = "" if bt is None or pd.isna(bt) else ("yes" if bt else "**NO**")
         L.append(f"| {r['policy']} | {w} | {r['draws_per_patient_day']:.3f} | "
-                 f"{r['event_coverage_replay']:.3f} | {r[det_col]:+.4f} | "
+                 f"{r['event_coverage_replay']:.3f} | {r[utility_col]:+.4f} | "
                  f"{r[bur_col]:+.4f} | {r['ess_final']:.1f} | {valid} | {nd} |\n")
 
     if metrics:
@@ -455,7 +458,7 @@ def write_report(df, metrics=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefs", nargs="+", type=float, default=None,
-                    help="flat list of w_detection w_burden pairs, e.g. 0.9 0.1 0.5 0.5")
+                    help="flat list of w_utility w_burden pairs, e.g. 0.9 0.1 0.5 0.5")
     ap.add_argument("--tag", default="",
                     help="optional model filename suffix used during training")
     ap.add_argument("--ope", choices=["all", "wis"], default="all",
@@ -477,7 +480,7 @@ def main():
     if args.prefs:
         flat = list(args.prefs)
         if len(flat) % 2:
-            raise SystemExit("--prefs needs an even count: w_detection w_burden pairs")
+            raise SystemExit("--prefs needs an even count: w_utility w_burden pairs")
         prefs = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
     else:
         prefs = [tuple(x) for x in cfg.JOINT_PREFERENCES]
@@ -509,10 +512,13 @@ def main():
             for i, d in enumerate(cfg.JOINT_REWARD_DIMS)}
     clin_row = {
         "policy": "clinician",
-        "w_detection": np.nan, "w_burden": np.nan,
+        "w_utility": np.nan, "w_burden": np.nan,
         "draws_per_patient_day": float((test["action"] != 0).sum() / patient_days(test)),
         "draw_rate": float((test["action"] != 0).mean()),
         "event_coverage_replay": event_coverage(test, test["action"]),
+        "utility_per_draw_replay": float(
+            test["reward"][test["action"] != 0, 0].mean()
+            if (test["action"] != 0).any() else 0.0),
         "ess_final": np.nan,
         "beats_trivial": True,
     }
@@ -541,14 +547,18 @@ def main():
         calibration = {}
 
     for pref in prefs:
-        print(f"\n[w_det={pref[0]}, w_bur={pref[1]}]")
+        print(f"\n[w_utility={pref[0]}, w_bur={pref[1]}]")
         policy = load_policy(pref, tag=args.tag, device=args.device)
         row = {"policy": f"cql_{pref_slug(pref)}{clean_tag(args.tag)}",
-               "w_detection": float(pref[0]), "w_burden": float(pref[1])}
-        det_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
-        row["draws_per_patient_day"] = float((det_actions != 0).sum() / patient_days(test))
-        row["draw_rate"] = float((det_actions != 0).mean())
-        row["event_coverage_replay"] = event_coverage(test, det_actions)
+               "w_utility": float(pref[0]), "w_burden": float(pref[1])}
+        policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
+        draw = policy_actions != 0
+        utility = objectives.utility_objective(test, policy_actions)
+        row["draws_per_patient_day"] = float(draw.sum() / patient_days(test))
+        row["draw_rate"] = float(draw.mean())
+        row["utility_per_draw_replay"] = float(
+            utility[draw].mean() if draw.any() else 0.0)
+        row["event_coverage_replay"] = event_coverage(test, policy_actions)
         # The gate is a VALIDATION decision. Recomputing it on test would let the
         # held-out set choose which policies are reportable, which is exactly the
         # selection test data must never make. Stage 4c already evaluated it on
@@ -571,7 +581,7 @@ def main():
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    det_col = "wis_detection" if args.ope == "wis" else "wdr_detection"
+    utility_col = "wis_utility" if args.ope == "wis" else "wdr_utility"
     bur_col = "wis_burden" if args.ope == "wis" else "wdr_burden"
 
     # Only VALID learned policies compete for the frontier. A diverged run that
@@ -581,7 +591,7 @@ def main():
     df["non_dominated"] = False
     if eligible.any():
         df.loc[eligible, "non_dominated"] = non_dominated(
-            df[eligible], det_col=det_col, bur_col=bur_col)
+            df[eligible], utility_col=utility_col, bur_col=bur_col)
     n_rejected = int(((df["policy"] != "clinician") & ~eligible).sum())
     if n_rejected:
         print(f"\n{n_rejected} policy(s) rejected by the validity gate and "
@@ -594,8 +604,8 @@ def main():
     metrics = {"n_valid": int(eligible.sum()), "n_rejected": n_rejected,
                "n_non_dominated": int(len(front))}
     if len(front):
-        pts = list(zip(front[det_col].astype(float), front[bur_col].astype(float)))
-        ref = (float(df[det_col].min()), float(df[bur_col].max()))
+        pts = list(zip(front[utility_col].astype(float), front[bur_col].astype(float)))
+        ref = (float(df[utility_col].min()), float(df[bur_col].max()))
         metrics["hypervolume"] = hypervolume_2d(pts, ref)
         metrics["sparsity"] = sparsity_2d(pts)
         metrics["reference_point"] = list(ref)
@@ -604,7 +614,7 @@ def main():
               f"sparsity={metrics['sparsity']:.4f}")
     metrics["fqe_calibration"] = calibration
     metrics["gamma"] = cfg.GAMMA
-    metrics["estimator_used_for_frontier"] = det_col.split("_")[0]
+    metrics["estimator_used_for_frontier"] = utility_col.split("_")[0]
 
     csv_out = cfg.REPORTS_DIR / "joint_frontier.csv"
     json_out = cfg.REPORTS_DIR / "joint_frontier.json"

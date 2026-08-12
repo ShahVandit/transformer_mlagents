@@ -112,21 +112,23 @@ REWARD_DIMS = ["r_sofa", "r_treat", "r_info", "neg_r_cost"]
 # ----------------------------------------------- joint draw-timing Pareto track ----
 # These objectives can identify WHEN a blood draw is useful, but they do not
 # identify WHICH panel is appropriate for a particular deterioration. Giving
-# all non-empty panels identical detection credit makes the smallest panel
+# all non-empty panels identical utility makes the smallest panel
 # dominate by construction. Keep the action aligned with the supported causal
-# question: no draw versus one blood draw. The four lab histories remain in the
-# state; panel selection is outside this policy.
+# question: no draw versus one blood draw. Utility is the strongest expected
+# information signal among the four target labs. Summing all four would assume
+# every physical draw necessarily obtains all four assays, which is not true in
+# the logged data; exact panel selection is outside this policy.
 JOINT_PANEL_BITS = ["0000", "1111"]
 JOINT_PANEL_NAMES = ["none", "blood_draw"]
-JOINT_REWARD_DIMS = ["detection", "burden"]
+JOINT_REWARD_DIMS = ["utility", "burden"]
 JOINT_DETECTION_LOOKAHEAD_HOURS = 12
-# Preference weights on the simplex: (w_detection, w_burden), summing to 1.
+# Preference weights on the simplex: (w_utility, w_burden), summing to 1.
 #
 # Replaces a bare lambda multiplying burden, for two reasons measured on this
-# data. First, lambda = w_burden / w_detection, so a sweep of lambda in
+# data. First, lambda = w_burden / w_utility, so a sweep of lambda in
 # [0.1, 0.9] only reaches w_burden in [0.09, 0.47]: it never crosses the
 # balanced point and never asks for a burden-dominant policy, leaving half the
-# frontier unexplored. Second, with w_detection pinned at 1 the reward
+# frontier unexplored. Second, with w_utility pinned at 1 the reward
 # magnitude grows with lambda, while CQL_ALPHA is a fixed weight against the TD
 # loss, so conservatism silently weakens as lambda rises. On the simplex |r|
 # stays roughly constant and alpha means the same thing at every point.

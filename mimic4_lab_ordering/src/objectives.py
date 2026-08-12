@@ -72,6 +72,66 @@ def deterioration_events(df):
     return onset | sofa
 
 
+def fit_utility_thresholds(train_df):
+    """Fit the paper's c_l threshold on clinician-ordered TRAIN rows only."""
+    thresholds = {}
+    for lab in panels.LABS:
+        mean = _to_numpy(_col(train_df, f"mean_{lab}")).astype(np.float64)
+        last = _to_numpy(_col(train_df, f"last_{lab}")).astype(np.float64)
+        std = np.maximum(
+            _to_numpy(_col(train_df, f"std_{lab}")).astype(np.float64),
+            cfg.FORECAST_MIN_STD,
+        )
+        observed = np.isfinite(
+            _to_numpy(_col(train_df, f"obs_{lab}")).astype(np.float64))
+        score = np.abs(mean - last) / std
+        eligible = observed & np.isfinite(score)
+        thresholds[lab] = float(np.median(score[eligible])) if eligible.any() else 0.0
+    return thresholds
+
+
+def information_potential(df, thresholds):
+    """Expected information available from one physical blood draw.
+
+    This is Eq. 5 from Cheng et al., computed from decision-time quantities:
+    predictive mean, last known value, and predictive uncertainty. Each lab is
+    thresholded by the median score among clinician-ordered training rows. The
+    binary action does not specify which assays are ordered, so utility is the
+    strongest supported lab signal rather than the sum of four counterfactual
+    assays. Before a lab has any prior value its utility is zero.
+    """
+    values = []
+    for lab in panels.LABS:
+        mean = _to_numpy(_col(df, f"mean_{lab}")).astype(np.float64)
+        last = _to_numpy(_col(df, f"last_{lab}")).astype(np.float64)
+        std = np.maximum(
+            _to_numpy(_col(df, f"std_{lab}")).astype(np.float64),
+            cfg.FORECAST_MIN_STD,
+        )
+        score = np.abs(mean - last) / std
+        score = np.where(np.isfinite(score), score, 0.0)
+        values.append(np.maximum(0.0, score - float(thresholds[lab])))
+    return np.max(np.stack(values, axis=1), axis=1).astype(np.float32)
+
+
+def utility_objective(df, actions, thresholds=None):
+    """Reward a draw in proportion to expected information; no draw gets zero.
+
+    Multiplication by the binary action is only a gate: draw earns +potential
+    and no draw earns 0. In maximization, omitting a useful draw already loses
+    that positive opportunity. Assigning -potential to every no-draw hour would
+    double the action gap and reward constant drawing when the proxy is broadly
+    positive.
+    """
+    if _has_col(df, "utility_potential"):
+        potential = _to_numpy(_col(df, "utility_potential")).astype(np.float32)
+    elif thresholds is not None:
+        potential = information_potential(df, thresholds)
+    else:
+        raise ValueError("utility_potential or utility thresholds are required")
+    return potential * (np.asarray(actions) != 0).astype(np.float32)
+
+
 def deterioration_episode_onsets(df, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
     """Collapse nearby deterioration labels into distinct episode onsets."""
     stay = _to_numpy(_col(df, "stay_id"))
@@ -91,49 +151,6 @@ def deterioration_episode_onsets(df, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOU
                     last_onset = int(onset)
             start = i
     return episode_onset
-
-
-def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
-    """Score every evaluable deterioration exactly once.
-
-    Consecutive positive hours are treated as one deterioration episode. For an
-    episode starting at hour ``t``, a draw in ``[t-lookahead, t)`` covers it. The
-    earliest eligible draw receives ``+1``; if there is no eligible draw,
-    the last decision before the event receives ``-1``. Events in the first
-    hour are excluded because the policy had no earlier decision opportunity.
-
-    This event-level assignment is deliberately symmetric. One event can add
-    exactly ``+1`` or ``-1`` to the trajectory, never one reward per hour in
-    its lookahead window. Additional draws cannot increase detection reward or
-    move credit away from an earlier transition; they are handled only by
-    ``burden_objective``.
-    """
-    stay = _to_numpy(_col(df, "stay_id"))
-    event = deterioration_events(df)
-    episode_onset = deterioration_episode_onsets(df, lookahead)
-    future_event = _future_any_by_stay(episode_onset, stay, lookahead)
-    any_draw = np.asarray(actions) != 0
-    r = np.zeros(len(stay), dtype=np.float32)
-
-    start = 0
-    for i in range(1, len(stay) + 1):
-        if i == len(stay) or stay[i] != stay[start]:
-            local_draw = any_draw[start:i]
-            event_onsets = np.flatnonzero(episode_onset[start:i])
-            for event_idx in event_onsets:
-                if event_idx == 0:
-                    continue
-                lo = max(0, event_idx - lookahead)
-                candidates = np.flatnonzero(local_draw[lo:event_idx])
-                if len(candidates):
-                    # Later actions must never rewrite an earlier transition's
-                    # reward, so the first qualifying draw keeps the credit.
-                    chosen = lo + int(candidates[0])
-                    r[start + chosen] += 1.0
-                else:
-                    r[start + event_idx - 1] -= 1.0
-            start = i
-    return r, future_event.astype(np.int8), event.astype(np.int8)
 
 
 def event_coverage(df, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
@@ -188,14 +205,14 @@ def assert_rewards_current(split, norm_meta=None, name="split", tol=1e-3):
     that is precisely how stage 3b produced them.
 
     This guard exists because the failure it catches is silent and expensive.
-    Editing `detection_objective` or `burden_objective` without re-running stage
+    Editing `utility_objective` or `burden_objective` without re-running stage
     3b leaves the training-derived objective ranges in joint_meta.json describing
     a DIFFERENT reward function than the one `scalar_policy_reward` recomputes at
     evaluation time.
     """
     stored = np.asarray(_col(split, "reward"), dtype=np.float64)
     acts = _to_numpy(_col(split, "action"))
-    fresh = np.stack([detection_objective(split, acts)[0],
+    fresh = np.stack([utility_objective(split, acts),
                       burden_objective(split, acts)], axis=1).astype(np.float64)
     if stored.shape != fresh.shape:
         raise SystemExit(
@@ -258,9 +275,9 @@ def _mean_stay_returns(values, stay_ids):
 def normalize_rewards(train_split, *splits):
     """Scale each objective by its training-set per-stay achievable range.
 
-    The anchors are the two extreme constant policies: never draw and always
-    draw. This makes a simplex weight describe a fraction of each objective's
-    achievable per-stay span instead of mixing objectives with very different
+    The anchors are the two constant policies: never draw and always draw. This
+    makes a simplex weight describe a fraction of each objective's observed
+    constant-policy per-stay span instead of mixing objectives with very different
     accumulation rates. Zero remains neutral and no validation/test outcomes
     are used to fit the scale.
     """
@@ -271,11 +288,11 @@ def normalize_rewards(train_split, *splits):
     always = np.ones(n, dtype=np.int64)
 
     never_reward = np.stack([
-        detection_objective(train_split, never)[0],
+        utility_objective(train_split, never),
         burden_objective(train_split, never),
     ], axis=1)
     always_reward = np.stack([
-        detection_objective(train_split, always)[0],
+        utility_objective(train_split, always),
         burden_objective(train_split, always),
     ], axis=1)
     never_return = _mean_stay_returns(never_reward, stay)

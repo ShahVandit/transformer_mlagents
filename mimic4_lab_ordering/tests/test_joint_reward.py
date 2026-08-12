@@ -1,9 +1,8 @@
-"""Standalone truth-table checks for the joint reward; requires no torch."""
+"""Standalone truth-table checks for joint information utility and burden."""
 import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -12,121 +11,96 @@ import objectives  # noqa: E402
 import s4c_train_family as train_family  # noqa: E402
 
 
-def synthetic_stay(event_hours=(20,), n=30):
-    data = {
+def information_frame():
+    n = 6
+    frame = {
         "stay_id": np.zeros(n, dtype=np.int64),
         "hour": np.arange(n, dtype=np.float32),
-        "sofa_delta": np.zeros(n, dtype=np.float32),
     }
-    for kind in ids.INTERVENTION_KINDS:
-        data[f"onset_{kind}"] = np.zeros(n, dtype=np.int8)
-    frame = pd.DataFrame(data)
-    for hour in event_hours:
-        frame.loc[hour, "onset_vasopressor"] = 1
+    for lab in ids.TARGET_LABS:
+        frame[f"mean_{lab}"] = np.array([0, 1, 4, 4, 1, 0], dtype=np.float32)
+        frame[f"last_{lab}"] = np.zeros(n, dtype=np.float32)
+        frame[f"std_{lab}"] = np.ones(n, dtype=np.float32)
+        frame[f"obs_{lab}"] = np.array(
+            [np.nan, 1, 4, np.nan, 1, np.nan], dtype=np.float32)
     return frame
 
 
-def score(frame, actions, w_det=0.9, w_bur=0.1):
-    detection = objectives.detection_objective(frame, actions, lookahead=12)[0]
-    burden = objectives.burden_objective(frame, actions)
-    return detection, burden, w_det * detection - w_bur * burden
-
-
 def main():
-    frame = synthetic_stay()
-    n = len(frame)
-    cases = {}
-    cases["never"] = np.zeros(n, dtype=np.int64)
-    cases["timely_once"] = np.zeros(n, dtype=np.int64)
-    cases["timely_once"][15] = 1
-    cases["timely_repeated"] = np.zeros(n, dtype=np.int64)
-    cases["timely_repeated"][[15, 16, 17]] = 1
-    cases["late_only"] = np.zeros(n, dtype=np.int64)
-    cases["late_only"][21] = 1
-    cases["always"] = np.ones(n, dtype=np.int64)
+    frame = information_frame()
+    thresholds = objectives.fit_utility_thresholds(frame)
+    assert all(value == 1.0 for value in thresholds.values()), thresholds
 
-    expected_detection = {
-        "never": -1.0,
-        "timely_once": 1.0,
-        "timely_repeated": 1.0,
-        "late_only": -1.0,
-        "always": 1.0,
-    }
+    potential = objectives.information_potential(frame, thresholds)
+    # The binary action uses the strongest supported lab signal. Row 1 is at
+    # the threshold and row 2 carries 3 units, regardless of lab count.
+    assert potential[1] == 0.0
+    assert potential[2] == 3.0
 
-    print("case              detection  burden  scalar(0.9/0.1)")
-    totals = {}
-    for name, actions in cases.items():
-        detection, burden, scalar = score(frame, actions)
-        totals[name] = (float(detection.sum()), float(burden.sum()), float(scalar.sum()))
-        print(f"{name:18s} {totals[name][0]:+9.2f} "
-              f"{totals[name][1]:7.2f} {totals[name][2]:+16.2f}")
-        assert totals[name][0] == expected_detection[name], (name, totals[name])
+    split = {**frame, "utility_potential": potential}
+    never = np.zeros(len(potential), dtype=np.int64)
+    low = never.copy()
+    low[1] = 1
+    high = never.copy()
+    high[2] = 1
+    repeated = never.copy()
+    repeated[[2, 3]] = 1
+    always = np.ones(len(potential), dtype=np.int64)
 
-    assert totals["timely_repeated"][1] > totals["timely_once"][1]
-    assert totals["timely_repeated"][2] < totals["timely_once"][2]
-    assert totals["late_only"][1] > totals["never"][1]
-    assert totals["late_only"][2] < totals["never"][2]
-    assert totals["always"][1] > totals["timely_repeated"][1]
-    assert totals["always"][2] < totals["timely_once"][2]
+    rows = {}
+    for name, actions in {
+        "never": never,
+        "low_information": low,
+        "high_information": high,
+        "repeated": repeated,
+        "always": always,
+    }.items():
+        utility = objectives.utility_objective(split, actions)
+        burden = objectives.burden_objective(split, actions)
+        rows[name] = (float(utility.sum()), float(burden.sum()))
 
-    # A later action cannot retroactively move reward from an earlier action.
-    det_once = score(frame, cases["timely_once"])[0]
-    det_repeated = score(frame, cases["timely_repeated"])[0]
-    assert det_once[15] == det_repeated[15] == 1.0
-    assert det_repeated[16] == det_repeated[17] == 0.0
-    assert objectives.event_coverage(frame, cases["timely_once"], 12) == 1.0
-    assert objectives.event_coverage(frame, cases["never"], 12) == 0.0
+    print("case                 utility  burden")
+    for name, (utility, burden) in rows.items():
+        print(f"{name:20s} {utility:8.2f} {burden:7.2f}")
 
-    # The epoch callback recomputes rewards under policy actions. When those
-    # actions equal the logged clinician actions, both paths must be identical.
-    clinician_actions = cases["timely_once"]
-    clinician_det, clinician_bur, _ = score(frame, clinician_actions)
-    clinician_raw = np.stack([clinician_det, clinician_bur], axis=1)
-    split = {
-        "stay_id": frame["stay_id"].to_numpy(),
-        "hour": frame["hour"].to_numpy(),
-        "event": objectives.deterioration_events(frame).astype(np.int8),
-        "action": clinician_actions,
-        "reward": clinician_raw,
-    }
-    clinician_normed, clinician_meta = objectives.normalize_rewards(
-        split, clinician_raw)
-    split["reward_norm"] = clinician_normed[0]
-    assert np.array_equal(split["reward_norm"][0], np.zeros(2, dtype=np.float32))
-    assert clinician_meta["normalization"] == "per_stay_extreme_range"
+    assert rows["never"] == (0.0, 0.0)
+    assert rows["low_information"][0] == 0.0
+    assert rows["low_information"][1] > 0.0
+    assert rows["high_information"][0] > rows["low_information"][0]
+    assert rows["repeated"][0] > rows["high_information"][0]
+    assert rows["repeated"][1] > rows["high_information"][1]
+    assert rows["always"][1] > rows["repeated"][1]
+
+    # No-draw is zero rather than negative. It still loses the positive utility
+    # that an informative draw would have collected.
+    missed = objectives.utility_objective(split, never)
+    taken = objectives.utility_objective(split, high)
+    assert missed[2] == 0.0
+    assert taken[2] == potential[2] > 0.0
+
+    clinician_actions = high
+    clinician_utility = objectives.utility_objective(split, clinician_actions)
+    clinician_burden = objectives.burden_objective(split, clinician_actions)
+    clinician_raw = np.stack([clinician_utility, clinician_burden], axis=1)
+    split["action"] = clinician_actions
+    split["reward"] = clinician_raw
+    normed, norm_meta = objectives.normalize_rewards(split, clinician_raw)
+    split["reward_norm"] = normed[0]
+
+    assert norm_meta["normalization"] == "per_stay_extreme_range"
     assert np.allclose(
-        np.asarray(clinician_meta["reward_scale"]),
-        np.abs(np.asarray(clinician_meta["always_draw_return"]) -
-               np.asarray(clinician_meta["never_draw_return"])))
+        np.asarray(norm_meta["reward_scale"]),
+        np.abs(np.asarray(norm_meta["always_draw_return"]) -
+               np.asarray(norm_meta["never_draw_return"])),
+    )
     for pref in ((0.9, 0.1), (0.5, 0.5), (0.1, 0.9)):
         stored = train_family.scalar_reward(split, pref)
         replayed = train_family.scalar_policy_reward(
-            split, clinician_actions, pref, clinician_meta)
+            split, clinician_actions, pref, norm_meta)
         assert np.allclose(stored, replayed), pref
 
-    # Clustered positive labels are one deterioration episode, so a persistent
-    # decline cannot pay repeatedly. Onsets beyond the lookahead are separate.
-    clustered = synthetic_stay(event_hours=(20, 21))
-    one_draw = np.zeros(len(clustered), dtype=np.int64)
-    one_draw[15] = 1
-    detection, _, _ = score(clustered, one_draw)
-    assert float(detection.sum()) == 1.0
-
-    clustered = synthetic_stay(event_hours=(20, 22))
-    one_draw = np.zeros(len(clustered), dtype=np.int64)
-    one_draw[15] = 1
-    detection, _, _ = score(clustered, one_draw)
-    assert float(detection.sum()) == 1.0
-
-    separated = synthetic_stay(event_hours=(10, 25))
-    two_draws = np.zeros(len(separated), dtype=np.int64)
-    two_draws[[5, 20]] = 1
-    detection, _, _ = score(separated, two_draws)
-    assert float(detection.sum()) == 2.0
-
-    print("PASS: symmetric event outcomes, no repeated detection credit, "
-          "extra draws only increase burden, neutral reward stays zero, "
-          "policy and clinician arithmetic are identical")
+    print("PASS: information utility is action-gated, low-information draws "
+          "earn no utility, and every draw incurs burden")
 
 
 if __name__ == "__main__":

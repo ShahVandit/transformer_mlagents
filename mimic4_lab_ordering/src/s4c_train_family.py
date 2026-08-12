@@ -3,11 +3,11 @@ Stage 4c: train a family of joint-panel CQL policies with d3rlpy.
 
 Each policy uses the same two raw objectives and the same normalized reward:
 
-    r_w = w_detection * z_detection - w_burden * z_burden
+    r_w = w_utility * z_utility - w_burden * z_burden
 
 Output:
-  models/joint_cql_w{w_det}_{w_bur}.d3
-  models/joint_cql_w{w_det}_{w_bur}.json
+  models/joint_cql_w{w_utility}_{w_bur}.d3
+  models/joint_cql_w{w_utility}_{w_bur}.json
 """
 import argparse
 import json
@@ -60,20 +60,26 @@ def validate_joint_artifacts(meta, *splits):
     norm = meta.get("reward_normalization", {})
     if norm.get("normalization") != "per_stay_extreme_range":
         raise SystemExit("joint MDP uses the old reward scaling; rerun stage 3b")
+    if meta.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
+        raise SystemExit("joint MDP uses the old reward objectives; rerun stage 3b")
+    if meta.get("utility_definition") != "max_thresholded_expected_information":
+        raise SystemExit("joint MDP has no information-utility contract; rerun stage 3b")
     for split in splits:
+        if "utility_potential" not in split:
+            raise SystemExit("joint MDP has no utility_potential; rerun stage 3b")
         if len(split["action"]) and int(np.max(split["action"])) >= N_ACTIONS:
             raise SystemExit("joint MDP contains stale panel actions; rerun stage 3b")
 
 
 def scalar_reward(split, pref):
-    """w_detection * z_detection - w_burden * z_burden.
+    """w_utility * z_utility - w_burden * z_burden.
 
     Weights lie on the simplex so |r| stays roughly constant across the sweep;
     see config.JOINT_PREFERENCES for why that matters to CQL_ALPHA.
     """
-    w_det, w_bur = float(pref[0]), float(pref[1])
+    w_utility, w_bur = float(pref[0]), float(pref[1])
     r = split["reward_norm"].astype(np.float32)
-    return (w_det * r[:, 0] - w_bur * r[:, 1]).astype(np.float32)
+    return (w_utility * r[:, 0] - w_bur * r[:, 1]).astype(np.float32)
 
 
 def scalar_policy_reward(split, actions, pref, norm_meta):
@@ -83,15 +89,15 @@ def scalar_policy_reward(split, actions, pref, norm_meta):
     states, so a recommended draw never actually updates the patient. It is not
     an OPE estimate and must not be read as one.
     """
-    det = objectives.detection_objective(split, actions)[0]
+    utility = objectives.utility_objective(split, actions)
     bur = objectives.burden_objective(split, actions)
-    raw = np.stack([det, bur], axis=1).astype(np.float32)
+    raw = np.stack([utility, bur], axis=1).astype(np.float32)
     mu = np.asarray(norm_meta["reward_mean"], dtype=np.float32)
     sd = np.asarray(norm_meta["reward_sd"], dtype=np.float32)
     sd[sd < 1e-6] = 1.0
     r = (raw - mu) / sd
-    w_det, w_bur = float(pref[0]), float(pref[1])
-    return (w_det * r[:, 0] - w_bur * r[:, 1]).astype(np.float32)
+    w_utility, w_bur = float(pref[0]), float(pref[1])
+    return (w_utility * r[:, 0] - w_bur * r[:, 1]).astype(np.float32)
 
 
 def per_stay_sum(values, stay):
@@ -104,14 +110,12 @@ def per_stay_sum(values, stay):
 
 
 def constant_policy_returns(split, norm_meta):
-    """Per-stay mean of normalized (detection, burden) for every CONSTANT policy.
+    """Per-stay mean of normalized (utility, burden) for constant policies.
 
-    One entry for never-draw and one for each of the seven non-empty panels.
-    "Always draw" is not a single baseline: `np.full(n, 1)` means "always order
-    creatinine+bun+wbc", which is one arbitrary panel out of seven and is not
-    the strongest constant policy at every preference. The gate compares against
-    the BEST constant panel, so a learned policy has to beat the best fixed rule
-    rather than a convenient one.
+    The binary track has two entries: never draw and always draw. The gate
+    compares against the better fixed rule at each preference, so a learned
+    policy must add state-dependent value rather than merely choosing one action
+    more often.
 
     Both objectives are computed once per constant action and cached. The
     preference only enters as a linear combination afterwards, and expectation is
@@ -130,11 +134,11 @@ def constant_policy_returns(split, norm_meta):
         actions.append((f"always_{cfg.JOINT_PANEL_BITS[a]}",
                         np.full(n, a, dtype=np.int64)))
     for name, acts in actions:
-        det = objectives.detection_objective(split, acts)[0]
+        utility = objectives.utility_objective(split, acts)
         bur = objectives.burden_objective(split, acts)
-        zd = (det - mu[0]) / sd[0]
+        zu = (utility - mu[0]) / sd[0]
         zb = (bur - mu[1]) / sd[1]
-        out[name] = (float(per_stay_sum(zd, stay).mean()),
+        out[name] = (float(per_stay_sum(zu, stay).mean()),
                      float(per_stay_sum(zb, stay).mean()))
     return out
 
@@ -148,8 +152,8 @@ def trivial_baselines(split, pref, norm_meta, cache=None):
     is exactly what happened at lambda >= 0.3.
     """
     cache = constant_policy_returns(split, norm_meta) if cache is None else cache
-    w_det, w_bur = float(pref[0]), float(pref[1])
-    return {name: w_det * d - w_bur * b for name, (d, b) in cache.items()}
+    w_utility, w_bur = float(pref[0]), float(pref[1])
+    return {name: w_utility * u - w_bur * b for name, (u, b) in cache.items()}
 
 
 def make_dataset(split, reward):
@@ -187,7 +191,7 @@ def summarize_policy(algo, split):
     return {
         "draw_rate": float(any_draw.mean()),
         "draws_per_patient_day": float(any_draw.sum() / days),
-        "replay_detection_mean": float(split["reward"][:, 0][any_draw].mean()
+        "replay_utility_mean": float(split["reward"][:, 0][any_draw].mean()
                                        if any_draw.any() else 0.0),
         "replay_burden_mean": float(split["reward"][:, 1][any_draw].mean()
                                     if any_draw.any() else 0.0),
@@ -198,7 +202,10 @@ def summarize_policy(algo, split):
 def summarize_policy_with_pref(algo, split, pref, norm_meta, baselines=None):
     actions = algo.predict(split["state"].astype(np.float32)).astype(np.int64)
     any_draw = actions != 0
+    clinician_draw = split["action"] != 0
     stay = split["stay_id"]
+    utility = objectives.utility_objective(split, actions)
+    clinician_utility = objectives.utility_objective(split, split["action"])
     scalar = scalar_policy_reward(split, actions, pref, norm_meta)
     clinician_scalar = scalar_policy_reward(
         split, split["action"].astype(np.int64), pref, norm_meta)
@@ -219,7 +226,10 @@ def summarize_policy_with_pref(algo, split, pref, norm_meta, baselines=None):
         "beats_trivial": bool(policy_rew > best_trivial + cfg.VALIDITY_MARGIN)
                          if base else None,
         "draws_per_patient_day": float(any_draw.sum() / max(1e-6, len(actions) / 24.0)),
-        "clin_draws_per_patient_day": float((split["action"] != 0).sum() / max(1e-6, len(actions) / 24.0)),
+        "clin_draws_per_patient_day": float(clinician_draw.sum() / max(1e-6, len(actions) / 24.0)),
+        "utility_per_draw": float(utility[any_draw].mean() if any_draw.any() else 0.0),
+        "clin_utility_per_draw": float(
+            clinician_utility[clinician_draw].mean() if clinician_draw.any() else 0.0),
         "event_coverage": objectives.event_coverage(split, actions),
         "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
@@ -235,6 +245,8 @@ def make_epoch_callback(pref, val, norm_meta, rows, baselines):
             f"  val epoch={epoch} step={total_step} "
             f"draws/day={s['draws_per_patient_day']:.2f} "
             f"(clin {s['clin_draws_per_patient_day']:.2f})  "
+            f"utility/draw={s['utility_per_draw']:.3f} "
+            f"(clin {s['clin_utility_per_draw']:.3f})  "
             f"coverage={s['event_coverage']:.3f}  "
             f"rew={s['ep_rew_mean']:+.2f} "
             f"(clin {s['clin_ep_rew_mean']:+.2f}, "
@@ -250,7 +262,7 @@ def make_epoch_callback(pref, val, norm_meta, rows, baselines):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefs", nargs="+", type=float, default=None,
-                    help="flat list of w_detection w_burden pairs, e.g. 0.9 0.1 0.5 0.5")
+                    help="flat list of w_utility w_burden pairs, e.g. 0.9 0.1 0.5 0.5")
     ap.add_argument("--steps", type=int, default=cfg.CQL_STEPS)
     ap.add_argument("--alpha", type=float, default=cfg.CQL_ALPHA)
     ap.add_argument("--tag", default="",
@@ -273,7 +285,7 @@ def main():
     if args.prefs:
         flat = list(args.prefs)
         if len(flat) % 2:
-            raise SystemExit("--prefs needs an even count: w_detection w_burden pairs")
+            raise SystemExit("--prefs needs an even count: w_utility w_burden pairs")
         prefs = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
     else:
         prefs = [tuple(x) for x in cfg.JOINT_PREFERENCES]
@@ -285,11 +297,11 @@ def main():
     for nm, sp in (("train", train), ("val", val)):
         z = objectives.clinician_reward_sanity(sp, norm_meta, name=f"joint_{nm}.npz")
         print(f"  {nm}: clinician scaled per-stay returns "
-              f"det={z[0]:+.3f} bur={z[1]:+.3f}")
+              f"utility={z[0]:+.3f} bur={z[1]:+.3f}")
 
     print(f"joint d3rlpy CQL family: train n={len(train['action']):,}, "
           f"state dim={train['state'].shape[1]}, actions={N_ACTIONS}")
-    print("reward: w_detection * z_detection - w_burden * z_burden")
+    print("reward: w_utility * z_utility - w_burden * z_burden")
     print(f"preferences: {prefs}")
 
     print(f"\ncaching constant-policy baselines on val "
@@ -298,7 +310,7 @@ def main():
 
     rows = []
     for pref in prefs:
-        print(f"\n[w_det={pref[0]}, w_bur={pref[1]}] d3rlpy DiscreteCQL, "
+        print(f"\n[w_utility={pref[0]}, w_bur={pref[1]}] d3rlpy DiscreteCQL, "
               f"{args.steps:,} steps, alpha={args.alpha}")
         base = trivial_baselines(val, pref, norm_meta, base_cache)
         best_name = max(base, key=base.get)
@@ -363,13 +375,13 @@ def main():
         }
         meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"  saved -> {model_path}")
-        rows.append({"w_detection": float(pref[0]), "w_burden": float(pref[1]),
+        rows.append({"w_utility": float(pref[0]), "w_burden": float(pref[1]),
                      **val_summary})
 
     n_valid = sum(1 for r in rows if r.get("beats_trivial"))
     report = [
         "# Joint d3rlpy CQL policy family\n\n",
-        "Reward is `w_detection * z_detection - w_burden * z_burden`, weights on "
+        "Reward is `w_utility * z_utility - w_burden * z_burden`, weights on "
         "the simplex.\n\n",
         "Every number below is a **replay** quantity on val: the policy's actions "
         "are scored against logged states, so a recommended draw never updates "
@@ -380,11 +392,11 @@ def main():
         f"{n_valid}/{len(rows)} "
         f"passed. A policy below the best constant rule has not found a trade-off, "
         f"it has diverged, and must not be plotted as a frontier point.\n\n",
-        "| w_det | w_bur | draws/day | clin draws/day | coverage | rew | clin rew | never | always | valid |\n",
+        "| w_utility | w_bur | draws/day | clin draws/day | coverage | rew | clin rew | never | always | valid |\n",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     ]
     for row in rows:
-        report.append(f"| {row['w_detection']:.1f} | {row['w_burden']:.1f} | "
+        report.append(f"| {row['w_utility']:.1f} | {row['w_burden']:.1f} | "
                       f"{row['draws_per_patient_day']:.3f} | "
                       f"{row['clin_draws_per_patient_day']:.3f} | "
                       f"{row['event_coverage']:.3f} | "

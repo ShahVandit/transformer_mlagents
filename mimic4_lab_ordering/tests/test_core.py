@@ -311,82 +311,42 @@ def test_joint_panels():
     check("a new stay starts with a clean redundancy clock",
           abs(float(b4[2]) - 1.0) < 1e-6)
 
-    # Detection is event-level: each event contributes exactly +1 or -1.
-    n = 30
-    d = pd.DataFrame({
-        "stay_id": np.zeros(n, dtype=int),
-        "hour": np.arange(n, dtype=float),
-        "sofa_delta": np.zeros(n),
-        **{f"onset_{k}": np.zeros(n, dtype=int) for k in
-           __import__("itemids").INTERVENTION_KINDS},
-    })
-    d.loc[20, "onset_vasopressor"] = 1          # event at hour 20
-    acts = np.zeros(n, dtype=int)
-    acts[15] = 1                                 # a draw 5h before the event
-    r, fut, ev = objectives.detection_objective(d, acts, lookahead=12)
-    check("a draw inside the window before an event scores +1", r[15] == 1.0)
-    check("the event hour itself is flagged", ev[20] == 1)
-    check("hours with no upcoming event score 0", r[0] == 0.0)
-    check("a covered event produces no miss penalty", float(r[r < 0].sum()) == 0.0)
-    check("one covered event contributes exactly +1", float(r.sum()) == 1.0)
+    # Joint utility follows the paper's thresholded expected information term.
+    n = 5
+    d = {"stay_id": np.zeros(n, dtype=int),
+         "hour": np.arange(n, dtype=float)}
+    for lab in __import__("itemids").TARGET_LABS:
+        d[f"mean_{lab}"] = np.array([0, 1, 4, 1, 0], dtype=float)
+        d[f"last_{lab}"] = np.zeros(n)
+        d[f"std_{lab}"] = np.ones(n)
+        d[f"obs_{lab}"] = np.array([np.nan, 1, 4, np.nan, np.nan])
+    thresholds = objectives.fit_utility_thresholds(d)
+    potential = objectives.information_potential(d, thresholds)
+    check("training thresholds are medians of clinician-ordered scores",
+          all(v == 1.0 for v in thresholds.values()))
+    check("threshold-level draws have no information utility", potential[1] == 0.0)
+    check("larger forecast changes have more information utility", potential[2] > 0.0)
 
-    # Extra draws cannot claim the same event more than once. The earliest
-    # eligible draw keeps the credit; all later draws only incur burden.
-    acts2 = np.zeros(n, dtype=int)
-    acts2[15] = 1
-    acts2[16] = 1                       # second draw inside the same window
-    acts2[17] = 1
-    r2, _, _ = objectives.detection_objective(d, acts2, lookahead=12)
-    check("the earliest eligible draw claims the event", r2[15] == 1.0)
-    check("a later draw cannot move earlier credit", r2[17] == 0.0)
-    check("a second draw in the same window earns nothing", r2[16] == 0.0)
-    check("three draws still earn only one detection credit", float(r2.sum()) == 1.0)
+    d["utility_potential"] = potential
+    none = np.zeros(n, dtype=int)
+    informative = none.copy()
+    informative[2] = 1
+    uninformative = none.copy()
+    uninformative[1] = 1
+    u_none = objectives.utility_objective(d, none)
+    u_info = objectives.utility_objective(d, informative)
+    u_low = objectives.utility_objective(d, uninformative)
+    b_low = objectives.burden_objective(d, uninformative)
+    check("no draw receives zero utility", float(u_none.sum()) == 0.0)
+    check("an informative draw receives positive utility", float(u_info.sum()) > 0.0)
+    check("an uninformative draw receives no utility", float(u_low.sum()) == 0.0)
+    check("an uninformative draw still incurs burden", float(b_low.sum()) > 0.0)
 
-    all_draw = np.ones(n, dtype=int)
-    r_all, _, _ = objectives.detection_objective(d, all_draw, lookahead=12)
-    r_one, _, _ = objectives.detection_objective(d, acts, lookahead=12)
-    r_none, _, _ = objectives.detection_objective(d, np.zeros(n, dtype=int),
-                                                  lookahead=12)
-    check("one timely draw and always-draw have equal detection credit",
-          float(r_all.sum()) == float(r_one.sum()) == 1.0,
-          f"all={r_all.sum():.1f} one={r_one.sum():.1f} none={r_none.sum():.1f}")
-    check("one missed event contributes exactly -1", float(r_none.sum()) == -1.0)
-    check("positive and negative outcomes have equal magnitude",
-          float(r_all.sum()) == -float(r_none.sum()))
-
-    # A draw after the event cannot retroactively cover it and adds burden only.
-    late = np.zeros(n, dtype=int)
-    late[21] = 1
-    r_late, _, _ = objectives.detection_objective(d, late, lookahead=12)
-    b_late = objectives.burden_objective(
-        {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}, late)
-    check("a late draw does not cover the event", float(r_late.sum()) == -1.0)
-    check("a late unnecessary draw still has positive burden", float(b_late.sum()) > 0.0)
-
-    # Events at admission are not penalised because no prior policy decision
-    # could possibly have covered them.
-    d_head = d.copy()
-    d_head.loc[:, "onset_vasopressor"] = 0
-    d_head.loc[0, "onset_vasopressor"] = 1
-    r_head, _, _ = objectives.detection_objective(
-        d_head, np.zeros(n, dtype=int), lookahead=12)
-    check("an event at the first hour is not an impossible penalty",
-          float(r_head.sum()) == 0.0)
-
-    # Per-stay range normalization leaves neutral transitions at zero and
-    # preserves symmetry between one covered and one missed event.
-    train_r = np.stack([r_one, objectives.burden_objective(d, acts)], axis=1)
-    train_split = {
-        "stay_id": d["stay_id"].to_numpy(),
-        "hour": d["hour"].to_numpy(),
-        "event": ev,
-        "reward": train_r,
-    }
+    train_r = np.stack([u_info, objectives.burden_objective(d, informative)], axis=1)
+    train_split = {**d, "action": informative, "reward": train_r}
     normed, norm_meta = objectives.normalize_rewards(train_split, train_r)
     check("normalization keeps neutral rewards at exactly zero",
-          bool(np.array_equal(normed[0][2], np.zeros(2, dtype=np.float32))))
-    check("normalization preserves symmetric detection magnitude",
-          abs(float(normed[0][0, 0])) == abs(float(normed[0][1, 0])))
+          bool(np.array_equal(normed[0][0], np.zeros(2, dtype=np.float32))))
     check("normalization records per-stay range semantics",
           norm_meta.get("normalization") == "per_stay_extreme_range")
 
