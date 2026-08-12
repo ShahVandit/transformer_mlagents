@@ -58,6 +58,8 @@ def _recent_any_by_stay(values, stay_ids, lookback):
 
 
 def deterioration_events(df):
+    if "event" in df if isinstance(df, dict) else getattr(df, "columns", []):
+        return _to_numpy(_col(df, "event")).astype(bool)
     onset_cols = [f"onset_{k}" for k in ids.INTERVENTION_KINDS]
     onset = np.column_stack([_to_numpy(_col(df, c)) for c in onset_cols]).sum(axis=1) > 0
     sofa = _to_numpy(_col(df, "sofa_delta")) >= cfg.SOFA_DELTA_THRESHOLD
