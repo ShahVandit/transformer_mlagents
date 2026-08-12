@@ -68,22 +68,7 @@ def patient_days(split):
 
 
 def event_coverage(split, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
-    event = split["event"].astype(bool)
-    draw = np.asarray(actions) != 0
-    stay = split["stay_id"]
-    covered = np.zeros(len(event), dtype=bool)
-    start = 0
-    for i in range(1, len(event) + 1):
-        if i == len(event) or stay[i] != stay[start]:
-            e = event[start:i]
-            d = draw[start:i].astype(np.int8)
-            c = np.r_[0, np.cumsum(d)]
-            for j in np.flatnonzero(e):
-                lo = max(0, j - lookback)
-                covered[start + j] = (c[j] - c[lo]) > 0
-            start = i
-    n_events = int(event.sum())
-    return float(covered[event].mean()) if n_events else np.nan
+    return objectives.event_coverage(split, actions, lookback)
 
 
 def non_dominated(df, det_col="wdr_detection", bur_col="wdr_burden"):

@@ -72,23 +72,46 @@ def deterioration_events(df):
     return onset | sofa
 
 
+def deterioration_episode_onsets(df, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
+    """Collapse nearby deterioration labels into distinct episode onsets."""
+    stay = _to_numpy(_col(df, "stay_id"))
+    event = deterioration_events(df)
+    episode_onset = np.zeros(len(event), dtype=bool)
+
+    start = 0
+    for i in range(1, len(stay) + 1):
+        if i == len(stay) or stay[i] != stay[start]:
+            local_event = event[start:i]
+            raw_onsets = np.flatnonzero(
+                local_event & ~np.r_[False, local_event[:-1]])
+            last_onset = None
+            for onset in raw_onsets:
+                if last_onset is None or onset - last_onset > lookahead:
+                    episode_onset[start + int(onset)] = True
+                    last_onset = int(onset)
+            start = i
+    return episode_onset
+
+
 def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
     """Score every evaluable deterioration exactly once.
 
     Consecutive positive hours are treated as one deterioration episode. For an
     episode starting at hour ``t``, a draw in ``[t-lookahead, t)`` covers it. The
-    most recent eligible draw receives ``+1``; if there is no eligible draw,
+    earliest eligible draw receives ``+1``; if there is no eligible draw,
     the last decision before the event receives ``-1``. Events in the first
     hour are excluded because the policy had no earlier decision opportunity.
 
     This event-level assignment is deliberately symmetric. One event can add
     exactly ``+1`` or ``-1`` to the trajectory, never one reward per hour in
-    its lookahead window. Additional draws cannot increase detection reward;
-    they are handled only by ``burden_objective``.
+    its lookahead window. Additional draws cannot increase detection reward or
+    move credit away from an earlier transition; they are handled only by
+    ``burden_objective``.
     """
     stay = _to_numpy(_col(df, "stay_id"))
     event = deterioration_events(df)
-    future_event = _future_any_by_stay(event, stay, lookahead)
+    episode_onset = deterioration_episode_onsets(df, lookahead)
+    future_event = _future_any_by_stay(episode_onset, stay, lookahead)
     any_draw = np.asarray(actions) != 0
     r = np.zeros(len(stay), dtype=np.float32)
 
@@ -96,29 +119,42 @@ def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOU
     for i in range(1, len(stay) + 1):
         if i == len(stay) or stay[i] != stay[start]:
             local_draw = any_draw[start:i]
-            local_event = event[start:i]
-            raw_onsets = np.flatnonzero(
-                local_event & ~np.r_[False, local_event[:-1]])
-            # Multiple labels close together usually describe one continuing
-            # clinical deterioration. Keep only the first onset in each
-            # lookahead-sized episode so one draw cannot collect repeated credit
-            # for a clustered vasopressor/SOFA/ventilation sequence.
-            event_onsets = []
-            for onset in raw_onsets:
-                if not event_onsets or onset - event_onsets[-1] > lookahead:
-                    event_onsets.append(int(onset))
+            event_onsets = np.flatnonzero(episode_onset[start:i])
             for event_idx in event_onsets:
                 if event_idx == 0:
                     continue
                 lo = max(0, event_idx - lookahead)
                 candidates = np.flatnonzero(local_draw[lo:event_idx])
                 if len(candidates):
-                    chosen = lo + int(candidates[-1])
+                    # Later actions must never rewrite an earlier transition's
+                    # reward, so the first qualifying draw keeps the credit.
+                    chosen = lo + int(candidates[0])
                     r[start + chosen] += 1.0
                 else:
                     r[start + event_idx - 1] -= 1.0
             start = i
     return r, future_event.astype(np.int8), event.astype(np.int8)
+
+
+def event_coverage(df, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
+    """Fraction of evaluable deterioration episodes covered by a prior draw."""
+    stay = _to_numpy(_col(df, "stay_id"))
+    episode_onset = deterioration_episode_onsets(df, lookback)
+    draw = np.asarray(actions) != 0
+    covered = []
+
+    start = 0
+    for i in range(1, len(stay) + 1):
+        if i == len(stay) or stay[i] != stay[start]:
+            local_draw = draw[start:i].astype(np.int8)
+            cumulative = np.r_[0, np.cumsum(local_draw)]
+            for event_idx in np.flatnonzero(episode_onset[start:i]):
+                if event_idx == 0:
+                    continue
+                lo = max(0, event_idx - lookback)
+                covered.append((cumulative[event_idx] - cumulative[lo]) > 0)
+            start = i
+    return float(np.mean(covered)) if covered else np.nan
 
 
 def burden_objective(df, actions):

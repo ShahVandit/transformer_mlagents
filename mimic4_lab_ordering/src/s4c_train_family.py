@@ -205,21 +205,6 @@ def summarize_policy_with_pref(algo, split, pref, norm_meta, baselines=None):
     scalar_stay = per_stay_sum(scalar, stay)
     clinician_scalar_stay = per_stay_sum(clinician_scalar, stay)
 
-    event = split["event"].astype(bool)
-    covered = np.zeros(len(event), dtype=bool)
-    start = 0
-    lookback = cfg.JOINT_DETECTION_LOOKAHEAD_HOURS
-    for i in range(1, len(event) + 1):
-        if i == len(event) or stay[i] != stay[start]:
-            d = any_draw[start:i].astype(np.int8)
-            c = np.r_[0, np.cumsum(d)]
-            local = np.zeros(i - start, dtype=bool)
-            for j in np.flatnonzero(event[start:i]):
-                lo = max(0, j - lookback)
-                local[j] = (c[j] - c[lo]) > 0
-            covered[start:i] = local
-            start = i
-
     base = baselines or {}
     best_trivial = max(base.values()) if base else -np.inf
     policy_rew = float(np.mean(scalar_stay))
@@ -235,7 +220,7 @@ def summarize_policy_with_pref(algo, split, pref, norm_meta, baselines=None):
                          if base else None,
         "draws_per_patient_day": float(any_draw.sum() / max(1e-6, len(actions) / 24.0)),
         "clin_draws_per_patient_day": float((split["action"] != 0).sum() / max(1e-6, len(actions) / 24.0)),
-        "event_coverage": float(covered[event].mean() if event.any() else 0.0),
+        "event_coverage": objectives.event_coverage(split, actions),
         "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
 

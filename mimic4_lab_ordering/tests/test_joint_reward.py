@@ -69,6 +69,14 @@ def main():
     assert totals["always"][1] > totals["timely_repeated"][1]
     assert totals["always"][2] < totals["timely_once"][2]
 
+    # A later action cannot retroactively move reward from an earlier action.
+    det_once = score(frame, cases["timely_once"])[0]
+    det_repeated = score(frame, cases["timely_repeated"])[0]
+    assert det_once[15] == det_repeated[15] == 1.0
+    assert det_repeated[16] == det_repeated[17] == 0.0
+    assert objectives.event_coverage(frame, cases["timely_once"], 12) == 1.0
+    assert objectives.event_coverage(frame, cases["never"], 12) == 0.0
+
     # The epoch callback recomputes rewards under policy actions. When those
     # actions equal the logged clinician actions, both paths must be identical.
     clinician_actions = cases["timely_once"]

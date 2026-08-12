@@ -330,15 +330,15 @@ def test_joint_panels():
     check("a covered event produces no miss penalty", float(r[r < 0].sum()) == 0.0)
     check("one covered event contributes exactly +1", float(r.sum()) == 1.0)
 
-    # Extra draws cannot claim the same event more than once. The latest eligible
-    # draw gets the credit; all others only incur burden.
+    # Extra draws cannot claim the same event more than once. The earliest
+    # eligible draw keeps the credit; all later draws only incur burden.
     acts2 = np.zeros(n, dtype=int)
     acts2[15] = 1
     acts2[16] = 1                       # second draw inside the same window
     acts2[17] = 1
     r2, _, _ = objectives.detection_objective(d, acts2, lookahead=12)
-    check("the latest eligible draw claims the event", r2[17] == 1.0)
-    check("an earlier draw in the same window earns nothing", r2[15] == 0.0)
+    check("the earliest eligible draw claims the event", r2[15] == 1.0)
+    check("a later draw cannot move earlier credit", r2[17] == 0.0)
     check("a second draw in the same window earns nothing", r2[16] == 0.0)
     check("three draws still earn only one detection credit", float(r2.sum()) == 1.0)
 
