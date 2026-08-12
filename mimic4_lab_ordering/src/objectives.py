@@ -80,16 +80,29 @@ def detection_objective(df, actions, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOU
 
 
 def burden_objective(df, actions):
+    stay = _to_numpy(_col(df, "stay_id"))
+    hour = _to_numpy(_col(df, "hour")).astype(np.float32)
     bits = panels.action_bits(actions).astype(np.float32)
-    deltas = []
-    for lab in panels.LABS:
-        d = _to_numpy(_col(df, f"delta_{lab}")).astype(np.float32)
-        d = np.where(np.isfinite(d), d, np.inf)
-        deltas.append(d)
-    deltas = np.stack(deltas, axis=1)
-    redundancy = (bits * np.exp(-deltas / cfg.COST_DECAY_GAMMA)).sum(axis=1)
-    any_draw = (np.asarray(actions) != 0).astype(np.float32)
-    return (any_draw * (1.0 + redundancy)).astype(np.float32)
+    out = np.zeros(len(stay), dtype=np.float32)
+
+    start = 0
+    for i in range(1, len(stay) + 1):
+        if i == len(stay) or stay[i] != stay[start]:
+            last_seen = np.full(len(panels.LABS), np.nan, dtype=np.float32)
+            for j in range(start, i):
+                if bits[j].sum() == 0:
+                    continue
+                delta = np.where(
+                    np.isfinite(last_seen),
+                    hour[j] - last_seen,
+                    hour[j] + 1.0,
+                )
+                out[j] = 1.0 + float(
+                    (bits[j] * np.exp(-delta / cfg.COST_DECAY_GAMMA)).sum()
+                )
+                last_seen = np.where(bits[j] > 0, hour[j], last_seen)
+            start = i
+    return out
 
 
 def normalize_rewards(train_reward, *splits):
