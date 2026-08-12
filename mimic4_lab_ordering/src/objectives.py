@@ -73,63 +73,60 @@ def deterioration_events(df):
 
 
 def fit_utility_thresholds(train_df):
-    """Fit the paper's c_l threshold on clinician-ordered TRAIN rows only."""
+    """Fit c_l on realized surprise from clinician-ordered TRAIN rows only."""
     thresholds = {}
     for lab in panels.LABS:
         mean = _to_numpy(_col(train_df, f"mean_{lab}")).astype(np.float64)
-        last = _to_numpy(_col(train_df, f"last_{lab}")).astype(np.float64)
+        observed = _to_numpy(_col(train_df, f"obs_{lab}")).astype(np.float64)
         std = np.maximum(
             _to_numpy(_col(train_df, f"std_{lab}")).astype(np.float64),
             cfg.FORECAST_MIN_STD,
         )
-        observed = np.isfinite(
-            _to_numpy(_col(train_df, f"obs_{lab}")).astype(np.float64))
-        score = np.abs(mean - last) / std
-        eligible = observed & np.isfinite(score)
+        score = np.abs(observed - mean) / std
+        eligible = np.isfinite(observed) & np.isfinite(score)
         thresholds[lab] = float(np.median(score[eligible])) if eligible.any() else 0.0
     return thresholds
 
 
-def information_potential(df, thresholds):
-    """Expected information available from one physical blood draw.
+def realized_information(df, thresholds):
+    """Realized information from the labs observed in a physical blood draw.
 
-    This is Eq. 5 from Cheng et al., computed from decision-time quantities:
-    predictive mean, last known value, and predictive uncertainty. Each lab is
-    thresholded by the median score among clinician-ordered training rows. The
-    binary action does not specify which assays are ordered, so utility is the
-    strongest supported lab signal rather than the sum of four counterfactual
-    assays. Before a lab has any prior value its utility is zero.
+    The result is compared with its past-only predictive mean and uncertainty.
+    Each lab is thresholded by the median realized surprise among clinician-
+    ordered training rows. The binary action does not specify which assays are
+    ordered, so utility is the strongest observed lab signal. No logged draw
+    means no observed result and therefore zero realized-information label.
     """
     values = []
     for lab in panels.LABS:
         mean = _to_numpy(_col(df, f"mean_{lab}")).astype(np.float64)
-        last = _to_numpy(_col(df, f"last_{lab}")).astype(np.float64)
+        observed = _to_numpy(_col(df, f"obs_{lab}")).astype(np.float64)
         std = np.maximum(
             _to_numpy(_col(df, f"std_{lab}")).astype(np.float64),
             cfg.FORECAST_MIN_STD,
         )
-        score = np.abs(mean - last) / std
-        score = np.where(np.isfinite(score), score, 0.0)
+        score = np.abs(observed - mean) / std
+        score = np.where(np.isfinite(observed) & np.isfinite(score), score, 0.0)
         values.append(np.maximum(0.0, score - float(thresholds[lab])))
     return np.max(np.stack(values, axis=1), axis=1).astype(np.float32)
 
 
 def utility_objective(df, actions, thresholds=None):
-    """Reward a draw in proportion to expected information; no draw gets zero.
+    """Score agreement with logged informative draws.
 
-    Multiplication by the binary action is only a gate: draw earns +potential
-    and no draw earns 0. In maximization, omitting a useful draw already loses
-    that positive opportunity. Assigning -potential to every no-draw hour would
-    double the action gap and reward constant drawing when the proxy is broadly
-    positive.
+    At a clinician-draw hour, a policy draw receives +u and omission receives
+    -u. At a logged no-draw hour, utility is zero because no result exists to
+    establish realized information; a policy draw is handled by burden. This is
+    cost-sensitive clinician imitation, not a counterfactual utility estimate.
     """
-    if _has_col(df, "utility_potential"):
-        potential = _to_numpy(_col(df, "utility_potential")).astype(np.float32)
+    if _has_col(df, "realized_utility"):
+        utility = _to_numpy(_col(df, "realized_utility")).astype(np.float32)
     elif thresholds is not None:
-        potential = information_potential(df, thresholds)
+        utility = realized_information(df, thresholds)
     else:
-        raise ValueError("utility_potential or utility thresholds are required")
-    return potential * (np.asarray(actions) != 0).astype(np.float32)
+        raise ValueError("realized_utility or utility thresholds are required")
+    draw = (np.asarray(actions) != 0).astype(np.float32)
+    return utility * (2.0 * draw - 1.0)
 
 
 def deterioration_episode_onsets(df, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):

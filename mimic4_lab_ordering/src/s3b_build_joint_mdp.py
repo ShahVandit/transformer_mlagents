@@ -31,10 +31,10 @@ def build_split(df, utility_thresholds):
     df = add_sofa(df.sort_values(["stay_id", "hour"]).reset_index(drop=True))
     state, cols = build_state(df)
     action = panels.encode_frame(df)
-    utility_potential = objectives.information_potential(df, utility_thresholds)
+    realized_utility = objectives.realized_information(df, utility_thresholds)
     utility = objectives.utility_objective(
         {
-            "utility_potential": utility_potential,
+            "realized_utility": realized_utility,
             "stay_id": df["stay_id"].to_numpy(),
             "hour": df["hour"].to_numpy(),
         },
@@ -59,7 +59,7 @@ def build_split(df, utility_thresholds):
         "hour": df["hour"].to_numpy(dtype=np.int64),
         "event": event.astype(np.int8),
         "future_event": future_event.astype(np.int8),
-        "utility_potential": utility_potential.astype(np.float32),
+        "realized_utility": realized_utility.astype(np.float32),
         "n_labs": panels.panel_n_labs(action),
     }, cols
 
@@ -112,7 +112,7 @@ def main():
         "panel_bits": cfg.JOINT_PANEL_BITS,
         "panel_names": cfg.JOINT_PANEL_NAMES,
         "lookahead_hours": cfg.JOINT_DETECTION_LOOKAHEAD_HOURS,
-        "utility_definition": "max_thresholded_expected_information",
+        "utility_definition": "clinician_conditioned_signed_realized_information",
         "utility_thresholds": utility_thresholds,
         "gamma": cfg.GAMMA,
         "action_distribution": {

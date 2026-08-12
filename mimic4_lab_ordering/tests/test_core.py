@@ -321,13 +321,13 @@ def test_joint_panels():
         d[f"std_{lab}"] = np.ones(n)
         d[f"obs_{lab}"] = np.array([np.nan, 1, 4, np.nan, np.nan])
     thresholds = objectives.fit_utility_thresholds(d)
-    potential = objectives.information_potential(d, thresholds)
+    potential = objectives.realized_information(d, thresholds)
     check("training thresholds are medians of clinician-ordered scores",
           all(v == 1.0 for v in thresholds.values()))
     check("threshold-level draws have no information utility", potential[1] == 0.0)
     check("larger forecast changes have more information utility", potential[2] > 0.0)
 
-    d["utility_potential"] = potential
+    d["realized_utility"] = potential
     none = np.zeros(n, dtype=int)
     informative = none.copy()
     informative[2] = 1
@@ -337,9 +337,11 @@ def test_joint_panels():
     u_info = objectives.utility_objective(d, informative)
     u_low = objectives.utility_objective(d, uninformative)
     b_low = objectives.burden_objective(d, uninformative)
-    check("no draw receives zero utility", float(u_none.sum()) == 0.0)
+    check("missing informative draws receives negative utility",
+          float(u_none.sum()) < 0.0)
     check("an informative draw receives positive utility", float(u_info.sum()) > 0.0)
-    check("an uninformative draw receives no utility", float(u_low.sum()) == 0.0)
+    check("drawing at zero potential does not alter utility",
+          np.allclose(u_low, u_none))
     check("an uninformative draw still incurs burden", float(b_low.sum()) > 0.0)
 
     train_r = np.stack([u_info, objectives.burden_objective(d, informative)], axis=1)

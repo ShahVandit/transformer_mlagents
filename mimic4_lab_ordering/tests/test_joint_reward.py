@@ -18,7 +18,7 @@ def information_frame():
         "hour": np.arange(n, dtype=np.float32),
     }
     for lab in ids.TARGET_LABS:
-        frame[f"mean_{lab}"] = np.array([0, 1, 4, 4, 1, 0], dtype=np.float32)
+        frame[f"mean_{lab}"] = np.zeros(n, dtype=np.float32)
         frame[f"last_{lab}"] = np.zeros(n, dtype=np.float32)
         frame[f"std_{lab}"] = np.ones(n, dtype=np.float32)
         frame[f"obs_{lab}"] = np.array(
@@ -31,13 +31,14 @@ def main():
     thresholds = objectives.fit_utility_thresholds(frame)
     assert all(value == 1.0 for value in thresholds.values()), thresholds
 
-    potential = objectives.information_potential(frame, thresholds)
+    potential = objectives.realized_information(frame, thresholds)
     # The binary action uses the strongest supported lab signal. Row 1 is at
     # the threshold and row 2 carries 3 units, regardless of lab count.
     assert potential[1] == 0.0
     assert potential[2] == 3.0
 
-    split = {**frame, "utility_potential": potential}
+    clinician = np.isfinite(frame["obs_creatinine"]).astype(np.int64)
+    split = {**frame, "realized_utility": potential, "action": clinician}
     never = np.zeros(len(potential), dtype=np.int64)
     low = never.copy()
     low[1] = 1
@@ -63,22 +64,39 @@ def main():
     for name, (utility, burden) in rows.items():
         print(f"{name:20s} {utility:8.2f} {burden:7.2f}")
 
-    assert rows["never"] == (0.0, 0.0)
-    assert rows["low_information"][0] == 0.0
+    assert rows["never"][0] < 0.0
+    assert rows["never"][1] == 0.0
+    assert rows["low_information"][0] == rows["never"][0]
     assert rows["low_information"][1] > 0.0
     assert rows["high_information"][0] > rows["low_information"][0]
-    assert rows["repeated"][0] > rows["high_information"][0]
+    assert rows["repeated"][0] == rows["high_information"][0]
     assert rows["repeated"][1] > rows["high_information"][1]
+    assert rows["always"][0] == rows["high_information"][0]
     assert rows["always"][1] > rows["repeated"][1]
 
-    # No-draw is zero rather than negative. It still loses the positive utility
-    # that an informative draw would have collected.
+    # At an informative opportunity, drawing receives +u and omission receives
+    # exactly -u. At zero potential, both actions receive zero utility.
     missed = objectives.utility_objective(split, never)
     taken = objectives.utility_objective(split, high)
-    assert missed[2] == 0.0
+    assert missed[2] == -potential[2] < 0.0
     assert taken[2] == potential[2] > 0.0
+    assert objectives.utility_objective(split, low)[1] == missed[1] == 0.0
 
-    clinician_actions = high
+    # Full clinician-conditioned action table at one informative logged draw
+    # and one logged no-draw hour.
+    informative_hour = 2
+    no_draw_hour = 3
+    matched_draw = objectives.utility_objective(split, high)
+    missed_draw = objectives.utility_objective(split, never)
+    extra_draw = objectives.utility_objective(split, repeated)
+    matched_no_draw = objectives.utility_objective(split, never)
+    assert matched_draw[informative_hour] == potential[informative_hour]
+    assert missed_draw[informative_hour] == -potential[informative_hour]
+    assert matched_no_draw[no_draw_hour] == 0.0
+    assert extra_draw[no_draw_hour] == 0.0
+    assert objectives.burden_objective(split, repeated)[no_draw_hour] > 0.0
+
+    clinician_actions = clinician
     clinician_utility = objectives.utility_objective(split, clinician_actions)
     clinician_burden = objectives.burden_objective(split, clinician_actions)
     clinician_raw = np.stack([clinician_utility, clinician_burden], axis=1)
@@ -99,8 +117,8 @@ def main():
             split, clinician_actions, pref, norm_meta)
         assert np.allclose(stored, replayed), pref
 
-    print("PASS: information utility is action-gated, low-information draws "
-          "earn no utility, and every draw incurs burden")
+    print("PASS: informative draws earn +u, missed opportunities receive -u, "
+          "zero-potential draws earn no utility, and every draw incurs burden")
 
 
 if __name__ == "__main__":

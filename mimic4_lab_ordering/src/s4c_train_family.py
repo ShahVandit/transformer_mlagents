@@ -62,11 +62,11 @@ def validate_joint_artifacts(meta, *splits):
         raise SystemExit("joint MDP uses the old reward scaling; rerun stage 3b")
     if meta.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
         raise SystemExit("joint MDP uses the old reward objectives; rerun stage 3b")
-    if meta.get("utility_definition") != "max_thresholded_expected_information":
+    if meta.get("utility_definition") != "clinician_conditioned_signed_realized_information":
         raise SystemExit("joint MDP has no information-utility contract; rerun stage 3b")
     for split in splits:
-        if "utility_potential" not in split:
-            raise SystemExit("joint MDP has no utility_potential; rerun stage 3b")
+        if "realized_utility" not in split:
+            raise SystemExit("joint MDP has no realized_utility; rerun stage 3b")
         if len(split["action"]) and int(np.max(split["action"])) >= N_ACTIONS:
             raise SystemExit("joint MDP contains stale panel actions; rerun stage 3b")
 
@@ -228,6 +228,8 @@ def summarize_policy_with_pref(algo, split, pref, norm_meta, baselines=None):
         "draws_per_patient_day": float(any_draw.sum() / max(1e-6, len(actions) / 24.0)),
         "clin_draws_per_patient_day": float(clinician_draw.sum() / max(1e-6, len(actions) / 24.0)),
         "utility_per_draw": float(utility[any_draw].mean() if any_draw.any() else 0.0),
+        "missed_utility_per_no_draw": float(
+            -utility[~any_draw].mean() if (~any_draw).any() else 0.0),
         "clin_utility_per_draw": float(
             clinician_utility[clinician_draw].mean() if clinician_draw.any() else 0.0),
         "event_coverage": objectives.event_coverage(split, actions),
@@ -247,6 +249,7 @@ def make_epoch_callback(pref, val, norm_meta, rows, baselines):
             f"(clin {s['clin_draws_per_patient_day']:.2f})  "
             f"utility/draw={s['utility_per_draw']:.3f} "
             f"(clin {s['clin_utility_per_draw']:.3f})  "
+            f"missed/no-draw={s['missed_utility_per_no_draw']:.3f}  "
             f"coverage={s['event_coverage']:.3f}  "
             f"rew={s['ep_rew_mean']:+.2f} "
             f"(clin {s['clin_ep_rew_mean']:+.2f}, "
