@@ -249,47 +249,28 @@ def test_batch_slicing():
 
 
 def test_joint_panels():
-    print("\njoint panel encoding (Pareto track)")
+    print("\njoint draw encoding (Pareto track)")
     import panels
     import objectives
     import pandas as pd
 
-    for i in range(16):
-        bits = np.array([int(c) for c in format(i, "04b")], dtype=np.int8)
-        a = int(panels.encode_bits(bits[None, :])[0])
-        if bits.sum() > 0 and a == 0:
-            check(f"combination {format(i,'04b')} is not collapsed to `none`", False)
-            break
-    else:
-        check("no real draw is ever encoded as the empty panel", True)
-
+    all_combinations = np.array([
+        [int(c) for c in format(i, "04b")] for i in range(16)
+    ], dtype=np.int8)
+    encoded = panels.encode_bits(all_combinations)
     check("the empty combination maps to `none`",
-          int(panels.encode_bits(np.zeros((1, 4), np.int8))[0]) == 0)
-    check("creatinine alone maps to the panel it rides on",
-          panels.PANEL_BITS[int(panels.encode_bits(
-              np.array([[1, 0, 0, 0]], np.int8))[0])] == "1100")
-
-    # every retained panel round-trips
-    ok = all(int(panels.encode_bits(panels.PANEL_ARRAY[i][None, :])[0]) == i
-             for i in range(len(panels.PANEL_BITS)))
-    check("every retained panel encodes to its own id", ok)
-
-    # rare combinations land within Hamming distance 2
-    worst = 0
-    for i in range(16):
-        bits = np.array([int(c) for c in format(i, "04b")], dtype=np.int8)
-        a = int(panels.encode_bits(bits[None, :])[0])
-        worst = max(worst, int(np.abs(panels.PANEL_ARRAY[a] - bits).sum()))
-    check("every combination maps within Hamming distance 2", worst <= 2, str(worst))
+          int(encoded[0]) == 0)
+    check("every non-empty lab combination maps to one blood draw",
+          bool((encoded[1:] == 1).all()))
 
     # burden: zero for no draw, larger for a repeat than for a stale draw.
     # Deltas are derived from stay_id/hour, not read from delta_* columns.
     n = 30
     d1 = {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}
     a1 = np.zeros(n, dtype=int)
-    a1[0] = 4          # creatinine+bun, first ever
-    a1[1] = 4          # repeated one hour later
-    a1[25] = 4         # repeated a day later
+    a1[0] = 1          # first blood draw
+    a1[1] = 1          # repeated one hour later
+    a1[25] = 1         # repeated a day later
     bb = objectives.burden_objective(d1, a1)
     check("burden is 0 for the empty panel", float(bb[5]) == 0.0)
     check("burden penalises a repeat draw more than a stale one", bb[1] > bb[25])
@@ -303,7 +284,7 @@ def test_joint_panels():
         n = h0 + 2
         d2 = {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}
         a2 = np.zeros(n, dtype=int)
-        a2[h0] = 1                                   # creatinine+bun+wbc
+        a2[h0] = 1                                   # first blood draw
         got = float(objectives.burden_objective(d2, a2)[h0])
         if abs(got - 1.0) > 1e-6:
             check(f"a first-ever draw at hour {h0} costs exactly the base 1.0",
@@ -330,7 +311,7 @@ def test_joint_panels():
     check("a new stay starts with a clean redundancy clock",
           abs(float(b4[2]) - 1.0) < 1e-6)
 
-    # detection: +1 only on a draw before an event, -1 only on an uncovered miss
+    # Detection is event-level: each event contributes exactly +1 or -1.
     n = 30
     d = pd.DataFrame({
         "stay_id": np.zeros(n, dtype=int),
@@ -345,45 +326,62 @@ def test_joint_panels():
     check("a draw inside the window before an event scores +1", r[15] == 1.0)
     check("the event hour itself is flagged", ev[20] == 1)
     check("hours with no upcoming event score 0", r[0] == 0.0)
-    # hour 10: the event at 20 is inside the (10, 22] window, and the draw at 15
-    # has not happened yet, so nothing covers it
-    check("an uncovered hour before an event is penalised", r[10] == -1.0)
-    # hour 19: also inside the window, but the draw at 15 is recent, so no penalty
-    check("a recent draw suppresses the miss penalty", r[19] == 0.0)
-    check("an hour covered by a recent draw is not penalised", r[16] == 0.0)
+    check("a covered event produces no miss penalty", float(r[r < 0].sum()) == 0.0)
+    check("one covered event contributes exactly +1", float(r.sum()) == 1.0)
 
-    # One credit per event. Before the gate on the positive branch, +1 fired on
-    # EVERY hour with an event in the lookahead window, so a policy drawing every
-    # hour collected +1 on ~32% of all hours and one event could pay out twelve
-    # times. That is what drove policies to ~10 draws/day.
+    # Extra draws cannot claim the same event more than once. The latest eligible
+    # draw gets the credit; all others only incur burden.
     acts2 = np.zeros(n, dtype=int)
     acts2[15] = 1
     acts2[16] = 1                       # second draw inside the same window
     acts2[17] = 1
     r2, _, _ = objectives.detection_objective(d, acts2, lookahead=12)
-    check("the first draw in a window claims the event", r2[15] == 1.0)
+    check("the latest eligible draw claims the event", r2[17] == 1.0)
+    check("an earlier draw in the same window earns nothing", r2[15] == 0.0)
     check("a second draw in the same window earns nothing", r2[16] == 0.0)
-    check("a third draw in the same window earns nothing", r2[17] == 0.0)
+    check("three draws still earn only one detection credit", float(r2.sum()) == 1.0)
 
-    # The credit is capped at one per event, but the PENALTY accrues for every
-    # hour spent uncovered while an event is approaching. That asymmetry is
-    # deliberate: being blind for seven hours before a deterioration is worse
-    # than being blind for one. Its consequence is that detection alone is
-    # maximised by always drawing, which is exactly why burden has to be the
-    # counterweight. Before the cap, always-draw also accumulated unbounded
-    # POSITIVE credit, so detection rose without limit as the policy drew more.
     all_draw = np.ones(n, dtype=int)
     r_all, _, _ = objectives.detection_objective(d, all_draw, lookahead=12)
     r_one, _, _ = objectives.detection_objective(d, acts, lookahead=12)
     r_none, _, _ = objectives.detection_objective(d, np.zeros(n, dtype=int),
                                                   lookahead=12)
-    check("always-draw maximises detection (burden is the counterweight)",
-          float(r_all.sum()) >= float(r_one.sum()) >= float(r_none.sum()),
+    check("one timely draw and always-draw have equal detection credit",
+          float(r_all.sum()) == float(r_one.sum()) == 1.0,
           f"all={r_all.sum():.1f} one={r_one.sum():.1f} none={r_none.sum():.1f}")
-    check("total positive credit never exceeds the number of events",
-          float(r_all[r_all > 0].sum()) <= float(np.asarray(ev).sum()) + 1e-6)
-    check("an uncovered stretch is penalised once per hour of exposure",
-          float(r_none.sum()) < -1.0)
+    check("one missed event contributes exactly -1", float(r_none.sum()) == -1.0)
+    check("positive and negative outcomes have equal magnitude",
+          float(r_all.sum()) == -float(r_none.sum()))
+
+    # A draw after the event cannot retroactively cover it and adds burden only.
+    late = np.zeros(n, dtype=int)
+    late[21] = 1
+    r_late, _, _ = objectives.detection_objective(d, late, lookahead=12)
+    b_late = objectives.burden_objective(
+        {"stay_id": np.zeros(n, dtype=int), "hour": np.arange(n, dtype=float)}, late)
+    check("a late draw does not cover the event", float(r_late.sum()) == -1.0)
+    check("a late unnecessary draw still has positive burden", float(b_late.sum()) > 0.0)
+
+    # Events at admission are not penalised because no prior policy decision
+    # could possibly have covered them.
+    d_head = d.copy()
+    d_head.loc[:, "onset_vasopressor"] = 0
+    d_head.loc[0, "onset_vasopressor"] = 1
+    r_head, _, _ = objectives.detection_objective(
+        d_head, np.zeros(n, dtype=int), lookahead=12)
+    check("an event at the first hour is not an impossible penalty",
+          float(r_head.sum()) == 0.0)
+
+    # Scale-only normalization leaves neutral transitions at zero and preserves
+    # symmetry between one covered and one missed event.
+    train_r = np.array([[1.0, 1.0], [-1.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+    normed, norm_meta = objectives.normalize_rewards(train_r, train_r)
+    check("normalization keeps neutral rewards at exactly zero",
+          bool(np.array_equal(normed[0][2], np.zeros(2, dtype=np.float32))))
+    check("normalization preserves symmetric detection magnitude",
+          abs(float(normed[0][0, 0])) == abs(float(normed[0][1, 0])))
+    check("normalization records scale-only semantics",
+          norm_meta.get("normalization") == "scale_only")
 
 
 def test_sofa():

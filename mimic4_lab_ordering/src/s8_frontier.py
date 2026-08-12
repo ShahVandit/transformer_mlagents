@@ -485,6 +485,8 @@ def main():
     test = load_split("test")
     norm_meta = json.loads(
         (cfg.RL_DIR / "joint_meta.json").read_text())["reward_normalization"]
+    meta = json.loads((cfg.RL_DIR / "joint_meta.json").read_text())
+    tf.validate_joint_artifacts(meta, train, val, test)
 
     if args.prefs:
         flat = list(args.prefs)

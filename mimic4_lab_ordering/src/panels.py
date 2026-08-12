@@ -18,28 +18,9 @@ def bits_from_frame(df):
 
 
 def encode_bits(bits):
-    """Map every four-lab order combination to one of the retained panels.
-
-    A combination with any lab set can never map to the empty panel. Ties on
-    Hamming distance are otherwise broken by index order, and `none` is index 0,
-    so creatinine-alone and bun-alone (both distance 1 from `0000` and from
-    `1100`) would silently become no-draw. That relabels a real blood draw as no
-    draw, zeroes its burden, and teaches the behaviour policy the wrong action.
-    329 rows in train, small but wrong in the one direction that matters.
-    """
+    """Encode any non-empty lab combination as one blood draw."""
     bits = np.asarray(bits, dtype=np.int8)
-    out = np.empty(len(bits), dtype=np.int64)
-    drew = PANEL_ARRAY.sum(axis=1) > 0
-    for i, row in enumerate(bits):
-        key = "".join(str(int(x)) for x in row)
-        if key in BITS_TO_ACTION:
-            out[i] = BITS_TO_ACTION[key]
-            continue
-        dist = np.abs(PANEL_ARRAY - row[None, :]).sum(axis=1).astype(float)
-        if row.sum() > 0:
-            dist[~drew] = np.inf          # never collapse a draw into `none`
-        out[i] = int(np.argmin(dist))
-    return out
+    return (bits.sum(axis=1) > 0).astype(np.int64)
 
 
 def encode_frame(df):
@@ -51,7 +32,9 @@ def action_bits(actions):
 
 
 def panel_n_labs(actions):
-    return action_bits(actions).sum(axis=1).astype(np.int16)
+    # Retained for file compatibility; in the binary track this is the number
+    # of physical draws (zero or one), not the number of ordered analytes.
+    return (np.asarray(actions) != 0).astype(np.int16)
 
 
 def panel_names_for(actions):

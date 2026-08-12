@@ -109,18 +109,15 @@ TREAT_LOOKAHEAD_BINS = 1     # Eq. 4: intervention started at s_{t+1}
 # Set at run time to the median prediction error over labs ordered in TRAIN.
 REWARD_DIMS = ["r_sofa", "r_treat", "r_info", "neg_r_cost"]
 
-# ------------------------------------------------ joint-panel Pareto track ----
-JOINT_PANEL_BITS = ["0000", "1110", "0001", "1111", "1100", "0010", "1101", "0011"]
-JOINT_PANEL_NAMES = [
-    "none",
-    "creatinine+bun+wbc",
-    "lactate",
-    "all_four",
-    "creatinine+bun",
-    "wbc",
-    "creatinine+bun+lactate",
-    "wbc+lactate",
-]
+# ----------------------------------------------- joint draw-timing Pareto track ----
+# These objectives can identify WHEN a blood draw is useful, but they do not
+# identify WHICH panel is appropriate for a particular deterioration. Giving
+# all non-empty panels identical detection credit makes the smallest panel
+# dominate by construction. Keep the action aligned with the supported causal
+# question: no draw versus one blood draw. The four lab histories remain in the
+# state; panel selection is outside this policy.
+JOINT_PANEL_BITS = ["0000", "1111"]
+JOINT_PANEL_NAMES = ["none", "blood_draw"]
 JOINT_REWARD_DIMS = ["detection", "burden"]
 JOINT_DETECTION_LOOKAHEAD_HOURS = 12
 # Preference weights on the simplex: (w_detection, w_burden), summing to 1.

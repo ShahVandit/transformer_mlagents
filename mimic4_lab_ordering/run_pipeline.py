@@ -77,6 +77,15 @@ def main():
                     help="smoke test: 200 ICU stays, WBC only, short FQI")
     ap.add_argument("--reuse-cache", action="store_true",
                     help="stage 1: reuse cached parquet scans and rebuild splits/cohort")
+    ap.add_argument("--prefs", nargs="+", type=float, default=None,
+                    help="joint track: flat w_detection w_burden pairs, "
+                         "e.g. 0.9 0.1 0.5 0.5 (default: config.JOINT_PREFERENCES)")
+    ap.add_argument("--ope", choices=["all", "wis"], default="all",
+                    help="joint track stage 8: all = FQE/WIS/WDR, "
+                         "wis = skip FQE/WDR for a fast pass")
+    ap.add_argument("--device", default=None,
+                    help="joint track stages 4/8: cpu, cuda:0, etc. "
+                         "(default: each script's own default)")
     args = ap.parse_args()
 
     start, end = (args.only, args.only) if args.only else (args.start, args.end)
@@ -95,14 +104,22 @@ def main():
             base += ["--learner", args.learner]
         if args.quick and num == 1:
             base += ["--limit-icustays", "200"]
+        if args.track == "joint" and args.prefs and num in (4, 8):
+            base += ["--prefs"] + [str(x) for x in args.prefs]
+        if args.track == "joint" and num == 8:
+            base += ["--ope", args.ope]
+        if args.track == "joint" and args.device and num in (4, 8):
+            base += ["--device", args.device]
         if args.quick and num == 4:
             if args.track == "joint":
-                base += ["--steps", "2000", "--lambdas", "0.1", "0.9"]
+                base += ["--steps", "2000"]
+                if not args.prefs:
+                    base += ["--prefs", "0.1", "0.9", "0.9", "0.1"]
             else:
                 base += (["--steps", "2000"] if args.learner == "cql"
                          else ["--iterations", "10"])
-        if args.quick and args.track == "joint" and num == 8:
-            base += ["--lambdas", "0.1", "0.9"]
+        if args.quick and args.track == "joint" and num == 8 and not args.prefs:
+            base += ["--prefs", "0.1", "0.9", "0.9", "0.1"]
         if args.track == "perlab" and num == 7:
             base += ["--labs"] + labs
 

@@ -53,6 +53,18 @@ def pref_slug(pref):
     return "w" + "_".join(str(round(float(x), 3)).replace(".", "p") for x in pref)
 
 
+def validate_joint_artifacts(meta, *splits):
+    """Refuse stale MDP files after a reward/action contract change."""
+    if meta.get("panel_bits") != cfg.JOINT_PANEL_BITS:
+        raise SystemExit("joint MDP uses the old action mapping; rerun stage 3b")
+    norm = meta.get("reward_normalization", {})
+    if norm.get("normalization") != "scale_only":
+        raise SystemExit("joint MDP uses the old centered rewards; rerun stage 3b")
+    for split in splits:
+        if len(split["action"]) and int(np.max(split["action"])) >= N_ACTIONS:
+            raise SystemExit("joint MDP contains stale panel actions; rerun stage 3b")
+
+
 def scalar_reward(split, pref):
     """w_detection * z_detection - w_burden * z_burden.
 
@@ -271,6 +283,7 @@ def main():
     norm_meta = meta["reward_normalization"]
     train = load_split("train")
     val = load_split("val")
+    validate_joint_artifacts(meta, train, val)
 
     if args.prefs:
         flat = list(args.prefs)
