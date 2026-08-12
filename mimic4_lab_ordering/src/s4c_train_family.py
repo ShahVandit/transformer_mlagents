@@ -89,36 +89,38 @@ def summarize_policy(algo, split):
 def summarize_policy_with_lambda(algo, split, lam):
     actions = algo.predict(split["state"].astype(np.float32)).astype(np.int64)
     any_draw = actions != 0
-    days = max(1e-6, len(actions) / 24.0)
     det = objectives.detection_objective(split, actions)[0]
     bur = objectives.burden_objective(split, actions)
     scalar = det - float(lam) * bur
 
     stay = split["stay_id"]
-    det_stay = []
-    bur_stay = []
     scalar_stay = []
     start = 0
     for i in range(1, len(stay) + 1):
         if i == len(stay) or stay[i] != stay[start]:
-            det_stay.append(float(det[start:i].sum()))
-            bur_stay.append(float(bur[start:i].sum()))
             scalar_stay.append(float(scalar[start:i].sum()))
             start = i
 
+    event = split["event"].astype(bool)
+    covered = np.zeros(len(event), dtype=bool)
+    start = 0
+    lookback = cfg.JOINT_DETECTION_LOOKAHEAD_HOURS
+    for i in range(1, len(event) + 1):
+        if i == len(event) or stay[i] != stay[start]:
+            d = any_draw[start:i].astype(np.int8)
+            c = np.r_[0, np.cumsum(d)]
+            local = np.zeros(i - start, dtype=bool)
+            for j in np.flatnonzero(event[start:i]):
+                lo = max(0, j - lookback)
+                local[j] = (c[j] - c[lo]) > 0
+            covered[start:i] = local
+            start = i
+
     return {
-        "draw_rate": float(any_draw.mean()),
-        "draws_per_patient_day": float(any_draw.sum() / days),
-        "replay_detection_sum": float(det.sum()),
-        "replay_burden_sum": float(bur.sum()),
-        "replay_scalar_sum": float(scalar.sum()),
-        "replay_detection_mean": float(det.mean()),
-        "replay_burden_mean": float(bur.mean()),
-        "replay_scalar_mean": float(scalar.mean()),
-        "replay_detection_stay_mean": float(np.mean(det_stay)),
-        "replay_burden_stay_mean": float(np.mean(bur_stay)),
-        "replay_scalar_stay_mean": float(np.mean(scalar_stay)),
-        "replay_scalar_stay_median": float(np.median(scalar_stay)),
+        "ep_rew_mean": float(np.mean(scalar_stay)),
+        "ep_rew_std": float(np.std(scalar_stay)),
+        "draws_per_patient_day": float(any_draw.sum() / max(1e-6, len(actions) / 24.0)),
+        "event_coverage": float(covered[event].mean() if event.any() else 0.0),
         "action_counts": {str(i): int((actions == i).sum()) for i in range(N_ACTIONS)},
     }
 
@@ -130,12 +132,10 @@ def make_epoch_callback(lam, val, rows):
         rows.append(rec)
         print(
             f"  val epoch={epoch} step={total_step} "
+            f"ep_rew_mean={s['ep_rew_mean']:+.2f} "
+            f"ep_rew_std={s['ep_rew_std']:.2f} "
             f"draws/day={s['draws_per_patient_day']:.3f} "
-            f"draw_rate={s['draw_rate']:.4f} "
-            f"det/stay={s['replay_detection_stay_mean']:+.2f} "
-            f"burden/stay={s['replay_burden_stay_mean']:+.2f} "
-            f"scalar/stay={s['replay_scalar_stay_mean']:+.2f} "
-            f"scalar_med={s['replay_scalar_stay_median']:+.2f}",
+            f"coverage={s['event_coverage']:.3f}",
             flush=True,
         )
     return _callback
