@@ -1,5 +1,5 @@
 """
-Stage 8: evaluate the joint CQL policy family and build the Pareto frontier.
+Stage 8: evaluate a joint policy family and build the Pareto frontier.
 
 Uses d3rlpy for policy loading and FQE; WIS/WDR remain custom.
 
@@ -12,6 +12,7 @@ Outputs:
 """
 import argparse
 import json
+import pickle
 import re
 import sys
 from pathlib import Path
@@ -23,11 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "d3rlpy"))
 
 import config as cfg
-import d3rlpy
-from d3rlpy.constants import ActionSpace
-from d3rlpy.dataset import MDPDataset
-from d3rlpy.ope import DiscreteFQE, FQEConfig
-from d3rlpy.preprocessing import StandardObservationScaler
 import objectives
 import s5_evaluate_ope as ope
 import s4c_train_family as tf
@@ -45,14 +41,21 @@ def load_split(split):
     return {k: d[k] for k in d.files}
 
 
-def load_policy(pref, tag="", device="cpu"):
-    p = cfg.MODELS_DIR / f"joint_cql_{pref_slug(pref)}{clean_tag(tag)}.d3"
+def load_policy(pref, tag="", device="cpu", family="cql"):
+    suffix = ".pkl" if family == "direct" else ".d3"
+    p = cfg.MODELS_DIR / f"joint_{family}_{pref_slug(pref)}{clean_tag(tag)}{suffix}"
     if not p.exists():
-        raise SystemExit(f"{p} not found; run stage 4c first")
+        raise SystemExit(f"{p} not found; run stage 4 first")
+    if family == "direct":
+        with p.open("rb") as f:
+            return pickle.load(f)
+    import d3rlpy
     return d3rlpy.load_learnable(str(p), device=device)
 
 
 def make_dataset(split, reward):
+    from d3rlpy.constants import ActionSpace
+    from d3rlpy.dataset import MDPDataset
     return MDPDataset(
         observations=split["state"].astype(np.float32),
         actions=split["action"].astype(np.int64),
@@ -104,19 +107,21 @@ def policy_beats_trivial(split, actions, pref, norm_meta, cache=None):
     return bool(mine > max(base.values()) + cfg.VALIDITY_MARGIN)
 
 
-def validity_from_sidecar(pref, tag, val, norm_meta, cache):
+def validity_from_sidecar(pref, tag, val, norm_meta, cache, family="cql"):
     """Read stage 4c's val verdict; recompute on val only if it is missing."""
     meta_path = (cfg.MODELS_DIR /
-                 f"joint_cql_{pref_slug(pref)}{clean_tag(tag)}.json")
+                 f"joint_{family}_{pref_slug(pref)}{clean_tag(tag)}.json")
     if meta_path.exists():
         payload = json.loads(meta_path.read_text())
-        if payload.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
+        if family == "cql" and payload.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
             raise SystemExit(
                 f"{meta_path} was trained on the old reward; rerun stage 4c")
         verdict = payload.get("beats_trivial")
         if verdict is not None:
-            return bool(verdict), "stage4c_val"
-    policy = load_policy(pref, tag=tag, device="cpu")
+            return bool(verdict), f"stage4_{family}_val"
+    if family == "direct":
+        raise SystemExit(f"{meta_path} missing direct-policy validity verdict")
+    policy = load_policy(pref, tag=tag, device="cpu", family=family)
     acts = policy.predict(val["state"].astype(np.float32)).astype(np.int64)
     return policy_beats_trivial(val, acts, pref, norm_meta, cache), "recomputed_val"
 
@@ -132,24 +137,13 @@ def fqe_calibration_check(train, test, beh, pi_b_test, trajs, subj_of_traj,
     print("\n[FQE calibration check: pi_e := pi_b]")
     out = {}
 
-    class _BehaviourPolicy:
-        """Minimal shim so DiscreteFQE can treat pi_b as the target policy."""
-
-        def __init__(self, clf):
-            self.clf = clf
-
-        def predict(self, states):
-            return self.clf.predict(np.asarray(states)).astype(np.int64)
-
     for dim, name in enumerate(cfg.JOINT_REWARD_DIMS):
         try:
-            fqe = train_fqe(
-                make_dataset(train, train["reward"][:, dim]),
-                _BehaviourPolicy(beh),
-                n_steps=max(cfg.FQE_MIN_STEPS, len(train["action"]) // 8),
-                device=device, gamma=cfg.GAMMA,
-            )
-            qv = fqe_q_values(fqe, test["state"])[:, :, None]
+            train_dim = dict(train)
+            train_dim["reward"] = train["reward"][:, [dim]]
+            pi_b_next = ope.behavior_probs(beh, train["next_state"])
+            fqe = ope.train_fqe(train_dim, pi_b_next, gamma=cfg.GAMMA)
+            qv = ope.q_values(fqe, test["state"])
             v0 = ope.fqe_initial_values(qv, pi_b_test, trajs)
             est = float(np.mean(v0[:, 0]))
         except Exception as exc:                       # noqa: BLE001
@@ -240,6 +234,8 @@ def fqe_q_values(fqe, states):
 
 
 def train_fqe(train_dataset, policy, n_steps, device="cpu", gamma=cfg.GAMMA):
+    from d3rlpy.ope import DiscreteFQE, FQEConfig
+    from d3rlpy.preprocessing import StandardObservationScaler
     cfg_fqe = FQEConfig(
         learning_rate=cfg.FQE_LR,
         batch_size=cfg.FQE_BATCH,
@@ -263,7 +259,8 @@ def train_fqe(train_dataset, policy, n_steps, device="cpu", gamma=cfg.GAMMA):
 
 
 def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_traj,
-                    epsilon, reward_dim, device="cpu", ope_mode="all"):
+                    epsilon, reward_dim, device="cpu", ope_mode="all",
+                    family="cql"):
     policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
     pi_e_test = epsilon_greedy_probs(policy_actions, epsilon)
 
@@ -297,15 +294,24 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
 
     estimators = [("factual", clin_est), ("wis", wis_est)]
     if ope_mode != "wis":
-        fqe = train_fqe(
-            make_dataset(train, train["reward"][:, reward_dim]),
-            policy,
-            n_steps=max(cfg.FQE_MIN_STEPS, len(train["action"]) // 8),
-            device=device,
-            gamma=cfg.GAMMA,
-        )
-        qv_test = fqe_q_values(fqe, test["state"])
-        qv_test_3d = qv_test[:, :, None]
+        if family == "direct":
+            pi_e_train = epsilon_greedy_probs(
+                policy.predict(train["next_state"].astype(np.float32)).astype(int),
+                epsilon)
+            train_dim = dict(train)
+            train_dim["reward"] = train["reward"][:, [reward_dim]]
+            fqe = ope.train_fqe(train_dim, pi_e_train, gamma=cfg.GAMMA)
+            qv_test_3d = ope.q_values(fqe, test["state"])
+        else:
+            fqe = train_fqe(
+                make_dataset(train, train["reward"][:, reward_dim]),
+                policy,
+                n_steps=max(cfg.FQE_MIN_STEPS, len(train["action"]) // 8),
+                device=device,
+                gamma=cfg.GAMMA,
+            )
+            qv_test = fqe_q_values(fqe, test["state"])
+            qv_test_3d = qv_test[:, :, None]
         fqe_v0 = ope.fqe_initial_values(qv_test_3d, pi_e_test, trajs)
 
         def fqe_est(sample):
@@ -333,7 +339,7 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
     return row
 
 
-def maybe_plot(df):
+def maybe_plot(df, family="cql"):
     try:
         import matplotlib.pyplot as plt
     except Exception as exc:
@@ -370,29 +376,31 @@ def maybe_plot(df):
         yerr = [pol[utility_col] - pol[utility_lo_col],
                 pol[utility_hi_col] - pol[utility_col]]
     ax.errorbar(pol[bur_col], pol[utility_col], xerr=xerr, yerr=yerr,
-                fmt="o", label=f"CQL policies ({label})")
+                fmt="o", label=f"{family.upper()} policies ({label})")
     ax.scatter([clin[bur_col]], [clin[utility_col]],
                marker="x", s=80, label="clinician")
     ax.set_xlabel("Burden return, lower is better")
     ax.set_ylabel("Information utility return, higher is better")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(cfg.REPORTS_DIR / "joint_frontier_ope.png", dpi=160)
+    prefix_name = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
+    fig.savefig(cfg.REPORTS_DIR / f"{prefix_name}_ope.png", dpi=160)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(pol["draws_per_patient_day"], pol["event_coverage_replay"], label="CQL policies")
+    ax.scatter(pol["draws_per_patient_day"], pol["event_coverage_replay"],
+               label=f"{family.upper()} policies")
     ax.scatter([clin["draws_per_patient_day"]], [clin["event_coverage_replay"]],
                marker="x", s=80, label="clinician")
     ax.set_xlabel("Draws per patient-day")
     ax.set_ylabel("Replay event coverage")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(cfg.REPORTS_DIR / "joint_frontier_replay.png", dpi=160)
+    fig.savefig(cfg.REPORTS_DIR / f"{prefix_name}_replay.png", dpi=160)
     plt.close(fig)
 
 
-def write_report(df, metrics=None):
+def write_report(df, metrics=None, family="cql"):
     utility_col = "wdr_utility" if "wdr_utility" in df.columns else "wis_utility"
     bur_col = "wdr_burden" if "wdr_burden" in df.columns else "wis_burden"
     label = "WDR" if utility_col.startswith("wdr") else "WIS"
@@ -400,7 +408,7 @@ def write_report(df, metrics=None):
             "event_coverage_replay", utility_col, bur_col, "ess_final",
             "beats_trivial", "non_dominated"]
     cols = [c for c in cols if c in df.columns]
-    L = ["# Joint-panel Pareto frontier\n\n",
+    L = [f"# Joint-panel Pareto frontier ({family})\n\n",
          "Information utility is better higher. Burden is better lower. "
          "Non-dominated means no other learned policy has both higher utility "
          f"and lower burden under {label} point estimates.\n\n",
@@ -450,7 +458,8 @@ def write_report(df, metrics=None):
              f"which reads as the policies beating the clinician 15-fold on "
              f"both objectives when their per-step values are in fact "
              f"comparable.\n")
-    out = cfg.REPORTS_DIR / "joint_frontier.md"
+    stem = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
+    out = cfg.REPORTS_DIR / f"{stem}.md"
     out.write_text("".join(L), encoding="utf-8")
     print(f"wrote report -> {out}")
 
@@ -465,10 +474,13 @@ def main():
                     help="all = FQE/WIS/WDR; wis = skip FQE/WDR for fast check")
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--family", choices=["cql", "direct"], default="cql")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
-    d3rlpy.seed(cfg.SEED)
+    if args.family == "cql":
+        import d3rlpy
+        d3rlpy.seed(cfg.SEED)
     train = load_split("train")
     val = load_split("val")
     test = load_split("test")
@@ -548,8 +560,9 @@ def main():
 
     for pref in prefs:
         print(f"\n[w_utility={pref[0]}, w_bur={pref[1]}]")
-        policy = load_policy(pref, tag=args.tag, device=args.device)
-        row = {"policy": f"cql_{pref_slug(pref)}{clean_tag(args.tag)}",
+        policy = load_policy(pref, tag=args.tag, device=args.device,
+                             family=args.family)
+        row = {"policy": f"{args.family}_{pref_slug(pref)}{clean_tag(args.tag)}",
                "w_utility": float(pref[0]), "w_burden": float(pref[1])}
         policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
         draw = policy_actions != 0
@@ -564,7 +577,7 @@ def main():
         # selection test data must never make. Stage 4c already evaluated it on
         # val and stored the verdict beside the model.
         row["beats_trivial"], row["gate_source"] = validity_from_sidecar(
-            pref, args.tag, val, norm_meta, base_cache)
+            pref, args.tag, val, norm_meta, base_cache, family=args.family)
         if not row["beats_trivial"]:
             print("  WARNING: below the best constant policy on val; "
                   "excluded from the frontier")
@@ -573,7 +586,7 @@ def main():
             est = evaluate_policy(
                 row["policy"], policy, train, test, beh, pi_b_test, trajs,
                 subj_of_traj, args.epsilon, reward_dim, device=args.device,
-                ope_mode=args.ope
+                ope_mode=args.ope, family=args.family
             )
             for k, v in est.items():
                 if k not in row:
@@ -615,15 +628,18 @@ def main():
     metrics["fqe_calibration"] = calibration
     metrics["gamma"] = cfg.GAMMA
     metrics["estimator_used_for_frontier"] = utility_col.split("_")[0]
+    metrics["family"] = args.family
 
-    csv_out = cfg.REPORTS_DIR / "joint_frontier.csv"
-    json_out = cfg.REPORTS_DIR / "joint_frontier.json"
+    stem = ("joint_frontier" if args.family == "cql"
+            else f"joint_{args.family}_frontier")
+    csv_out = cfg.REPORTS_DIR / f"{stem}.csv"
+    json_out = cfg.REPORTS_DIR / f"{stem}.json"
     df.to_csv(csv_out, index=False)
     json_out.write_text(json.dumps(
         {"metrics": metrics, "rows": json.loads(df.to_json(orient="records"))},
         indent=2), encoding="utf-8")
-    write_report(df, metrics)
-    maybe_plot(df)
+    write_report(df, metrics, family=args.family)
+    maybe_plot(df, family=args.family)
     print(f"wrote -> {csv_out}")
     print(f"wrote -> {json_out}")
 

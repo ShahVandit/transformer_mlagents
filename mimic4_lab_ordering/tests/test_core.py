@@ -9,6 +9,7 @@ the forecaster must not see the future, the split must not share a patient, and
 the state must not contain the result of the order being decided.
 """
 import json
+import pickle
 import warnings
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import config as cfg          # noqa: E402
+import direct_policy as direct  # noqa: E402
 import forecast as fc         # noqa: E402
 import mofqi                  # noqa: E402
 import s3_build_mdp as mdp    # noqa: E402
@@ -319,7 +321,7 @@ def test_joint_panels():
         d[f"mean_{lab}"] = np.array([0, 1, 4, 1, 0], dtype=float)
         d[f"last_{lab}"] = np.zeros(n)
         d[f"std_{lab}"] = np.ones(n)
-        d[f"obs_{lab}"] = np.array([np.nan, 1, 4, np.nan, np.nan])
+        d[f"obs_{lab}"] = np.array([0, 2, 8, np.nan, np.nan])
     thresholds = objectives.fit_utility_thresholds(d)
     potential = objectives.realized_information(d, thresholds)
     check("training thresholds are medians of clinician-ordered scores",
@@ -351,6 +353,59 @@ def test_joint_panels():
           bool(np.array_equal(normed[0][0], np.zeros(2, dtype=np.float32))))
     check("normalization records per-stay range semantics",
           norm_meta.get("normalization") == "per_stay_extreme_range")
+
+
+def test_direct_policy():
+    print("\ndirect constrained policy")
+    state_cols = mdp.state_columns()
+    n = 6
+    state = np.zeros((n, len(state_cols)), dtype=np.float32)
+    thresholds = {lab: 0.5 for lab in __import__("itemids").TARGET_LABS}
+    for lab in __import__("itemids").TARGET_LABS:
+        state[:, state_cols.index(f"mean_{lab}")] = np.arange(n)
+        state[:, state_cols.index(f"last_{lab}")] = 0.0
+        state[:, state_cols.index(f"std_{lab}")] = 1.0
+        state[:, state_cols.index(f"delta_{lab}")] = np.arange(n) + 1.0
+
+    info = direct.information_utility(state, state_cols, thresholds)
+    burden = direct.draw_burden(state, state_cols)
+    check("direct information is non-negative", bool((info >= 0).all()))
+    check("direct burden includes the base draw cost", bool((burden >= 1).all()))
+    scales = direct.fit_utility_scales(
+        state, np.array([0, 0, 0, 1, 1, 1]), state_cols, thresholds)
+    g_info = direct.draw_utility(
+        state, state_cols, thresholds, scales, (0.9, 0.1))
+    g_burden = direct.draw_utility(
+        state, state_cols, thresholds, scales, (0.1, 0.9))
+    check("burden-dominant utility can make a draw negative",
+          bool((g_burden < 0).any()))
+    check("information weight raises high-surprise draw value",
+          float(g_info[-1]) > float(g_info[0]))
+
+    policy_p = np.array([0.0, 0.25, 0.75, 1.0], dtype=np.float32)
+    behavior_p = np.array([0.01, 0.3, 0.7, 0.99], dtype=np.float32)
+    overlap = direct.expected_overlap(policy_p, behavior_p)
+    unsupported = direct.unsupported_action_mass(policy_p, behavior_p, 0.05)
+    check("expected propensity stays within probability bounds",
+          bool(((overlap >= 0) & (overlap <= 1)).all()))
+    check("unsupported-action mass is non-negative",
+          bool((unsupported >= 0).all()))
+    check("supported deterministic actions have zero violation",
+          float(unsupported[[0, 3]].sum()) == 0.0)
+
+    # Without a support penalty, exact expected utility is linear in p, so its
+    # optimizer is the deterministic sign threshold on g(s, 1).
+    candidate = np.linspace(0.0, 1.0, 101)
+    chosen = np.array([candidate[np.argmax(candidate * g)] for g in g_info])
+    target = (g_info > 0).astype(float)
+    check("unconstrained direct utility is optimized by the sign threshold",
+          bool(np.array_equal(chosen, target)))
+
+    net = direct.PolicyNet(len(state_cols), hidden=8)
+    policy = direct.DirectPolicy(net, state.mean(axis=0), state.std(axis=0))
+    restored = pickle.loads(pickle.dumps(policy))
+    check("DirectPolicy survives a pickle round trip",
+          np.array_equal(policy.predict(state), restored.predict(state)))
 
 
 def test_sofa():
@@ -470,6 +525,7 @@ def main():
     test_state_and_delta()
     test_batch_slicing()
     test_joint_panels()
+    test_direct_policy()
     test_sofa()
     test_ope_helpers()
     test_run_filter()

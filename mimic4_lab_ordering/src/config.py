@@ -184,6 +184,19 @@ CQL_HIDDEN = 128
 CQL_TARGET_TAU = 0.005     # Polyak rate for the target network
 CQL_EVAL_EVERY = 2_000
 
+# ------------------------------------- direct constrained policy (joint track) ----
+# ExOSITO-style contextual policy optimization. The utility is computable from
+# the current state for both actions, so this learner has no Bellman target.
+DIRECT_LR = 1e-3
+DIRECT_LAMBDA_LR = 1e-2
+DIRECT_LAMBDA_INIT = 3.0
+DIRECT_EPOCHS = 20
+DIRECT_BATCH = 4096
+DIRECT_HIDDEN = 64
+DIRECT_EPS_QUANTILE = 0.05
+DIRECT_PATIENCE = 5
+DIRECT_CALIBRATION_FRAC = 0.15
+
 # ------------------------------------------------- off-policy evaluation ----
 # Tier 1 replicates the paper: per-step WIS with an undiscounted horizon.
 # Paper-faithful setting for the PER-LAB replication in s5_evaluate_ope.py only:

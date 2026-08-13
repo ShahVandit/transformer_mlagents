@@ -57,7 +57,7 @@ JOINT_STAGES = [
     (1, "extract cohort", "s1_extract_cohort.py", False),
     (2, "hourly grid", "s2_hourly_grid.py", False),
     (3, "build joint MDP", "s3b_build_joint_mdp.py", False),
-    (4, "train joint CQL family", "s4c_train_family.py", False),
+    (4, "train joint policy family", "s4c_train_family.py", False),
     (8, "joint frontier", "s8_frontier.py", False),
 ]
 
@@ -73,6 +73,8 @@ def main():
                     help="stage-4 learner; mofqi is the paper's method")
     ap.add_argument("--track", default="perlab", choices=["perlab", "joint"],
                     help="pipeline track to run")
+    ap.add_argument("--family", default="cql", choices=["cql", "direct"],
+                    help="joint track policy family; direct is the lead bandit method")
     ap.add_argument("--quick", action="store_true",
                     help="smoke test: 200 ICU stays, WBC only, short FQI")
     ap.add_argument("--reuse-cache", action="store_true",
@@ -97,6 +99,8 @@ def main():
             continue
         if args.track == "perlab" and num == 4 and args.learner == "cql":
             script, name = "s4b_train_cql.py", "train CQL"
+        if args.track == "joint" and num == 4 and args.family == "direct":
+            script, name = "s4d_train_direct.py", "train direct constrained family"
         base = [PY, str(SRC / script)]
         if args.reuse_cache and num == 1:
             base += ["--skip-scan"]
@@ -107,12 +111,13 @@ def main():
         if args.track == "joint" and args.prefs and num in (4, 8):
             base += ["--prefs"] + [str(x) for x in args.prefs]
         if args.track == "joint" and num == 8:
-            base += ["--ope", args.ope]
+            base += ["--ope", args.ope, "--family", args.family]
         if args.track == "joint" and args.device and num in (4, 8):
             base += ["--device", args.device]
         if args.quick and num == 4:
             if args.track == "joint":
-                base += ["--steps", "2000"]
+                base += (["--epochs", "2"] if args.family == "direct"
+                         else ["--steps", "2000"])
                 if not args.prefs:
                     base += ["--prefs", "0.1", "0.9", "0.9", "0.1"]
             else:
