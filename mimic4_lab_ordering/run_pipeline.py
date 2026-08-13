@@ -75,7 +75,7 @@ def main():
                     help="stage-4 learner; mofqi is the paper's method")
     ap.add_argument("--track", default="perlab", choices=["perlab", "joint"],
                     help="pipeline track to run")
-    ap.add_argument("--family", default="cql", choices=["cql", "direct"],
+    ap.add_argument("--family", default="cql", choices=["cql", "direct", "mofqi"],
                     help="joint track policy family; direct is the lead bandit method")
     ap.add_argument("--quick", action="store_true",
                     help="smoke test: 200 ICU stays, WBC only, short FQI")
@@ -92,6 +92,10 @@ def main():
                          "(default: each script's own default)")
     ap.add_argument("--exclude-poe-state", action="store_true",
                     help="stage 3 ablation: omit past POE workflow features")
+    ap.add_argument("--accept-forecaster", action="store_true",
+                    help="stage 2: continue despite a documented forecaster gate failure")
+    ap.add_argument("--resume-forecaster-test", action="store_true",
+                    help="stage 2: reuse saved forecasters and build only test data")
     args = ap.parse_args()
 
     start, end = (args.only, args.only) if args.only else (args.start, args.end)
@@ -105,6 +109,8 @@ def main():
             script, name = "s4b_train_cql.py", "train CQL"
         if args.track == "joint" and num == 4 and args.family == "direct":
             script, name = "s4d_train_direct.py", "train direct constrained family"
+        if args.track == "joint" and num == 4 and args.family == "mofqi":
+            script, name = "s4e_train_mofqi_joint.py", "train joint MO-FQI family"
         base = [PY, str(SRC / script)]
         if args.reuse_cache and num == 1:
             base += ["--skip-scan"]
@@ -120,10 +126,18 @@ def main():
             base += ["--device", args.device]
         if args.exclude_poe_state and num == 3:
             base += ["--exclude-poe-state"]
+        if args.accept_forecaster and num == 2 and script == "s2_hourly_grid.py":
+            base += ["--accept-forecaster"]
+        if args.resume_forecaster_test and num == 2 and script == "s2_hourly_grid.py":
+            base += ["--resume-test"]
         if args.quick and num == 4:
             if args.track == "joint":
-                base += (["--epochs", "2"] if args.family == "direct"
-                         else ["--steps", "2000"])
+                if args.family == "direct":
+                    base += ["--epochs", "2"]
+                elif args.family == "mofqi":
+                    base += ["--iterations", "2", "--sample-per-iter", "5000"]
+                else:
+                    base += ["--steps", "2000"]
                 if not args.prefs:
                     base += ["--prefs", "0.1", "0.9", "0.9", "0.1"]
             else:

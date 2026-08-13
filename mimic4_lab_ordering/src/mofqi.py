@@ -170,6 +170,26 @@ class MOFittedQ:
         return collapse_from_q(self.q_all_actions(states), eps)
 
 
+class WeightedQPolicy:
+    """Deterministic policy obtained by scalarizing one learned Q-vector.
+
+    The joint model is trained once with objectives ``[utility, -burden]``.
+    Preferences are applied only when choosing an action, yielding several
+    policies from the same vector-valued Q function.
+    """
+
+    def __init__(self, model, preference):
+        self.model = model
+        self.preference = np.asarray(preference, dtype=np.float64)
+        if self.preference.shape != (model.n_dims,):
+            raise ValueError("preference dimension does not match Q-vector")
+
+    def predict(self, states):
+        q = self.model.q_all_actions(np.asarray(states, dtype=np.float32))
+        scores = np.einsum("nad,d->na", q, self.preference)
+        return np.argmax(scores, axis=1).astype(np.int64)
+
+
 def collapse_from_q(Q, eps):
     """Eq. 7 applied to precomputed Q-values.
 

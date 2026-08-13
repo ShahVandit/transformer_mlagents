@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "d3rlpy"))
 
 import config as cfg
+import mofqi
 import objectives
 import s5_evaluate_ope as ope
 import s4c_train_family as tf
@@ -42,6 +43,13 @@ def load_split(split):
 
 
 def load_policy(pref, tag="", device="cpu", family="cql"):
+    if family == "mofqi":
+        p = cfg.MODELS_DIR / f"joint_mofqi{clean_tag(tag)}.pkl"
+        if not p.exists():
+            raise SystemExit(f"{p} not found; run joint MO-FQI training first")
+        with p.open("rb") as f:
+            payload = pickle.load(f)
+        return mofqi.WeightedQPolicy(payload["model"], pref)
     suffix = ".pkl" if family == "direct" else ".d3"
     p = cfg.MODELS_DIR / f"joint_{family}_{pref_slug(pref)}{clean_tag(tag)}{suffix}"
     if not p.exists():
@@ -119,8 +127,8 @@ def validity_from_sidecar(pref, tag, val, norm_meta, cache, family="cql"):
         verdict = payload.get("beats_trivial")
         if verdict is not None:
             return bool(verdict), f"stage4_{family}_val"
-    if family == "direct":
-        raise SystemExit(f"{meta_path} missing direct-policy validity verdict")
+    if family in ("direct", "mofqi"):
+        raise SystemExit(f"{meta_path} missing {family} policy validity verdict")
     policy = load_policy(pref, tag=tag, device="cpu", family=family)
     acts = policy.predict(val["state"].astype(np.float32)).astype(np.int64)
     return policy_beats_trivial(val, acts, pref, norm_meta, cache), "recomputed_val"
@@ -294,7 +302,7 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
 
     estimators = [("factual", clin_est), ("wis", wis_est)]
     if ope_mode != "wis":
-        if family == "direct":
+        if family in ("direct", "mofqi"):
             pi_e_train = epsilon_greedy_probs(
                 policy.predict(train["next_state"].astype(np.float32)).astype(int),
                 epsilon)
@@ -474,7 +482,7 @@ def main():
                     help="all = FQE/WIS/WDR; wis = skip FQE/WDR for fast check")
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--family", choices=["cql", "direct"], default="cql")
+    ap.add_argument("--family", choices=["cql", "direct", "mofqi"], default="cql")
     args = ap.parse_args()
 
     cfg.ensure_dirs()

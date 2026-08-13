@@ -104,6 +104,22 @@ def test_pareto():
     check("binary-action pruning is a no-op in the backup",
           np.allclose(mofqi.pruned_max(Q, k), Q.max(axis=1)))
 
+    class FixedQ:
+        n_dims = 2
+
+        @staticmethod
+        def q_all_actions(states):
+            return np.tile(
+                np.array([[[0.8, 0.1], [0.6, 0.9]]], dtype=np.float32),
+                (len(states), 1, 1))
+
+    utility_policy = mofqi.WeightedQPolicy(FixedQ(), (0.9, 0.1))
+    burden_policy = mofqi.WeightedQPolicy(FixedQ(), (0.1, 0.9))
+    dummy = np.zeros((3, 1), dtype=np.float32)
+    check("MO-FQI preference extraction selects different trade-offs",
+          np.all(utility_policy.predict(dummy) == 0)
+          and np.all(burden_policy.predict(dummy) == 1))
+
 
 def test_budget():
     print("\nbudget rule (Sec. 3)")

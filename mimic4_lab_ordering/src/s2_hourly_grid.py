@@ -344,6 +344,13 @@ def build_split(split, stays, ev, gcs_ev, interventions, poe_orders,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--forecaster", default=None, help="override config.FORECASTER")
+    ap.add_argument(
+        "--accept-forecaster", action="store_true",
+        help="build locked test data despite a failed validation gate; the "
+             "failure remains recorded in the validation report")
+    ap.add_argument(
+        "--resume-test", action="store_true",
+        help="reuse saved forecasters and existing train/val grids; build only test")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
@@ -359,6 +366,52 @@ def main():
     ev = all_ev[all_ev["trait"].isin(TRAIT_IDX)]
     print(f"{len(ev):,} forecast events, {len(gcs_ev):,} GCS events, "
           f"{len(stays):,} stays")
+
+    if args.resume_test:
+        required = [FORECASTER_PKL, TARGET_FORECASTER_PKL,
+                    cfg.HOURLY_DIR / "train.parquet",
+                    cfg.HOURLY_DIR / "val.parquet"]
+        missing = [str(p) for p in required if not p.exists()]
+        if missing:
+            raise SystemExit("cannot resume test build; missing:\n  "
+                             + "\n  ".join(missing))
+        with FORECASTER_PKL.open("rb") as fh:
+            forecaster = fc.LocalTrendForecaster.from_state_dict(pickle.load(fh))
+        with TARGET_FORECASTER_PKL.open("rb") as fh:
+            target_forecaster = tlf.TargetLabForecaster.from_state_dict(
+                pickle.load(fh))
+        train_hourly = pd.read_parquet(cfg.HOURLY_DIR / "train.parquet")
+        population_means = {
+            lab: float(train_hourly[f"obs_{lab}"].mean())
+            for lab in ids.TARGET_LABS
+        }
+        val_metrics = fv.evaluate_hourly(
+            cfg.HOURLY_DIR / "val.parquet", population_means)
+        val_gate = fv.validation_gate(val_metrics)
+        if not val_gate["passed"] and not args.accept_forecaster:
+            raise SystemExit(
+                "saved forecaster still fails validation; add "
+                "--accept-forecaster to continue as a prototype")
+
+        print("\nreusing saved forecasters; building locked test hourly grid")
+        test_stays = stays[stays["split"] == "test"]
+        build_split("test", test_stays, ev, gcs_ev, interventions, poe_orders,
+                    forecaster, cfg.HOURLY_DIR / "test.parquet")
+        test_path = cfg.HOURLY_DIR / "test.parquet"
+        test_hourly = target_forecaster.transform(
+            pd.read_parquet(test_path), training=False)
+        test_hourly.to_parquet(test_path, index=False)
+        test_metrics = fv.evaluate_hourly(test_path, population_means)
+        test_gate = fv.validation_gate(test_metrics)
+        md_path, json_path = fv.write_report(
+            {"metrics": val_metrics, "gate": val_gate},
+            {"metrics": test_metrics, "gate": test_gate},
+            {"resume_test": True,
+             "target_lab_model": target_forecaster.selection_},
+            cfg.REPORTS_DIR / "forecaster_validation")
+        print(f"wrote {md_path}")
+        print(f"wrote {json_path}")
+        return
 
     # Fit on TRAIN only. Selection and uncertainty calibration use VAL only;
     # TEST remains locked until the validation gate passes.
@@ -456,11 +509,15 @@ def main():
             {"base_state_space": tuning,
              "target_lab_model": target_forecaster.selection_},
             cfg.REPORTS_DIR / "forecaster_validation")
-        raise SystemExit(
-            "forecaster validation failed; test split was not evaluated:\n  - "
-            + "\n  - ".join(val_gate["reasons"]))
+        if not args.accept_forecaster:
+            raise SystemExit(
+                "forecaster validation failed; test split was not evaluated:\n  - "
+                + "\n  - ".join(val_gate["reasons"]))
+        print("\nWARNING: accepting prototype forecaster despite failed gate:")
+        for reason in val_gate["reasons"]:
+            print(f"  - {reason}")
 
-    print("\nvalidation passed; building locked test hourly grid")
+    print("\nbuilding locked test hourly grid")
     test_stays = stays[stays["split"] == "test"]
     build_split("test", test_stays, ev, gcs_ev, interventions, poe_orders,
                 forecaster, cfg.HOURLY_DIR / "test.parquet")
