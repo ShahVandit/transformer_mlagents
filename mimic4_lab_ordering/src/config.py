@@ -174,13 +174,16 @@ FORECAST_COVERAGE90_MIN = 0.87
 FORECAST_COVERAGE90_MAX = 0.93
 FORECAST_RESIDUAL_MAX_TRAIN_ROWS = 250_000
 FORECAST_RESIDUAL_FOLDS = 5
+FORECAST_DELTA_SHRINKAGE = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]
 FORECAST_RESIDUAL_CANDIDATES = [
-    {"name": "conservative", "max_leaf_nodes": 15, "min_samples_leaf": 50,
-     "l2_regularization": 10.0},
-    {"name": "balanced", "max_leaf_nodes": 31, "min_samples_leaf": 30,
-     "l2_regularization": 5.0},
-    {"name": "flexible", "max_leaf_nodes": 63, "min_samples_leaf": 20,
-     "l2_regularization": 10.0},
+    {"name": "conservative", "max_leaf_nodes": 15, "min_samples_leaf": 75,
+     "l2_regularization": 15.0, "max_iter": 250, "learning_rate": 0.05},
+    {"name": "balanced", "max_leaf_nodes": 31, "min_samples_leaf": 40,
+     "l2_regularization": 8.0, "max_iter": 300, "learning_rate": 0.05},
+    {"name": "flexible", "max_leaf_nodes": 63, "min_samples_leaf": 30,
+     "l2_regularization": 10.0, "max_iter": 350, "learning_rate": 0.04},
+    {"name": "high_capacity", "max_leaf_nodes": 127, "min_samples_leaf": 30,
+     "l2_regularization": 15.0, "max_iter": 350, "learning_rate": 0.035},
 ]
 
 # ------------------------------------------------------------ MO-FQI (Sec. 2.3) ----

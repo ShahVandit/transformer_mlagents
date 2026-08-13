@@ -28,6 +28,7 @@ import s3_build_mdp as mdp    # noqa: E402
 import s5_evaluate_ope as ope  # noqa: E402
 import s6_clinical_metrics as clin  # noqa: E402
 import s2_hourly_grid as grid  # noqa: E402
+import target_lab_forecaster as target_fc  # noqa: E402
 import sofa as sofa_mod       # noqa: E402
 
 PASS, FAIL = [], []
@@ -200,6 +201,26 @@ def test_forecaster_no_leakage():
 
     check("filtered output is finite on a sparse trait",
           bool(np.isfinite(f.filter(sparse, lengths)[0]).all()))
+
+
+def test_target_forecaster_selection_and_calibration():
+    actual = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+    last = np.zeros(5)
+    predicted_delta = actual * 1.5
+    rmse, shrinkage = target_fc._select_shrinkage(
+        actual, last, predicted_delta, candidates=[0.0, 0.5, 1.0])
+    locf_rmse = float(np.sqrt(np.mean((actual - last) ** 2)))
+    assert rmse <= locf_rmse
+    assert shrinkage == 0.5
+
+    rng = np.random.default_rng(7)
+    final_mean = rng.normal(size=20_000)
+    raw_std = rng.uniform(0.5, 2.0, size=20_000)
+    actual = final_mean + raw_std * rng.normal(size=20_000)
+    scale = target_fc._calibrate_interval(actual, final_mean, raw_std)
+    coverage = np.mean(
+        np.abs(actual - final_mean) <= 1.6448536269514722 * raw_std * scale)
+    assert abs(coverage - 0.90) < 0.01
 
 
 # ------------------------------------------------------------------ state ----

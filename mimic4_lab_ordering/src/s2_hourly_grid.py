@@ -434,6 +434,7 @@ def main():
             f"{c['name']}={c['validation_rmse']:.4f}"
             for c in row["candidates"])
         print(f"  {lab:11s} selected={row['selected']} "
+              f"delta*x{row['shrinkage']:.2f} "
               f"interval*x{row['interval_scale']:.3f} [{candidates}]")
 
     population_means = {

@@ -51,9 +51,16 @@ def _metrics(actual, mean, std, last, population_mean):
 
         predicted_utility = np.abs(mean[repeat] - last[repeat]) / std[repeat]
         realized_change = np.abs(actual[repeat] - last[repeat])
-        corr = spearmanr(predicted_utility, realized_change, nan_policy="omit")
+        realized_standardized_change = realized_change / std[repeat]
+        corr = spearmanr(
+            predicted_utility, realized_standardized_change, nan_policy="omit")
         rho = getattr(corr, "statistic", getattr(corr, "correlation", corr[0]))
         out["utility_spearman"] = float(rho) if np.isfinite(rho) else 0.0
+        raw_corr = spearmanr(predicted_utility, realized_change, nan_policy="omit")
+        raw_rho = getattr(
+            raw_corr, "statistic", getattr(raw_corr, "correlation", raw_corr[0]))
+        out["raw_change_spearman"] = (
+            float(raw_rho) if np.isfinite(raw_rho) else 0.0)
         threshold = np.quantile(realized_change, 0.75)
         high = realized_change >= threshold
         k = max(1, int(high.sum()))
@@ -65,7 +72,9 @@ def _metrics(actual, mean, std, last, population_mean):
     else:
         out.update({"repeat_rmse": float("nan"), "locf_rmse": float("nan"),
                     "rmse_skill_vs_locf": float("nan"), "locf_mae": float("nan"),
-                    "utility_spearman": float("nan"), "high_change_lift": float("nan")})
+                    "utility_spearman": float("nan"),
+                    "raw_change_spearman": float("nan"),
+                    "high_change_lift": float("nan")})
 
     pop_err = actual - population_mean
     out["population_rmse"] = float(np.sqrt(np.mean(pop_err * pop_err)))
