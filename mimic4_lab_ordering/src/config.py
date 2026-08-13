@@ -123,13 +123,10 @@ REWARD_DIMS = ["r_sofa", "r_treat", "r_info", "neg_r_cost"]
 # identify WHICH panel is appropriate for a particular deterioration. Giving
 # all non-empty panels identical utility makes the smallest panel
 # dominate by construction. Keep the action aligned with the supported causal
-# question: no draw versus one blood draw. Utility is the strongest realized
-# information signal among the observed target labs. Summing all four would assume
-# every physical draw necessarily obtains all four assays, which is not true in
-# the logged data; exact panel selection is outside this policy. On a logged
-# clinician-draw hour, matching the draw earns +u and omitting it receives -u.
-# On a logged no-draw hour there is no observed information label, so utility is
-# zero; a policy draw still incurs burden.
+# question: no draw versus one blood draw. Information potential is computed
+# from the four target-lab forecasts. A draw earns that potential; no draw earns
+# zero because its counterfactual lab result is unobserved. Every draw separately
+# incurs burden. Exact panel selection is outside this binary policy.
 JOINT_PANEL_BITS = ["0000", "1111"]
 JOINT_PANEL_NAMES = ["none", "blood_draw"]
 JOINT_REWARD_DIMS = ["utility", "burden"]

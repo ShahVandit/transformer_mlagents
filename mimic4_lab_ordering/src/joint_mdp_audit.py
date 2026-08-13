@@ -97,10 +97,10 @@ def audit_split(name, split, meta):
              f"{name}: zero-information rows have nonzero utility")
     _require(np.allclose(utility[draw], potential[draw]),
              f"{name}: logged draws do not receive +information utility")
-    _require(np.allclose(utility[~draw], -potential[~draw]),
-             f"{name}: logged omissions do not receive -information utility")
-    _require((utility > 0).any() and (utility < 0).any(),
-             f"{name}: utility has no usable signed factual signal")
+    _require(np.allclose(utility[~draw], 0.0),
+             f"{name}: no-draw rows receive information utility")
+    _require((utility > 0).any() and (utility >= 0).all(),
+             f"{name}: utility has no usable draw-gated signal")
     _require((potential[draw] > 0).any() and (potential[~draw] > 0).any(),
              f"{name}: information potential is confounded with logged action")
     _require((draw_burden >= 1.0).all(),

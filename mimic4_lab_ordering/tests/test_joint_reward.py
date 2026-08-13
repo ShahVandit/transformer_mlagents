@@ -72,7 +72,7 @@ def main():
     for name, (utility, burden) in rows.items():
         print(f"{name:20s} {utility:8.2f} {burden:7.2f}")
 
-    assert rows["never"][0] < 0.0
+    assert rows["never"][0] == 0.0
     assert rows["never"][1] == 0.0
     assert rows["low_information"][0] == rows["never"][0]
     assert rows["low_information"][1] > 0.0
@@ -82,11 +82,11 @@ def main():
     assert rows["always"][0] == rows["high_information"][0]
     assert rows["always"][1] > rows["repeated"][1]
 
-    # At an informative opportunity, drawing receives +u and omission receives
-    # exactly -u. At zero potential, both actions receive zero utility.
+    # At an informative opportunity, drawing receives +u. A no-draw decision
+    # has no observed counterfactual lab result, so its utility is zero.
     missed = objectives.utility_objective(split, never)
     taken = objectives.utility_objective(split, high)
-    assert missed[2] == -potential[2] < 0.0
+    assert missed[2] == 0.0
     assert taken[2] == potential[2] > 0.0
     assert objectives.utility_objective(split, low)[1] == missed[1] == 0.0
 
@@ -99,7 +99,7 @@ def main():
     extra_draw = objectives.utility_objective(split, repeated)
     matched_no_draw = objectives.utility_objective(split, never)
     assert matched_draw[informative_hour] == potential[informative_hour]
-    assert missed_draw[informative_hour] == -potential[informative_hour]
+    assert missed_draw[informative_hour] == 0.0
     assert matched_no_draw[no_draw_hour] == 0.0
     assert extra_draw[no_draw_hour] == 0.0
     assert objectives.burden_objective(split, repeated)[no_draw_hour] > 0.0
@@ -125,7 +125,7 @@ def main():
             split, clinician_actions, pref, norm_meta)
         assert np.allclose(stored, replayed), pref
 
-    print("PASS: informative draws earn +u, missed opportunities receive -u, "
+    print("PASS: informative draws earn +u, no-draw actions earn zero utility, "
           "zero-potential draws earn no utility, and every draw incurs burden")
 
 

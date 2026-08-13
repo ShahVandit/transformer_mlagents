@@ -460,8 +460,8 @@ def test_joint_panels():
     u_info = objectives.utility_objective(d, informative)
     u_low = objectives.utility_objective(d, uninformative)
     b_low = objectives.burden_objective(d, uninformative)
-    check("missing informative draws receives negative utility",
-          float(u_none.sum()) < 0.0)
+    check("no-draw actions receive zero information utility",
+          float(u_none.sum()) == 0.0)
     check("an informative draw receives positive utility", float(u_info.sum()) > 0.0)
     check("drawing at zero potential does not alter utility",
           np.allclose(u_low, u_none))

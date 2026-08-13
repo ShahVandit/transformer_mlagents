@@ -72,7 +72,7 @@ def deterioration_events(df):
     return onset | sofa
 
 
-UTILITY_DEFINITION = "state_computable_signed_forecast_information"
+UTILITY_DEFINITION = "state_computable_action_gated_forecast_information"
 
 
 def fit_utility_thresholds(train_df):
@@ -119,7 +119,13 @@ def information_potential(df, thresholds):
 
 
 def utility_objective(df, actions, thresholds=None):
-    """Give +u for measuring available information and -u for missing it."""
+    """Give +u for a draw and zero utility when no draw is taken.
+
+    The forecast potential is available from the decision-time state, but a
+    no-draw row contains no observed counterfactual lab result. It therefore
+    cannot support a negative information reward. The burden objective is the
+    separate penalty for taking the draw.
+    """
     if _has_col(df, "information_potential"):
         utility = _to_numpy(_col(df, "information_potential")).astype(np.float32)
     elif thresholds is not None:
@@ -127,7 +133,7 @@ def utility_objective(df, actions, thresholds=None):
     else:
         raise ValueError("information_potential or utility thresholds are required")
     draw = (np.asarray(actions) != 0).astype(np.float32)
-    return utility * (2.0 * draw - 1.0)
+    return utility * draw
 
 
 def deterioration_episode_onsets(df, lookahead=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
