@@ -221,7 +221,9 @@ def _neg_loglik(theta, y):
 class LocalTrendForecaster(Forecaster):
     """Per-trait local linear trend model, fit by MLE, vectorized across stays."""
 
-    def __init__(self, trait_names, seed=cfg.SEED, fit_max_stays=300, fit_max_hours=240):
+    def __init__(self, trait_names, seed=cfg.SEED,
+                 fit_max_stays=cfg.FORECAST_TRAIN_STAYS,
+                 fit_max_hours=cfg.FORECAST_FIT_MAX_HOURS):
         self.trait_names = list(trait_names)
         self.seed = seed
         self.fit_max_stays = fit_max_stays
@@ -233,6 +235,7 @@ class LocalTrendForecaster(Forecaster):
         self.q_level_ = None
         self.q_slope_ = None
         self.r_ = None
+        self.std_scale_ = None
 
     # -- fitting ----------------------------------------------------------- #
     def fit(self, obs):
@@ -264,6 +267,7 @@ class LocalTrendForecaster(Forecaster):
         self.q_level_ = np.empty(K)
         self.q_slope_ = np.empty(K)
         self.r_ = np.empty(K)
+        self.std_scale_ = np.ones(K)
         x0 = np.log([0.05, 1e-3, 0.3])
         for k in range(K):
             yk = z[:, :, k]
@@ -343,6 +347,7 @@ class LocalTrendForecaster(Forecaster):
 
             if want_cov:
                 s = np.sqrt(np.maximum(v, 0.0)) * self.sd_[k]
+                s = s * self.std_scale_[k]
                 s = np.nan_to_num(s, nan=cfg.FORECAST_MIN_STD,
                                   posinf=f32_max, neginf=cfg.FORECAST_MIN_STD)
                 std[:, :, k] = np.clip(np.maximum(s, cfg.FORECAST_MIN_STD),
@@ -353,7 +358,8 @@ class LocalTrendForecaster(Forecaster):
     def state_dict(self):
         return {"trait_names": self.trait_names, "mu": self.mu_, "sd": self.sd_,
                 "lo": self.lo_, "hi": self.hi_,
-                "q_level": self.q_level_, "q_slope": self.q_slope_, "r": self.r_}
+                "q_level": self.q_level_, "q_slope": self.q_slope_, "r": self.r_,
+                "std_scale": self.std_scale_}
 
     @classmethod
     def from_state_dict(cls, d):
@@ -361,7 +367,60 @@ class LocalTrendForecaster(Forecaster):
         f.mu_, f.sd_ = d["mu"], d["sd"]
         f.lo_, f.hi_ = d["lo"], d["hi"]
         f.q_level_, f.q_slope_, f.r_ = d["q_level"], d["q_slope"], d["r"]
+        f.std_scale_ = np.asarray(d.get("std_scale", np.ones(len(f.trait_names))))
         return f
+
+    def tune_on_validation(self, obs, trait_names, lengths=None,
+                           q_level_scales=cfg.FORECAST_Q_LEVEL_SCALES,
+                           q_slope_scales=cfg.FORECAST_Q_SLOPE_SCALES,
+                           r_scales=cfg.FORECAST_R_SCALES):
+        """Select target-trait dynamics by one-step-ahead validation NLL.
+
+        Every candidate predicts hour t before folding in hour t's observation,
+        so the validation result is never visible to the prediction it scores.
+        After selecting dynamics, calibrate sigma by the validation residual RMS;
+        this matters because sigma is the denominator of the policy utility.
+        """
+        if self.r_ is None:
+            raise RuntimeError("call fit() before tune_on_validation()")
+        name_to_idx = {name: i for i, name in enumerate(self.trait_names)}
+        selected = {}
+        for name in trait_names:
+            k = name_to_idx[name]
+            y = self._standardize(obs)[:, :, k]
+            if lengths is not None:
+                valid = np.arange(y.shape[1])[None, :] < np.asarray(lengths)[:, None]
+                y = np.where(valid, y, np.nan)
+            base = np.array([self.q_level_[k], self.q_slope_[k], self.r_[k]])
+            best = None
+            for sl in q_level_scales:
+                for ss in q_slope_scales:
+                    for sr in r_scales:
+                        params = base * np.array([sl, ss, sr])
+                        nll = _neg_loglik(np.log(params), y)
+                        candidate = (float(nll), *params.tolist(), sl, ss, sr)
+                        if best is None or candidate[0] < best[0]:
+                            best = candidate
+            nll, ql, qs, r, sl, ss, sr = best
+            self.q_level_[k], self.q_slope_[k], self.r_[k] = ql, qs, r
+
+            mean, std = self.filter(obs, lengths)
+            observed = obs[:, :, k]
+            keep = np.isfinite(observed) & np.isfinite(mean[:, :, k]) \
+                & np.isfinite(std[:, :, k])
+            z = (observed[keep] - mean[:, :, k][keep]) \
+                / np.maximum(std[:, :, k][keep], cfg.FORECAST_MIN_STD)
+            scale = float(np.sqrt(np.mean(z * z))) if len(z) else 1.0
+            self.std_scale_[k] = float(np.clip(scale, 0.5, 3.0))
+            selected[name] = {
+                "validation_nll": nll,
+                "q_level_scale": float(sl),
+                "q_slope_scale": float(ss),
+                "r_scale": float(sr),
+                "std_calibration_scale": float(self.std_scale_[k]),
+                "n_validation_observations": int(keep.sum()),
+            }
+        return selected
 
 
 class MOGPForecaster(Forecaster):

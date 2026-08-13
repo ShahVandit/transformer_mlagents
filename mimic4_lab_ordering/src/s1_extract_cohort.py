@@ -35,6 +35,7 @@ Outputs
     data/cache/chartevents_filtered.parquet long-format vitals + GCS
     data/cache/labevents_filtered.parquet   long-format labs
     data/cache/interventions.parquet        one row per (stay, kind, starttime)
+    data/cache/poe_lab_orders.parquet       new lab orders entered during ICU stay
     data/splits.json                        subject ids per split
 """
 import argparse
@@ -115,6 +116,13 @@ EVENT_SCHEMA = pa.schema([
     ("trait", pa.string()),
     ("charttime", pa.timestamp("s")),
     ("value", pa.float32()),
+])
+
+POE_SCHEMA = pa.schema([
+    ("stay_id", pa.int32()),
+    ("subject_id", pa.int32()),
+    ("poe_id", pa.string()),
+    ("ordertime", pa.timestamp("s")),
 ])
 
 
@@ -300,6 +308,62 @@ def scan_labevents(stays, tolerate_truncation=False):
     return writer.rows
 
 
+def scan_poe_lab_orders(stays, tolerate_truncation=False):
+    """Cache new POE lab orders entered while the patient was in the ICU.
+
+    MIMIC-IV provides no shared key between ``poe.poe_id`` and
+    ``labevents.specimen_id``. The rows are therefore retained as an independent
+    workflow stream; later stages aggregate simultaneous rows into order groups
+    but never claim that a particular order caused a particular specimen.
+    """
+    max_subject = int(stays["subject_id"].max())
+    windows = (stays[["hadm_id", "stay_id", "subject_id", "intime", "outtime"]]
+               .dropna(subset=["hadm_id"]).copy())
+    windows["hadm_id"] = windows["hadm_id"].astype("int64")
+
+    writer = _ShardWriter(cfg.POE_PARQUET, POE_SCHEMA)
+    reader = pd.read_csv(
+        cfg.POE_CSV,
+        usecols=["poe_id", "subject_id", "hadm_id", "ordertime",
+                 "order_type", "transaction_type"],
+        chunksize=cfg.SCAN_CHUNK_ROWS,
+    )
+    for i, chunk in _iter_chunks(reader, cfg.POE_CSV, tolerate_truncation):
+        if chunk["subject_id"].min() > max_subject:
+            print(f"    chunk {i}: past subject {max_subject}, stopping early")
+            break
+        chunk = chunk[
+            chunk["order_type"].eq("Lab")
+            & chunk["transaction_type"].eq("New")
+        ].dropna(subset=["hadm_id", "ordertime"])
+        if chunk.empty:
+            continue
+        chunk = chunk.copy()
+        chunk["hadm_id"] = chunk["hadm_id"].astype("int64")
+        chunk["ordertime"] = pd.to_datetime(chunk["ordertime"], errors="coerce")
+        chunk = chunk.dropna(subset=["ordertime"])
+
+        m = chunk.merge(windows, on="hadm_id", how="inner", suffixes=("", "_stay"))
+        m = m[(m["ordertime"] >= m["intime"]) & (m["ordertime"] <= m["outtime"])]
+        if m.empty:
+            continue
+        out = pd.DataFrame({
+            "stay_id": m["stay_id"].to_numpy("int32"),
+            "subject_id": m["subject_id_stay"].to_numpy("int32"),
+            "poe_id": m["poe_id"].astype(str).to_numpy(),
+            "ordertime": m["ordertime"].to_numpy(),
+        })
+        writer.write(out)
+        print(f"    chunk {i}: kept {len(out):,} rows (total {writer.rows:,})",
+              flush=True)
+
+    writer.close()
+    if writer.rows == 0:
+        pq.write_table(pa.Table.from_pylist([], schema=POE_SCHEMA), cfg.POE_PARQUET)
+    print(f"  wrote {writer.rows:,} POE lab-order rows -> {cfg.POE_PARQUET}")
+    return writer.rows
+
+
 # ---------------------------------------------------------- interventions ----
 def extract_interventions(stays):
     """Intervals for the four intervention classes in Eq. 4.
@@ -454,11 +518,14 @@ def main():
     cfg.check_inputs()
     print(f"reading MIMIC-IV from {cfg.MIMIC4_DIR}")
 
-    print("\n[1/5] cohort")
+    print("\n[1/6] cohort")
     stays = build_cohort(args.limit_icustays)
 
     if args.skip_scan:
-        print("\n[2-4/5] --skip-scan: reusing cached parquet")
+        print("\n[2-5/6] --skip-scan: reusing cached parquet")
+        if not cfg.POE_PARQUET.exists():
+            print("  POE cache missing; scanning poe.csv.gz only")
+            scan_poe_lab_orders(stays, args.tolerate_truncation)
     else:
         print("\n[2/5] chartevents scan")
         if args.skip_chart and cfg.CHART_PARQUET.exists():
@@ -469,6 +536,8 @@ def main():
         scan_labevents(stays, args.tolerate_truncation)
         print("\n[4/5] interventions")
         extract_interventions(stays)
+        print("\n[5/6] POE lab orders")
+        scan_poe_lab_orders(stays, args.tolerate_truncation)
 
     if _SCAN_STATUS:
         (cfg.RAW_CACHE_DIR / "scan_status.json").write_text(
@@ -478,7 +547,7 @@ def main():
             print(f"    {name}: stopped after {st['chunks_read']} chunks")
         print("  The cohort below covers a PREFIX of the subject id range only.")
 
-    print("\n[5/5] completeness filter and subject splits")
+    print("\n[6/6] completeness filter and subject splits")
     stays = apply_completeness_filter(stays)
     stays = make_splits(stays)
     stays.to_parquet(cfg.COHORT_PARQUET, index=False)

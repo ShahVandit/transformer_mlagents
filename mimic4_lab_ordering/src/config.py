@@ -58,6 +58,7 @@ LABEVENTS_CSV = MIMIC4_DIR / "labevents.csv.gz"
 INPUTEVENTS_CSV = MIMIC4_DIR / "inputevents.csv.gz"
 PROCEDUREEVENTS_CSV = MIMIC4_DIR / "procedureevents.csv.gz"
 PRESCRIPTIONS_CSV = MIMIC4_DIR / "prescriptions.csv.gz"
+POE_CSV = MIMIC4_DIR / "poe.csv.gz"
 
 # ---------------------------------------------------- generated artifacts ----
 DATA_DIR = PROJECT_ROOT / "data"
@@ -72,6 +73,7 @@ COHORT_PARQUET = RAW_CACHE_DIR / "cohort.parquet"
 CHART_PARQUET = RAW_CACHE_DIR / "chartevents_filtered.parquet"
 LAB_PARQUET = RAW_CACHE_DIR / "labevents_filtered.parquet"
 INTERVENTIONS_PARQUET = RAW_CACHE_DIR / "interventions.parquet"
+POE_PARQUET = RAW_CACHE_DIR / "poe_lab_orders.parquet"
 SPLITS_JSON = DATA_DIR / "splits.json"
 HOURLY_DIR = PROCESSED_DIR / "hourly"     # one parquet shard per split
 
@@ -100,6 +102,13 @@ TEST_FRAC = 0.15
 BIN_HOURS = 1              # paper resamples to a one-hour grid
 GAMMA = 0.9                # discount factor used by FQI (Sec. 3)
 INCLUDE_VITAL_STD = False  # False -> 21-dim state (paper); True -> 25-dim variant
+
+# POE is a separate workflow stream, not a specimen linkage. These features use
+# only lab orders entered strictly before the current hourly decision point.
+INCLUDE_POE_STATE = True
+POE_RECENT_HOURS = 6
+POE_LONG_HOURS = 24
+POE_MAX_SINCE_HOURS = 168
 
 # ------------------------------------------------------- reward (Sec. 2.2) ----
 SOFA_DELTA_THRESHOLD = 2.0   # Eq. 3: a SOFA rise >= 2 is the critical sepsis index
@@ -149,6 +158,30 @@ VALIDITY_MARGIN = 0.0     # required improvement over the best trivial baseline
 # emitting an hourly predictive mean and std satisfies that contract.
 FORECASTER = "local_trend"   # "local_trend" | "mogp"
 FORECAST_MIN_STD = 1e-3      # floor on sigma_t so r_info cannot divide by ~0
+FORECAST_TRAIN_STAYS = 1_000
+FORECAST_VALIDATION_STAYS = 750
+FORECAST_FIT_MAX_HOURS = 240
+# Validation tunes the process and observation noise around the train MLE.
+FORECAST_Q_LEVEL_SCALES = [0.5, 1.0, 2.0]
+FORECAST_Q_SLOPE_SCALES = [0.5, 1.0, 2.0]
+FORECAST_R_SCALES = [0.5, 1.0, 2.0]
+# The policy's utility depends on both the mean and sigma, so stage 2 refuses to
+# build test data unless the selected forecaster clears these validation gates.
+FORECAST_MIN_AGGREGATE_RMSE_SKILL = 0.03
+FORECAST_MIN_TARGETS_BEATING_LOCF = 4
+FORECAST_MIN_UTILITY_SPEARMAN = 0.15
+FORECAST_COVERAGE90_MIN = 0.87
+FORECAST_COVERAGE90_MAX = 0.93
+FORECAST_RESIDUAL_MAX_TRAIN_ROWS = 250_000
+FORECAST_RESIDUAL_FOLDS = 5
+FORECAST_RESIDUAL_CANDIDATES = [
+    {"name": "conservative", "max_leaf_nodes": 15, "min_samples_leaf": 50,
+     "l2_regularization": 10.0},
+    {"name": "balanced", "max_leaf_nodes": 31, "min_samples_leaf": 30,
+     "l2_regularization": 5.0},
+    {"name": "flexible", "max_leaf_nodes": 63, "min_samples_leaf": 20,
+     "l2_regularization": 10.0},
+]
 
 # ------------------------------------------------------------ MO-FQI (Sec. 2.3) ----
 FQI_ITERATIONS = 200
@@ -238,6 +271,7 @@ REQUIRED_INPUTS = {
     "admissions": ADMISSIONS_CSV, "chartevents": CHARTEVENTS_CSV,
     "labevents": LABEVENTS_CSV, "inputevents": INPUTEVENTS_CSV,
     "procedureevents": PROCEDUREEVENTS_CSV, "prescriptions": PRESCRIPTIONS_CSV,
+    "poe": POE_CSV,
 }
 
 

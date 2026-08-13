@@ -78,7 +78,16 @@ def add_sofa(df):
 
 
 # ------------------------------------------------------------------ state ----
-def state_columns():
+def poe_state_columns():
+    return [
+        "poe_order_groups_6h",
+        "poe_order_rows_6h",
+        "poe_order_groups_24h",
+        "poe_hours_since_lab_order",
+    ]
+
+
+def state_columns(include_poe=None):
     cols = [f"mean_{t}" for t in ids.STATE_VITALS]
     if cfg.INCLUDE_VITAL_STD:
         cols += [f"std_{t}" for t in ids.STATE_VITALS]
@@ -87,10 +96,12 @@ def state_columns():
     cols += ["sofa"]
     cols += [f"last_{l}" for l in ids.TARGET_LABS]
     cols += [f"delta_{l}" for l in ids.TARGET_LABS]
+    if cfg.INCLUDE_POE_STATE if include_poe is None else include_poe:
+        cols += poe_state_columns()
     return cols
 
 
-def build_state(df):
+def build_state(df, include_poe=None):
     """[N, 21] state matrix, with the two documented imputations for the head of
     a stay before a lab has ever been drawn."""
     d = df.copy()
@@ -100,7 +111,12 @@ def build_state(df):
         d[f"last_{l}"] = d[f"last_{l}"].fillna(d[f"mean_{l}"])
         # Delta_t before the first ever measurement: hours since ICU admission.
         d[f"delta_{l}"] = d[f"delta_{l}"].fillna(d["hour"] + 1.0)
-    cols = state_columns()
+    cols = state_columns(include_poe)
+    missing = [c for c in cols if c not in d.columns]
+    if missing:
+        hint = (" Re-run stage 2 to add POE workflow features."
+                if any(c.startswith("poe_") for c in missing) else "")
+        raise ValueError(f"state columns missing from hourly data: {missing}.{hint}")
     s = d[cols].to_numpy(dtype=np.float32)
     if not np.isfinite(s).all():
         bad = np.array(cols)[~np.isfinite(s).all(axis=0)]
@@ -215,6 +231,8 @@ def build_lab_split(df, lab, c_l, state, state_cols):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labs", nargs="+", default=ids.TARGET_LABS)
+    ap.add_argument("--exclude-poe-state", action="store_true",
+                    help="ablation: build the original physiology-only state")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
@@ -242,10 +260,12 @@ def main():
 
     states = {}
     for split, df in frames.items():
-        s, cols = build_state(df)
+        s, cols = build_state(df, include_poe=not args.exclude_poe_state)
         states[split] = s
 
-    meta = {"state_cols": state_columns(), "state_dim": len(state_columns()),
+    cols = state_columns(include_poe=not args.exclude_poe_state)
+    meta = {"state_cols": cols, "state_dim": len(cols),
+            "poe_state_included": not args.exclude_poe_state,
             "reward_dims": cfg.REWARD_DIMS, "gamma": cfg.GAMMA, "c_l": c_l}
     (cfg.RL_DIR / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 

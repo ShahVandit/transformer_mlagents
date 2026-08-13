@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -204,8 +205,12 @@ def test_forecaster_no_leakage():
 # ------------------------------------------------------------------ state ----
 def test_state_and_delta():
     print("\nstate construction (Sec. 2.2)")
-    check("state dimension is 21 as the paper reports",
-          len(mdp.state_columns()) == 21, str(len(mdp.state_columns())))
+    check("physiology state dimension is 21 as the paper reports",
+          len(mdp.state_columns(include_poe=False)) == 21,
+          str(len(mdp.state_columns(include_poe=False))))
+    check("POE extension adds exactly four past-only workflow features",
+          len(mdp.state_columns(include_poe=True)) == 25,
+          str(len(mdp.state_columns(include_poe=True))))
 
     obs = np.full((1, 6, 1), np.nan)
     obs[0, 2, 0] = 5.0
@@ -216,6 +221,31 @@ def test_state_and_delta():
     check("Delta_t is 1 an hour after the draw", delta[0, 3, 0] == 1.0)
     check("Delta_t increments hourly", delta[0, 5, 0] == 3.0)
     check("Delta_t is undefined before the first draw", np.isnan(delta[0, 1, 0]))
+
+
+def test_poe_features_are_past_only():
+    print("\nPOE workflow features")
+    stays = np.array([7])
+    lengths = pd.Series([5], index=stays)
+    intimes = {7: pd.Timestamp("2020-01-01 00:00:00")}
+    orders = pd.DataFrame({
+        "stay_id": [7, 7, 7],
+        "ordertime": [pd.Timestamp("2020-01-01 01:10:00"),
+                      pd.Timestamp("2020-01-01 01:10:00"),
+                      pd.Timestamp("2020-01-01 03:00:00")],
+    })
+    f = grid.poe_feature_grids(orders, stays, lengths, intimes, 5)
+    check("simultaneous POE rows form one order group",
+          int(f["poe_order_groups_current_hour"][0, 1]) == 1
+          and int(f["poe_order_rows_current_hour"][0, 1]) == 2)
+    check("current-hour POE is absent from current policy state",
+          int(f["poe_order_groups_6h"][0, 1]) == 0)
+    check("POE enters state in the following hour",
+          int(f["poe_order_groups_6h"][0, 2]) == 1
+          and int(f["poe_order_rows_6h"][0, 2]) == 2)
+    check("time since POE is also strictly lagged",
+          float(f["poe_hours_since_lab_order"][0, 1]) == 2.0
+          and float(f["poe_hours_since_lab_order"][0, 2]) == 1.0)
 
 
 # ------------------------------------------------------------------- SOFA ----
@@ -499,7 +529,10 @@ def test_artifacts():
         print("  SKIP  no rl/meta.json; run stage 3 first")
         return
     meta = json.loads(meta_p.read_text())
-    check("meta records a 21-dim state", meta["state_dim"] == 21)
+    expected_dim = 25 if meta.get("poe_state_included") else 21
+    check("meta records the configured state dimension",
+          meta["state_dim"] == expected_dim,
+          f"expected {expected_dim}, got {meta['state_dim']}")
 
     p = cfg.RL_DIR / "wbc_test.npz"
     if not p.exists():
@@ -523,6 +556,7 @@ def main():
     test_budget()
     test_forecaster_no_leakage()
     test_state_and_delta()
+    test_poe_features_are_past_only()
     test_batch_slicing()
     test_joint_panels()
     test_direct_policy()

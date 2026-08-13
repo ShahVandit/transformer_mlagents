@@ -38,6 +38,7 @@ the 24-hour budget rule, and every metric in Sec. 3.1.
 | Splits | 3,636/2,424 admissions | subject-level train/val/test | 65,366 patients hold 94,458 stays, so a stay-level split leaks a patient across train and test |
 | `eps_cost`, `c_l` tuned on | train | val | strictly cleaner; does not change the method |
 | OPE | PS-WIS only, no intervals | PS-WIS **plus** FQE, WDR, patient bootstrap CIs, ESS, support diagnostics, an FQE calibration check | see *What the paper does not report* |
+| Workflow context | not used | four strictly lagged POE lab-order features, with a physiology-only ablation and validation report | tests whether prior ordering workflow adds signal without asserting an order-to-specimen link |
 
 ---
 
@@ -66,6 +67,14 @@ Vitals are charted roughly hourly, so their predictive std is near-constant and
 carries little signal, while a lab's grows with time since it was last drawn and
 is exactly what the ordering decision turns on. Set
 `config.INCLUDE_VITAL_STD = True` for the 25-dim variant.
+
+The default MIMIC-IV state adds four strictly past-only POE workflow features:
+lab-order groups in the previous 6 and 24 hours, component order rows in the
+previous 6 hours, and time since the latest lab order. MIMIC-IV does not provide
+a shared key from `poe_id` to `specimen_id`, so these are independent workflow
+features, not claimed order-to-draw matches. Stage 2 writes
+`reports/poe_feature_validation.md`; pass `--exclude-poe-state` to stage 3 for
+the original 21-dimensional physiology-only ablation.
 
 **Action.** Binary per lab; four independent policies (creatinine, BUN, WBC,
 lactate), so `L = 1` each.
@@ -210,6 +219,18 @@ python run_pipeline.py --only 5            # one stage
 python run_pipeline.py --labs wbc lactate  # restrict the per-lab stages
 python tests/test_core.py                  # 50 property tests
 ```
+
+To add POE to an existing cached cohort without rescanning `chartevents` or
+`labevents`, then rebuild the hourly data and joint MDP:
+
+```bash
+python run_pipeline.py --only 1 --reuse-cache
+python run_pipeline.py --track joint --from 2 --to 3
+```
+
+Inspect `reports/poe_feature_validation.md` before training. It reports POE
+coverage, temporal association with later specimens, and the held-out change in
+ROC-AUC, PR-AUC, and Brier score after adding past POE features.
 
 Stage 1 scans `chartevents` (3.5 GB) and `labevents` (2.6 GB) once and caches the
 filtered result to parquet; it is by far the slowest step and does not need to be

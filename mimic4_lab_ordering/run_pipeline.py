@@ -46,6 +46,7 @@ DEFAULT_LABS = ["creatinine", "bun", "wbc", "lactate"]
 STAGES = [
     (1, "extract cohort", "s1_extract_cohort.py", False),
     (2, "hourly grid", "s2_hourly_grid.py", False),
+    (2, "validate POE features", "s2b_validate_poe.py", False),
     (3, "build MDP", "s3_build_mdp.py", False),
     (4, "train policy", "s4_train_mofqi.py", True),
     (5, "evaluate OPE", "s5_evaluate_ope.py", True),
@@ -56,6 +57,7 @@ STAGES = [
 JOINT_STAGES = [
     (1, "extract cohort", "s1_extract_cohort.py", False),
     (2, "hourly grid", "s2_hourly_grid.py", False),
+    (2, "validate POE features", "s2b_validate_poe.py", False),
     (3, "build joint MDP", "s3b_build_joint_mdp.py", False),
     (4, "train joint policy family", "s4c_train_family.py", False),
     (8, "joint frontier", "s8_frontier.py", False),
@@ -88,6 +90,8 @@ def main():
     ap.add_argument("--device", default=None,
                     help="joint track stages 4/8: cpu, cuda:0, etc. "
                          "(default: each script's own default)")
+    ap.add_argument("--exclude-poe-state", action="store_true",
+                    help="stage 3 ablation: omit past POE workflow features")
     args = ap.parse_args()
 
     start, end = (args.only, args.only) if args.only else (args.start, args.end)
@@ -114,6 +118,8 @@ def main():
             base += ["--ope", args.ope, "--family", args.family]
         if args.track == "joint" and args.device and num in (4, 8):
             base += ["--device", args.device]
+        if args.exclude_poe_state and num == 3:
+            base += ["--exclude-poe-state"]
         if args.quick and num == 4:
             if args.track == "joint":
                 base += (["--epochs", "2"] if args.family == "direct"

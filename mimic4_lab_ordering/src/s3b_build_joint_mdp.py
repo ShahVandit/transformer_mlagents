@@ -27,9 +27,9 @@ def make_done_and_next_state(df, state):
     return done, state[nxt]
 
 
-def build_split(df, utility_thresholds):
+def build_split(df, utility_thresholds, include_poe=True):
     df = add_sofa(df.sort_values(["stay_id", "hour"]).reset_index(drop=True))
-    state, cols = build_state(df)
+    state, cols = build_state(df, include_poe=include_poe)
     action = panels.encode_frame(df)
     realized_utility = objectives.realized_information(df, utility_thresholds)
     utility = objectives.utility_objective(
@@ -66,6 +66,8 @@ def build_split(df, utility_thresholds):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--exclude-poe-state", action="store_true",
+                    help="ablation: build the original physiology-only state")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
@@ -85,7 +87,8 @@ def main():
     state_cols = None
     for split in ("train", "val", "test"):
         frame = train_frame if split == "train" else pd.read_parquet(paths[split])
-        d, state_cols = build_split(frame, utility_thresholds)
+        d, state_cols = build_split(
+            frame, utility_thresholds, include_poe=not args.exclude_poe_state)
         built[split] = d
         print(f"{split}: {len(d['action']):,} hours, "
               f"{len(np.unique(d['stay_id'])):,} stays, "
@@ -107,6 +110,7 @@ def main():
         "track": "joint",
         "state_cols": state_cols or state_columns(),
         "state_dim": len(state_cols or state_columns()),
+        "poe_state_included": not args.exclude_poe_state,
         "reward_dims": cfg.JOINT_REWARD_DIMS,
         "reward_normalization": norm_meta,
         "panel_bits": cfg.JOINT_PANEL_BITS,
