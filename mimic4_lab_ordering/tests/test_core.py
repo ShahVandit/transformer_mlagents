@@ -27,6 +27,7 @@ import mofqi                  # noqa: E402
 import objectives             # noqa: E402
 import s3_build_mdp as mdp    # noqa: E402
 import s5_evaluate_ope as ope  # noqa: E402
+import s8_frontier as frontier  # noqa: E402
 import s6_clinical_metrics as clin  # noqa: E402
 import s2_hourly_grid as grid  # noqa: E402
 import target_lab_forecaster as target_fc  # noqa: E402
@@ -121,6 +122,27 @@ def test_pareto():
     check("MO-FQI preference extraction selects different trade-offs",
           np.all(utility_policy.predict(dummy) == 0)
           and np.all(burden_policy.predict(dummy) == 1))
+
+    candidates = [
+        {"name": "low", "utility": 2.0, "burden": 1.0},
+        {"name": "middle", "utility": 4.0, "burden": 2.0},
+        {"name": "high", "utility": 5.0, "burden": 4.0},
+    ]
+    selected = mofqi.epsilon_constraint_select(candidates, [0.5, 1.5, 3.0, 5.0])
+    names = [None if row["selected"] is None else row["selected"]["name"]
+             for row in selected]
+    check("epsilon constraints select maximum feasible utility",
+          names == [None, "low", "middle", "high"])
+
+    split = {
+        "stay_id": np.array([1, 1, 2], dtype=np.int64),
+        "information_potential": np.array([1.0, 2.0, 4.0], dtype=np.float32),
+        "draw_burden": np.ones(3, dtype=np.float32),
+    }
+    utility, burden = frontier.discounted_policy_objectives(
+        split, np.ones(3, dtype=np.int64), gamma=0.5)
+    check("epsilon budgets use discounted per-stay objective returns",
+          abs(utility - 3.0) < 1e-9 and abs(burden - 1.25) < 1e-9)
 
 
 def test_budget():

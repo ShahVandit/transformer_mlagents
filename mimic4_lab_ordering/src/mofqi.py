@@ -208,6 +208,38 @@ class WeightedQPolicy:
         return np.argmax(scores, axis=1).astype(np.int64)
 
 
+def epsilon_constraint_select(candidates, budgets, margin=0.0):
+    """Maximize validation utility subject to each burden budget.
+
+    ``candidates`` is an iterable of mappings with ``name``, ``utility``, and
+    ``burden``. This is an epsilon-constraint over a finite policy set, not a
+    local action threshold. Ties prefer lower burden and then a stable name.
+    """
+    rows = [dict(row) for row in candidates]
+    required = {"name", "utility", "burden"}
+    for row in rows:
+        missing = required.difference(row)
+        if missing:
+            raise ValueError(f"epsilon candidate missing fields: {sorted(missing)}")
+        row["utility"] = float(row["utility"])
+        row["burden"] = float(row["burden"])
+        if not np.isfinite(row["utility"]) or not np.isfinite(row["burden"]):
+            raise ValueError("epsilon candidates must have finite objectives")
+
+    selected = []
+    for budget in budgets:
+        budget = float(budget)
+        if not np.isfinite(budget) or budget < 0.0:
+            raise ValueError("epsilon burden budgets must be finite and non-negative")
+        feasible = [row for row in rows if row["burden"] <= budget + margin]
+        best = (max(feasible, key=lambda row: (row["utility"],
+                                               -row["burden"],
+                                               str(row["name"])))
+                if feasible else None)
+        selected.append({"budget": budget, "selected": best})
+    return selected
+
+
 def collapse_from_q(Q, eps):
     """Eq. 7 applied to precomputed Q-values.
 

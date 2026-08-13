@@ -143,6 +143,12 @@ JOINT_DETECTION_LOOKAHEAD_HOURS = 12
 # stays roughly constant and alpha means the same thing at every point.
 JOINT_PREFERENCES = [(0.9, 0.1), (0.7, 0.3), (0.5, 0.5), (0.3, 0.7), (0.1, 0.9)]
 
+# Epsilon-constraint reporting selects, on validation only, the candidate with
+# maximum utility whose burden does not exceed this fraction of the clinician's
+# validation burden. These are policy-level constraints over the trained MO-FQI
+# candidate set; they do not force a fixed number of draws in each patient-day.
+JOINT_EPSILON_BURDEN_FRACTIONS = [0.5, 0.75, 1.0, 1.25, 1.5]
+
 # A policy only joins the frontier if it beats both trivial baselines on its own
 # weighted objective. Without this a diverged run is indistinguishable from a
 # preference that genuinely wants more testing.

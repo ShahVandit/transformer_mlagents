@@ -85,6 +85,97 @@ def event_coverage(split, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS)
     return objectives.event_coverage(split, actions, lookback)
 
 
+def discounted_policy_objectives(split, actions, gamma=cfg.GAMMA):
+    """Replay mean discounted utility and burden per stay."""
+    actions = np.asarray(actions, dtype=np.int64)
+    values = np.stack([
+        objectives.utility_objective(split, actions),
+        objectives.burden_objective(split, actions),
+    ], axis=1).astype(np.float64)
+    stay = np.asarray(split["stay_id"])
+    returns = []
+    start = 0
+    for i in range(1, len(stay) + 1):
+        if i == len(stay) or stay[i] != stay[start]:
+            discount = gamma ** np.arange(i - start, dtype=np.float64)
+            returns.append((values[start:i] * discount[:, None]).sum(axis=0))
+            start = i
+    if not returns:
+        return 0.0, 0.0
+    mean = np.asarray(returns, dtype=np.float64).mean(axis=0)
+    return float(mean[0]), float(mean[1])
+
+
+def constant_objective_candidates(split):
+    """Constant policies used to validate an epsilon-constrained selection."""
+    n = len(split["action"])
+    out = []
+    for action, name in ((0, "never_draw"), (1, "always_draw")):
+        acts = np.full(n, action, dtype=np.int64)
+        utility, burden = discounted_policy_objectives(split, acts)
+        out.append({"name": name, "utility": utility, "burden": burden})
+    return out
+
+
+def select_epsilon_policies(prefs, tag, val, burden_fractions):
+    """Select learned MO-FQI candidates using validation data only."""
+    clinician_actions = np.asarray(val["action"], dtype=np.int64)
+    _, clinician_burden = discounted_policy_objectives(val, clinician_actions)
+    if clinician_burden <= 0.0:
+        raise SystemExit("clinician validation burden is not positive")
+
+    candidates = []
+    policies = {}
+    for pref in prefs:
+        name = f"mofqi_{pref_slug(pref)}{clean_tag(tag)}"
+        policy = load_policy(pref, tag=tag, device="cpu", family="mofqi")
+        actions = policy.predict(val["state"].astype(np.float32)).astype(np.int64)
+        utility, burden = discounted_policy_objectives(val, actions)
+        candidates.append({
+            "name": name,
+            "utility": utility,
+            "burden": burden,
+            "preference": tuple(pref),
+            "draws_per_patient_day": float(
+                (actions != 0).sum() / patient_days(val)),
+        })
+        policies[name] = policy
+
+    fractions = [float(x) for x in burden_fractions]
+    if any(not np.isfinite(x) or x <= 0.0 for x in fractions):
+        raise SystemExit("--burden-fractions must contain positive finite values")
+    budgets = [x * clinician_burden for x in fractions]
+    selections = mofqi.epsilon_constraint_select(candidates, budgets)
+    constants = constant_objective_candidates(val)
+
+    rows = []
+    for fraction, result in zip(fractions, selections):
+        budget = result["budget"]
+        feasible_constants = [x for x in constants if x["burden"] <= budget]
+        best_constant = max(feasible_constants, key=lambda x: x["utility"])
+        selected = result["selected"]
+        valid = bool(
+            selected is not None
+            and selected["utility"] > best_constant["utility"] + cfg.VALIDITY_MARGIN
+        )
+        rows.append({
+            "burden_fraction": fraction,
+            "burden_limit": budget,
+            "clinician_burden": clinician_burden,
+            "selected_policy": None if selected is None else selected["name"],
+            "selected_preference": (None if selected is None
+                                    else list(selected["preference"])),
+            "val_utility": None if selected is None else selected["utility"],
+            "val_burden": None if selected is None else selected["burden"],
+            "val_draws_per_patient_day": (None if selected is None else
+                                           selected["draws_per_patient_day"]),
+            "best_feasible_constant": best_constant["name"],
+            "best_feasible_constant_utility": best_constant["utility"],
+            "valid": valid,
+        })
+    return rows, policies
+
+
 def non_dominated(df, utility_col="wdr_utility", bur_col="wdr_burden"):
     vals = df[[utility_col, bur_col]].to_numpy(dtype=float)
     keep = np.ones(len(vals), dtype=bool)
@@ -350,7 +441,12 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
     return row
 
 
-def maybe_plot(df, family="cql"):
+def output_stem(family, selection="weighted"):
+    base = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
+    return base if selection == "weighted" else f"joint_{family}_epsilon_frontier"
+
+
+def maybe_plot(df, family="cql", selection="weighted"):
     try:
         import matplotlib.pyplot as plt
     except Exception as exc:
@@ -394,7 +490,7 @@ def maybe_plot(df, family="cql"):
     ax.set_ylabel("Information utility return, higher is better")
     ax.legend()
     fig.tight_layout()
-    prefix_name = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
+    prefix_name = output_stem(family, selection)
     fig.savefig(cfg.REPORTS_DIR / f"{prefix_name}_ope.png", dpi=160)
     plt.close(fig)
 
@@ -411,11 +507,12 @@ def maybe_plot(df, family="cql"):
     plt.close(fig)
 
 
-def write_report(df, metrics=None, family="cql"):
+def write_report(df, metrics=None, family="cql", selection="weighted"):
     utility_col = "wdr_utility" if "wdr_utility" in df.columns else "wis_utility"
     bur_col = "wdr_burden" if "wdr_burden" in df.columns else "wis_burden"
     label = "WDR" if utility_col.startswith("wdr") else "WIS"
-    cols = ["policy", "w_utility", "w_burden", "draws_per_patient_day",
+    cols = ["policy", "w_utility", "w_burden", "epsilon_burden_fractions",
+            "draws_per_patient_day",
             "event_coverage_replay", utility_col, bur_col, "ess_final",
             "beats_trivial", "non_dominated"]
     cols = [c for c in cols if c in df.columns]
@@ -423,12 +520,15 @@ def write_report(df, metrics=None, family="cql"):
          "Information utility is better higher. Burden is better lower. "
          "Non-dominated means no other learned policy has both higher utility "
          f"and lower burden under {label} point estimates.\n\n",
-         f"| policy | w_utility/w_bur | draws/day | replay coverage | {label} utility "
+         f"| policy | selection | draws/day | replay coverage | {label} utility "
          f"| {label} burden | ESS final | valid | non-dominated |\n",
          "|---|---|---:|---:|---:|---:|---:|---|---|\n"]
     for _, r in df[cols].iterrows():
-        w = ("" if pd.isna(r.get("w_utility", np.nan))
-             else f"{r['w_utility']:.1f}/{r['w_burden']:.1f}")
+        if selection == "epsilon" and r.get("policy") != "clinician":
+            w = f"epsilon={r.get('epsilon_burden_fractions', '')}x clinician"
+        else:
+            w = ("" if pd.isna(r.get("w_utility", np.nan))
+                 else f"{r['w_utility']:.1f}/{r['w_burden']:.1f}")
         nd = "yes" if bool(r.get("non_dominated")) else ""
         bt = r.get("beats_trivial")
         valid = "" if bt is None or pd.isna(bt) else ("yes" if bt else "**NO**")
@@ -462,6 +562,26 @@ def write_report(df, metrics=None, family="cql"):
                          f"{c['factual_hi']:+.4f}] | "
                          f"{'yes' if c['inside_ci'] else '**NO**'} |\n")
 
+        epsilon_rows = metrics.get("epsilon_selection") or []
+        if epsilon_rows:
+            L.append("\n## Epsilon-constraint selection on validation\n\n"
+                     "Each limit is a fraction of the clinician's validation "
+                     "burden. The feasible candidate with maximum validation "
+                     "utility is selected before the test set is evaluated.\n\n"
+                     "| burden fraction | burden limit | selected policy | "
+                     "val utility | val burden | valid |\n"
+                     "|---:|---:|---|---:|---:|---|\n")
+            for item in epsilon_rows:
+                utility = item.get("val_utility")
+                burden = item.get("val_burden")
+                L.append(
+                    f"| {item['burden_fraction']:.3f} | "
+                    f"{item['burden_limit']:.4f} | "
+                    f"{item.get('selected_policy') or 'none'} | "
+                    f"{'' if utility is None else f'{utility:+.4f}'} | "
+                    f"{'' if burden is None else f'{burden:.4f}'} | "
+                    f"{'yes' if item.get('valid') else '**NO**'} |\n")
+
     L.append(f"\nAll returns use `gamma = {cfg.GAMMA}`, the clinician row "
              f"included. Mixing a discounted clinician value with an "
              f"undiscounted policy estimate introduces a fixed scale factor of "
@@ -469,7 +589,7 @@ def write_report(df, metrics=None, family="cql"):
              f"which reads as the policies beating the clinician 15-fold on "
              f"both objectives when their per-step values are in fact "
              f"comparable.\n")
-    stem = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
+    stem = output_stem(family, selection)
     out = cfg.REPORTS_DIR / f"{stem}.md"
     out.write_text("".join(L), encoding="utf-8")
     print(f"wrote report -> {out}")
@@ -486,7 +606,17 @@ def main():
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--family", choices=["cql", "direct", "mofqi"], default="cql")
+    ap.add_argument("--selection", choices=["weighted", "epsilon"],
+                    default="weighted",
+                    help="weighted evaluates every trained preference; epsilon "
+                         "maximizes validation utility under burden limits")
+    ap.add_argument("--burden-fractions", nargs="+", type=float, default=None,
+                    help="epsilon burden limits as fractions of clinician "
+                         "validation burden")
     args = ap.parse_args()
+
+    if args.selection == "epsilon" and args.family != "mofqi":
+        raise SystemExit("epsilon selection currently requires --family mofqi")
 
     cfg.ensure_dirs()
     if args.family == "cql":
@@ -515,6 +645,22 @@ def main():
     for nm, sp in (("train", train), ("val", val), ("test", test)):
         objectives.assert_rewards_current(sp, norm_meta, name=f"joint_{nm}.npz")
     print("reward cache matches the current objectives")
+
+    epsilon_selection = []
+    selected_policies = {}
+    if args.selection == "epsilon":
+        fractions = (args.burden_fractions
+                     or cfg.JOINT_EPSILON_BURDEN_FRACTIONS)
+        print("selecting epsilon-constrained policies on validation only")
+        epsilon_selection, selected_policies = select_epsilon_policies(
+            prefs, args.tag, val, fractions)
+        for item in epsilon_selection:
+            selected = item["selected_policy"] or "NONE"
+            status = "VALID" if item["valid"] else "REJECTED"
+            print(f"  epsilon={item['burden_fraction']:.3f}x clinician: "
+                  f"limit={item['burden_limit']:.4f} selected={selected} "
+                  f"val_utility={item['val_utility']} "
+                  f"val_burden={item['val_burden']} -> {status}")
 
     print(f"joint frontier: {len(test['action']):,} test transitions, "
           f"{len(np.unique(test['stay_id'])):,} test stays")
@@ -569,12 +715,41 @@ def main():
     else:
         calibration = {}
 
-    for pref in prefs:
-        print(f"\n[w_utility={pref[0]}, w_bur={pref[1]}]")
-        policy = load_policy(pref, tag=args.tag, device=args.device,
-                             family=args.family)
-        row = {"policy": f"{args.family}_{pref_slug(pref)}{clean_tag(args.tag)}",
+    if args.selection == "weighted":
+        evaluation_specs = [{
+            "name": f"{args.family}_{pref_slug(pref)}{clean_tag(args.tag)}",
+            "preference": tuple(pref),
+            "policy": None,
+            "epsilon_rows": [],
+        } for pref in prefs]
+    else:
+        grouped = {}
+        for item in epsilon_selection:
+            name = item["selected_policy"]
+            if name is None:
+                continue
+            spec = grouped.setdefault(name, {
+                "name": name,
+                "preference": tuple(item["selected_preference"]),
+                "policy": selected_policies[name],
+                "epsilon_rows": [],
+            })
+            spec["epsilon_rows"].append(item)
+        evaluation_specs = list(grouped.values())
+
+    for spec in evaluation_specs:
+        pref = spec["preference"]
+        print(f"\n[policy={spec['name']}]")
+        policy = (spec["policy"] if spec["policy"] is not None else
+                  load_policy(pref, tag=args.tag, device=args.device,
+                              family=args.family))
+        row = {"policy": spec["name"],
                "w_utility": float(pref[0]), "w_burden": float(pref[1])}
+        if args.selection == "epsilon":
+            row["epsilon_burden_fractions"] = ",".join(
+                f"{x['burden_fraction']:.3g}" for x in spec["epsilon_rows"])
+            row["epsilon_burden_limits"] = ",".join(
+                f"{x['burden_limit']:.6g}" for x in spec["epsilon_rows"])
         policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
         draw = policy_actions != 0
         utility = objectives.utility_objective(test, policy_actions)
@@ -587,8 +762,12 @@ def main():
         # held-out set choose which policies are reportable, which is exactly the
         # selection test data must never make. Stage 4c already evaluated it on
         # val and stored the verdict beside the model.
-        row["beats_trivial"], row["gate_source"] = validity_from_sidecar(
-            pref, args.tag, val, norm_meta, base_cache, family=args.family)
+        if args.selection == "epsilon":
+            row["beats_trivial"] = any(x["valid"] for x in spec["epsilon_rows"])
+            row["gate_source"] = "epsilon_constraint_val"
+        else:
+            row["beats_trivial"], row["gate_source"] = validity_from_sidecar(
+                pref, args.tag, val, norm_meta, base_cache, family=args.family)
         if not row["beats_trivial"]:
             print("  WARNING: below the best constant policy on val; "
                   "excluded from the frontier")
@@ -640,17 +819,19 @@ def main():
     metrics["gamma"] = cfg.GAMMA
     metrics["estimator_used_for_frontier"] = utility_col.split("_")[0]
     metrics["family"] = args.family
+    metrics["selection"] = args.selection
+    if args.selection == "epsilon":
+        metrics["epsilon_selection"] = epsilon_selection
 
-    stem = ("joint_frontier" if args.family == "cql"
-            else f"joint_{args.family}_frontier")
+    stem = output_stem(args.family, args.selection)
     csv_out = cfg.REPORTS_DIR / f"{stem}.csv"
     json_out = cfg.REPORTS_DIR / f"{stem}.json"
     df.to_csv(csv_out, index=False)
     json_out.write_text(json.dumps(
         {"metrics": metrics, "rows": json.loads(df.to_json(orient="records"))},
         indent=2), encoding="utf-8")
-    write_report(df, metrics, family=args.family)
-    maybe_plot(df, family=args.family)
+    write_report(df, metrics, family=args.family, selection=args.selection)
+    maybe_plot(df, family=args.family, selection=args.selection)
     print(f"wrote -> {csv_out}")
     print(f"wrote -> {json_out}")
 

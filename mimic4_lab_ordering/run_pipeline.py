@@ -87,6 +87,13 @@ def main():
     ap.add_argument("--ope", choices=["all", "wis"], default="all",
                     help="joint track stage 8: all = FQE/WIS/WDR, "
                          "wis = skip FQE/WDR for a fast pass")
+    ap.add_argument("--selection", choices=["weighted", "epsilon"],
+                    default="weighted",
+                    help="joint MO-FQI stage 8: report all weighted candidates "
+                         "or validation-selected epsilon-constrained policies")
+    ap.add_argument("--burden-fractions", nargs="+", type=float, default=None,
+                    help="epsilon selection: burden limits as fractions of the "
+                         "clinician's validation burden")
     ap.add_argument("--device", default=None,
                     help="joint track stages 4/8: cpu, cuda:0, etc. "
                          "(default: each script's own default)")
@@ -122,6 +129,10 @@ def main():
             base += ["--prefs"] + [str(x) for x in args.prefs]
         if args.track == "joint" and num == 8:
             base += ["--ope", args.ope, "--family", args.family]
+            base += ["--selection", args.selection]
+            if args.burden_fractions:
+                base += (["--burden-fractions"]
+                         + [str(x) for x in args.burden_fractions])
         if args.track == "joint" and args.device and num in (4, 8):
             base += ["--device", args.device]
         if args.exclude_poe_state and num == 3:
