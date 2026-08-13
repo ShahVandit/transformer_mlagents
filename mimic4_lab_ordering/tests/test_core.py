@@ -24,11 +24,13 @@ import config as cfg          # noqa: E402
 import direct_policy as direct  # noqa: E402
 import forecast as fc         # noqa: E402
 import mofqi                  # noqa: E402
+import objectives             # noqa: E402
 import s3_build_mdp as mdp    # noqa: E402
 import s5_evaluate_ope as ope  # noqa: E402
 import s6_clinical_metrics as clin  # noqa: E402
 import s2_hourly_grid as grid  # noqa: E402
 import target_lab_forecaster as target_fc  # noqa: E402
+import joint_mdp_audit  # noqa: E402
 import sofa as sofa_mod       # noqa: E402
 
 PASS, FAIL = [], []
@@ -142,6 +144,54 @@ def test_budget():
     check("the budget clock does not cross stays", int(out.sum()) == 2)
 
 
+def test_joint_mdp_audit_rejects_bad_transition():
+    stay = np.array([1, 1, 2, 2], dtype=np.int64)
+    subject = np.array([10, 10, 20, 20], dtype=np.int64)
+    action = np.array([0, 1, 0, 1], dtype=np.int64)
+    potential = np.array([0.0, 2.0, 0.5, 1.0], dtype=np.float32)
+    draw_burden = np.array([1.0, 1.5, 1.0, 1.5], dtype=np.float32)
+    base = {
+        "stay_id": stay,
+        "subject_id": subject,
+        "hour": np.array([0, 1, 0, 1], dtype=np.int64),
+        "action": action,
+        "information_potential": potential,
+        "draw_burden": draw_burden,
+    }
+    utility = objectives.utility_objective(base, action)
+    burden = objectives.burden_objective(base, action)
+    reward = np.stack([utility, burden], axis=1).astype(np.float32)
+    split = {
+        **base,
+        "state": np.arange(8, dtype=np.float32).reshape(4, 2),
+        "reward": reward,
+        "done": np.array([0, 1, 0, 1], dtype=np.float32),
+        "event": np.zeros(4, dtype=np.int8),
+        "future_event": np.zeros(4, dtype=np.int8),
+        "n_labs": np.array([0, 1, 0, 1], dtype=np.int64),
+    }
+    split["next_state"] = split["state"][[1, 1, 3, 3]]
+    normed, norm = objectives.normalize_rewards(split, reward)
+    split["reward_norm"] = normed[0]
+    meta = {
+        "state_dim": 2,
+        "reward_dims": cfg.JOINT_REWARD_DIMS,
+        "panel_bits": cfg.JOINT_PANEL_BITS,
+        "reward_normalization": norm,
+    }
+    joint_mdp_audit.audit_split("synthetic", split, meta)
+    broken = dict(split)
+    broken["next_state"] = split["next_state"].copy()
+    broken["next_state"][0] = -1
+    try:
+        joint_mdp_audit.audit_split("broken", broken, meta)
+    except ValueError as exc:
+        check("joint MDP audit rejects bad next-state linkage",
+              "next-state linkage" in str(exc))
+    else:
+        check("joint MDP audit rejects bad next-state linkage", False)
+
+
 # ------------------------------------------------------------- forecaster ----
 def test_forecaster_no_leakage():
     print("\nforecaster leakage guard (Sec. 2.1)")
@@ -242,11 +292,11 @@ def test_target_forecaster_selection_and_calibration():
 # ------------------------------------------------------------------ state ----
 def test_state_and_delta():
     print("\nstate construction (Sec. 2.2)")
-    check("physiology state dimension is 21 as the paper reports",
-          len(mdp.state_columns(include_poe=False)) == 21,
+    check("joint state adds four explicit lab-history flags to the 21 paper features",
+          len(mdp.state_columns(include_poe=False)) == 25,
           str(len(mdp.state_columns(include_poe=False))))
     check("POE extension adds exactly four past-only workflow features",
-          len(mdp.state_columns(include_poe=True)) == 25,
+          len(mdp.state_columns(include_poe=True)) == 29,
           str(len(mdp.state_columns(include_poe=True))))
 
     obs = np.full((1, 6, 1), np.nan)
@@ -380,7 +430,8 @@ def test_joint_panels():
     check("a new stay starts with a clean redundancy clock",
           abs(float(b4[2]) - 1.0) < 1e-6)
 
-    # Joint utility follows the paper's thresholded expected information term.
+    # Joint utility is available before either action and follows the paper's
+    # thresholded forecast-change proxy.
     n = 5
     d = {"stay_id": np.zeros(n, dtype=int),
          "hour": np.arange(n, dtype=float)}
@@ -388,15 +439,18 @@ def test_joint_panels():
         d[f"mean_{lab}"] = np.array([0, 1, 4, 1, 0], dtype=float)
         d[f"last_{lab}"] = np.zeros(n)
         d[f"std_{lab}"] = np.ones(n)
-        d[f"obs_{lab}"] = np.array([0, 2, 8, np.nan, np.nan])
+        d[f"obs_{lab}"] = np.array([np.nan, 2, np.nan, 2, np.nan])
+        d[f"delta_{lab}"] = np.array([np.nan, 1, 1, 2, 3], dtype=float)
+    d["action"] = np.array([0, 1, 0, 1, 0], dtype=int)
     thresholds = objectives.fit_utility_thresholds(d)
-    potential = objectives.realized_information(d, thresholds)
+    potential = objectives.information_potential(d, thresholds)
     check("training thresholds are medians of clinician-ordered scores",
           all(v == 1.0 for v in thresholds.values()))
     check("threshold-level draws have no information utility", potential[1] == 0.0)
     check("larger forecast changes have more information utility", potential[2] > 0.0)
 
-    d["realized_utility"] = potential
+    d["information_potential"] = potential
+    d["draw_burden"] = objectives.burden_potential(d)
     none = np.zeros(n, dtype=int)
     informative = none.copy()
     informative[2] = 1
@@ -591,6 +645,7 @@ def main():
     test_rewards()
     test_pareto()
     test_budget()
+    test_joint_mdp_audit_rejects_bad_transition()
     test_forecaster_no_leakage()
     test_state_and_delta()
     test_poe_features_are_past_only()

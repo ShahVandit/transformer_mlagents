@@ -96,6 +96,7 @@ def state_columns(include_poe=None):
     cols += ["sofa"]
     cols += [f"last_{l}" for l in ids.TARGET_LABS]
     cols += [f"delta_{l}" for l in ids.TARGET_LABS]
+    cols += [f"seen_{l}" for l in ids.TARGET_LABS]
     if cfg.INCLUDE_POE_STATE if include_poe is None else include_poe:
         cols += poe_state_columns()
     return cols
@@ -106,6 +107,7 @@ def build_state(df, include_poe=None):
     a stay before a lab has ever been drawn."""
     d = df.copy()
     for l in ids.TARGET_LABS:
+        d[f"seen_{l}"] = d[f"last_{l}"].notna().astype(np.float32)
         # y_t before the first ever measurement: fall back to the forecaster's
         # prior mean, which is the best estimate available at that moment.
         d[f"last_{l}"] = d[f"last_{l}"].fillna(d[f"mean_{l}"])

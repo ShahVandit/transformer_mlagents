@@ -72,59 +72,60 @@ def deterioration_events(df):
     return onset | sofa
 
 
+UTILITY_DEFINITION = "state_computable_signed_forecast_information"
+
+
 def fit_utility_thresholds(train_df):
-    """Fit c_l on realized surprise from clinician-ordered TRAIN rows only."""
+    """Fit Cheng Eq. 5 cutoffs from decision-time TRAIN state only."""
+    if _has_col(train_df, "action"):
+        draw = _to_numpy(_col(train_df, "action")) != 0
+    else:
+        draw = panels.encode_frame(train_df) != 0
     thresholds = {}
     for lab in panels.LABS:
         mean = _to_numpy(_col(train_df, f"mean_{lab}")).astype(np.float64)
-        observed = _to_numpy(_col(train_df, f"obs_{lab}")).astype(np.float64)
+        last = _to_numpy(_col(train_df, f"last_{lab}")).astype(np.float64)
+        last = np.where(np.isfinite(last), last, mean)
         std = np.maximum(
             _to_numpy(_col(train_df, f"std_{lab}")).astype(np.float64),
             cfg.FORECAST_MIN_STD,
         )
-        score = np.abs(observed - mean) / std
-        eligible = np.isfinite(observed) & np.isfinite(score)
+        score = np.abs(mean - last) / std
+        eligible = draw & np.isfinite(score)
         thresholds[lab] = float(np.median(score[eligible])) if eligible.any() else 0.0
     return thresholds
 
 
-def realized_information(df, thresholds):
-    """Realized information from the labs observed in a physical blood draw.
+def information_potential(df, thresholds):
+    """Decision-time information value available for either action.
 
-    The result is compared with its past-only predictive mean and uncertainty.
-    Each lab is thresholded by the median realized surprise among clinician-
-    ordered training rows. The binary action does not specify which assays are
-    ordered, so utility is the strongest observed lab signal. No logged draw
-    means no observed result and therefore zero realized-information label.
+    This is Cheng Eq. 5's forecast-change proxy, but it uses only values already
+    present in the state: predictive mean, last observed value, and uncertainty.
+    Summing over the four assays reflects the utility of the joint blood panel.
     """
     values = []
     for lab in panels.LABS:
         mean = _to_numpy(_col(df, f"mean_{lab}")).astype(np.float64)
-        observed = _to_numpy(_col(df, f"obs_{lab}")).astype(np.float64)
+        last = _to_numpy(_col(df, f"last_{lab}")).astype(np.float64)
+        last = np.where(np.isfinite(last), last, mean)
         std = np.maximum(
             _to_numpy(_col(df, f"std_{lab}")).astype(np.float64),
             cfg.FORECAST_MIN_STD,
         )
-        score = np.abs(observed - mean) / std
-        score = np.where(np.isfinite(observed) & np.isfinite(score), score, 0.0)
+        score = np.abs(mean - last) / std
+        score = np.where(np.isfinite(score), score, 0.0)
         values.append(np.maximum(0.0, score - float(thresholds[lab])))
-    return np.max(np.stack(values, axis=1), axis=1).astype(np.float32)
+    return np.sum(np.stack(values, axis=1), axis=1).astype(np.float32)
 
 
 def utility_objective(df, actions, thresholds=None):
-    """Score agreement with logged informative draws.
-
-    At a clinician-draw hour, a policy draw receives +u and omission receives
-    -u. At a logged no-draw hour, utility is zero because no result exists to
-    establish realized information; a policy draw is handled by burden. This is
-    cost-sensitive clinician imitation, not a counterfactual utility estimate.
-    """
-    if _has_col(df, "realized_utility"):
-        utility = _to_numpy(_col(df, "realized_utility")).astype(np.float32)
+    """Give +u for measuring available information and -u for missing it."""
+    if _has_col(df, "information_potential"):
+        utility = _to_numpy(_col(df, "information_potential")).astype(np.float32)
     elif thresholds is not None:
-        utility = realized_information(df, thresholds)
+        utility = information_potential(df, thresholds)
     else:
-        raise ValueError("realized_utility or utility thresholds are required")
+        raise ValueError("information_potential or utility thresholds are required")
     draw = (np.asarray(actions) != 0).astype(np.float32)
     return utility * (2.0 * draw - 1.0)
 
@@ -171,27 +172,53 @@ def event_coverage(df, actions, lookback=cfg.JOINT_DETECTION_LOOKAHEAD_HOURS):
     return float(np.mean(covered)) if covered else np.nan
 
 
-def burden_objective(df, actions):
-    stay = _to_numpy(_col(df, "stay_id"))
-    hour = _to_numpy(_col(df, "hour")).astype(np.float32)
-    any_draw = np.asarray(actions) != 0
-    out = np.zeros(len(stay), dtype=np.float32)
+def burden_potential(df):
+    """Cost of drawing now from the current decision-time state.
 
-    start = 0
-    for i in range(1, len(stay) + 1):
-        if i == len(stay) or stay[i] != stay[start]:
-            last_seen = np.nan
-            for j in range(start, i):
-                if not any_draw[j]:
-                    continue
-                # One physical draw has one base cost. Repeating it soon adds a
-                # redundancy surcharge that decays with time since the previous
-                # draw; the first draw has no redundancy surcharge.
-                delta = hour[j] - last_seen if np.isfinite(last_seen) else np.inf
-                out[j] = 1.0 + float(np.exp(-delta / cfg.COST_DECAY_GAMMA))
-                last_seen = hour[j]
-            start = i
-    return out
+    The first term is the physical draw. The second penalizes redundancy when
+    any target lab was observed recently. Unlike a policy-history replay clock,
+    this is the same Markov reward used in both training and evaluation.
+    """
+    if _has_col(df, "draw_burden"):
+        return _to_numpy(_col(df, "draw_burden")).astype(np.float32)
+    delta = np.column_stack([
+        _to_numpy(_col(df, f"delta_{lab}")).astype(np.float64)
+        for lab in panels.LABS
+    ])
+    seen = np.column_stack([
+        _to_numpy(_col(df, f"last_{lab}")).astype(np.float64)
+        for lab in panels.LABS
+    ])
+    seen = np.isfinite(seen)
+    delta = np.where(np.isfinite(delta), delta, np.inf)
+    delta = np.where(seen, delta, np.inf)
+    since_any = np.maximum(np.min(delta, axis=1), 0.0)
+    return (1.0 + np.exp(-since_any / cfg.COST_DECAY_GAMMA)).astype(np.float32)
+
+
+def burden_objective(df, actions):
+    draw = (np.asarray(actions) != 0).astype(np.float32)
+    if (not _has_col(df, "draw_burden")
+            and not _has_col(df, "delta_creatinine")):
+        # Legacy standalone tests and the old per-lab path provide only a
+        # stay/hour frame. Keep their replay semantics isolated; joint MDP
+        # artifacts always use the state-computable draw_burden column.
+        stay = _to_numpy(_col(df, "stay_id"))
+        hour = _to_numpy(_col(df, "hour")).astype(np.float32)
+        out = np.zeros(len(stay), dtype=np.float32)
+        start = 0
+        for i in range(1, len(stay) + 1):
+            if i == len(stay) or stay[i] != stay[start]:
+                last_seen = np.nan
+                for j in range(start, i):
+                    if not draw[j]:
+                        continue
+                    delta = hour[j] - last_seen if np.isfinite(last_seen) else np.inf
+                    out[j] = 1.0 + float(np.exp(-delta / cfg.COST_DECAY_GAMMA))
+                    last_seen = hour[j]
+                start = i
+        return out
+    return burden_potential(df) * draw
 
 
 def assert_rewards_current(split, norm_meta=None, name="split", tol=1e-3):

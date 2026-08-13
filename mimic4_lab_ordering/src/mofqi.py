@@ -106,14 +106,26 @@ class MOFittedQ:
 
     # -- training ----------------------------------------------------------- #
     def fit(self, data, iterations=cfg.FQI_ITERATIONS, gamma=cfg.GAMMA,
-            sample_per_iter=cfg.FQI_SAMPLE_PER_ITER, verbose_every=10):
-        """Batch MO-FQI. `data` holds state/action/reward/next_state/done."""
+            sample_per_iter=cfg.FQI_SAMPLE_PER_ITER, verbose_every=10,
+            preference=None):
+        """Batch MO-FQI. `data` holds state/action/reward/next_state/done.
+
+        When ``preference`` is supplied, one next action is selected by the
+        scalarized Q-vector and that SAME action supplies every objective's
+        Bellman target. This yields a policy-consistent frontier point. Applying
+        weights only after independent per-objective maxima would combine
+        returns from mutually incompatible future policies.
+        """
         s = data["state"]
         a = data["action"]
         r = data["reward"].astype(np.float64)
         s2 = data["next_state"]
         not_done = (1.0 - data["done"]).astype(np.float64)
         n = len(a)
+        pref = None if preference is None else np.asarray(
+            preference, dtype=np.float64)
+        if pref is not None and pref.shape != (self.n_dims,):
+            raise ValueError("preference dimension does not match reward vector")
 
         # "sampled ... with probability inversely proportional to the frequency
         # of the action in the tuple" (Sec. 3). Orders are rare, so this is what
@@ -131,7 +143,13 @@ class MOFittedQ:
 
             Q_next = self.q_all_actions(s2[idx])                 # [m, A, D]
             keep = pareto_mask(Q_next)
-            v_next = pruned_max(Q_next, keep)                    # [m, D]
+            if pref is None:
+                v_next = pruned_max(Q_next, keep)                # [m, D]
+            else:
+                scores = np.einsum("mad,d->ma", Q_next, pref)
+                scores = np.where(keep, scores, -np.inf)
+                best = np.argmax(scores, axis=1)
+                v_next = Q_next[np.arange(m), best, :]           # [m, D]
             target = r[idx] + gamma * not_done[idx, None] * v_next
 
             models = []

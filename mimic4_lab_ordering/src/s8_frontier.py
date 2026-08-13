@@ -44,11 +44,14 @@ def load_split(split):
 
 def load_policy(pref, tag="", device="cpu", family="cql"):
     if family == "mofqi":
-        p = cfg.MODELS_DIR / f"joint_mofqi{clean_tag(tag)}.pkl"
+        p = (cfg.MODELS_DIR /
+             f"joint_mofqi_{pref_slug(pref)}{clean_tag(tag)}.pkl")
         if not p.exists():
             raise SystemExit(f"{p} not found; run joint MO-FQI training first")
         with p.open("rb") as f:
             payload = pickle.load(f)
+        if not np.allclose(payload.get("preference", pref), pref):
+            raise SystemExit(f"{p} was trained for a different preference")
         return mofqi.WeightedQPolicy(payload["model"], pref)
     suffix = ".pkl" if family == "direct" else ".d3"
     p = cfg.MODELS_DIR / f"joint_{family}_{pref_slug(pref)}{clean_tag(tag)}{suffix}"

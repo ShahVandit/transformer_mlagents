@@ -18,11 +18,15 @@ def information_frame():
         "hour": np.arange(n, dtype=np.float32),
     }
     for lab in ids.TARGET_LABS:
-        frame[f"mean_{lab}"] = np.zeros(n, dtype=np.float32)
+        frame[f"mean_{lab}"] = np.array(
+            [0, 1, 4, 0, 1, 0], dtype=np.float32)
         frame[f"last_{lab}"] = np.zeros(n, dtype=np.float32)
         frame[f"std_{lab}"] = np.ones(n, dtype=np.float32)
         frame[f"obs_{lab}"] = np.array(
             [np.nan, 1, 4, np.nan, 1, np.nan], dtype=np.float32)
+        frame[f"delta_{lab}"] = np.array(
+            [np.nan, 1, 1, 2, 1, 2], dtype=np.float32)
+    frame["action"] = np.array([0, 1, 0, 0, 1, 0], dtype=np.int64)
     return frame
 
 
@@ -31,14 +35,18 @@ def main():
     thresholds = objectives.fit_utility_thresholds(frame)
     assert all(value == 1.0 for value in thresholds.values()), thresholds
 
-    potential = objectives.realized_information(frame, thresholds)
-    # The binary action uses the strongest supported lab signal. Row 1 is at
-    # the threshold and row 2 carries 3 units, regardless of lab count.
+    potential = objectives.information_potential(frame, thresholds)
+    # The binary action is one joint panel, so information is summed over labs.
     assert potential[1] == 0.0
-    assert potential[2] == 3.0
+    assert potential[2] == 12.0
 
-    clinician = np.isfinite(frame["obs_creatinine"]).astype(np.int64)
-    split = {**frame, "realized_utility": potential, "action": clinician}
+    clinician = frame["action"].copy()
+    split = {
+        **frame,
+        "information_potential": potential,
+        "draw_burden": objectives.burden_potential(frame),
+        "action": clinician,
+    }
     never = np.zeros(len(potential), dtype=np.int64)
     low = never.copy()
     low[1] = 1

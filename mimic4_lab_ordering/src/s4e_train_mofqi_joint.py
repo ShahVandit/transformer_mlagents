@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as cfg
 import mofqi
 import objectives
+import joint_mdp_audit
 import s4c_train_family as tf
 
 
@@ -38,47 +39,57 @@ def main():
     norm_meta = meta["reward_normalization"]
     train = tf.load_split("train")
     val = tf.load_split("val")
+    test = tf.load_split("test")
     tf.validate_joint_artifacts(meta, train, val)
     for name, split in (("train", train), ("val", val)):
         objectives.assert_rewards_current(
             split, norm_meta, name=f"joint_{name}.npz")
+    print("running mandatory joint MDP audit before training")
+    joint_mdp_audit.audit_all(
+        meta, {"train": train, "val": val, "test": test})
+    print("joint MDP audit: PASS")
 
     prefs = parse_preferences(args.prefs)
     train_for_fit = dict(train)
     train_for_fit["reward"] = train["reward_norm"].astype(np.float32).copy()
     train_for_fit["reward"][:, 1] *= -1.0
 
+    tag = tf.clean_tag(args.tag)
     print(f"joint MO-FQI: {len(train['action']):,} train transitions, "
           f"state dim={train['state'].shape[1]}, objectives=[utility, -burden]")
-    print(f"training one vector-Q model for {args.iterations} iterations")
-    started = time.time()
-    model = mofqi.MOFittedQ(
-        n_actions=len(cfg.JOINT_PANEL_BITS),
-        n_dims=len(cfg.JOINT_REWARD_DIMS),
-    )
-    model.fit(
-        train_for_fit,
-        iterations=args.iterations,
-        gamma=cfg.GAMMA,
-        sample_per_iter=args.sample_per_iter,
-    )
-    print(f"training completed in {time.time() - started:.1f}s")
-
-    tag = tf.clean_tag(args.tag)
-    model_path = cfg.MODELS_DIR / f"joint_mofqi{tag}.pkl"
-    with model_path.open("wb") as f:
-        pickle.dump({
-            "model": model,
-            "state_cols": meta["state_cols"],
-            "reward_dims": ["utility", "neg_burden"],
-            "iterations": args.iterations,
-            "sample_per_iter": args.sample_per_iter,
-        }, f)
-    print(f"saved shared vector-Q model -> {model_path}")
-
+    print(f"training {len(prefs)} policy-consistent vector-Q models, "
+          f"{args.iterations} iterations each")
     base_cache = tf.constant_policy_returns(val, norm_meta)
     rows = []
     for pref in prefs:
+        print(f"\n[preference={pref}]")
+        started = time.time()
+        model = mofqi.MOFittedQ(
+            n_actions=len(cfg.JOINT_PANEL_BITS),
+            n_dims=len(cfg.JOINT_REWARD_DIMS),
+        )
+        model.fit(
+            train_for_fit,
+            iterations=args.iterations,
+            gamma=cfg.GAMMA,
+            sample_per_iter=args.sample_per_iter,
+            preference=pref,
+        )
+        print(f"  training completed in {time.time() - started:.1f}s")
+        model_path = (cfg.MODELS_DIR /
+                      f"joint_mofqi_{tf.pref_slug(pref)}{tag}.pkl")
+        with model_path.open("wb") as f:
+            pickle.dump({
+                "model": model,
+                "preference": list(pref),
+                "state_cols": meta["state_cols"],
+                "reward_dims": ["utility", "neg_burden"],
+                "iterations": args.iterations,
+                "sample_per_iter": args.sample_per_iter,
+                "backup": "preference_consistent",
+            }, f)
+        print(f"  saved vector-Q model -> {model_path}")
+
         policy = mofqi.WeightedQPolicy(model, pref)
         base = tf.trivial_baselines(val, pref, norm_meta, base_cache)
         summary = tf.summarize_policy_with_pref(
@@ -92,7 +103,7 @@ def main():
         sidecar.write_text(json.dumps({
             "track": "joint",
             "learner": "MO-FQI",
-            "shared_model_path": str(model_path),
+            "model_path": str(model_path),
             "preference": list(pref),
             "reward_dims": cfg.JOINT_REWARD_DIMS,
             "q_reward_dims": ["utility", "neg_burden"],
@@ -104,8 +115,8 @@ def main():
 
     report = [
         "# Joint MO-FQI policy family\n\n",
-        "One vector-Q model was trained on `[utility, -burden]`. The preference "
-        "is applied only during action selection.\n\n",
+        "Each vector-Q model was trained on `[utility, -burden]` with its "
+        "preference used inside the Bellman backup.\n\n",
         "| utility weight | burden weight | draws/day | coverage | reward | valid |\n",
         "|---:|---:|---:|---:|---:|---|\n",
     ]

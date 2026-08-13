@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as cfg
 import objectives
 import panels
+import joint_mdp_audit
 from s3_build_mdp import add_sofa, build_state, state_columns
 
 
@@ -31,16 +32,19 @@ def build_split(df, utility_thresholds, include_poe=True):
     df = add_sofa(df.sort_values(["stay_id", "hour"]).reset_index(drop=True))
     state, cols = build_state(df, include_poe=include_poe)
     action = panels.encode_frame(df)
-    realized_utility = objectives.realized_information(df, utility_thresholds)
+    information_potential = objectives.information_potential(
+        df, utility_thresholds)
+    draw_burden = objectives.burden_potential(df)
     utility = objectives.utility_objective(
         {
-            "realized_utility": realized_utility,
+            "information_potential": information_potential,
             "stay_id": df["stay_id"].to_numpy(),
             "hour": df["hour"].to_numpy(),
         },
         action,
     )
-    burden = objectives.burden_objective(df, action)
+    burden = objectives.burden_objective(
+        {"draw_burden": draw_burden}, action)
     reward = np.stack([utility, burden], axis=1).astype(np.float32)
     event = objectives.deterioration_events(df)
     episode_onset = objectives.deterioration_episode_onsets(df)
@@ -59,7 +63,8 @@ def build_split(df, utility_thresholds, include_poe=True):
         "hour": df["hour"].to_numpy(dtype=np.int64),
         "event": event.astype(np.int8),
         "future_event": future_event.astype(np.int8),
-        "realized_utility": realized_utility.astype(np.float32),
+        "information_potential": information_potential.astype(np.float32),
+        "draw_burden": draw_burden.astype(np.float32),
         "n_labs": panels.panel_n_labs(action),
     }, cols
 
@@ -116,7 +121,7 @@ def main():
         "panel_bits": cfg.JOINT_PANEL_BITS,
         "panel_names": cfg.JOINT_PANEL_NAMES,
         "lookahead_hours": cfg.JOINT_DETECTION_LOOKAHEAD_HOURS,
-        "utility_definition": "clinician_conditioned_signed_realized_information",
+        "utility_definition": objectives.UTILITY_DEFINITION,
         "utility_thresholds": utility_thresholds,
         "gamma": cfg.GAMMA,
         "action_distribution": {
@@ -138,6 +143,12 @@ def main():
     for row in meta["action_distribution"]["train"]:
         print(f"  {row['action']}: {row['bits']} {row['panel']:28s} "
               f"{row['frac']:.4%}")
+
+    print("\nrunning mandatory joint MDP audit")
+    reports = joint_mdp_audit.audit_all(meta, built)
+    for split, row in reports.items():
+        print(f"  {split}: PASS ({row['transitions']:,} transitions, "
+              f"{row['stays']:,} stays)")
 
 
 if __name__ == "__main__":
