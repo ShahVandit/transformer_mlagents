@@ -211,6 +211,117 @@ class WeightedQPolicy:
         return (advantage @ self.preference > 0.0).astype(np.int64)
 
 
+class LagrangianQPolicy:
+    """Binary policy with a clinically calibrated burden trade-off.
+
+    ``lambda_burden`` is selected on validation data, not used in MO-FQI
+    training. The shared model predicts ``[utility, -burden]`` and the policy
+    draws when ``delta_utility + lambda * delta_neg_burden > 0``.
+    """
+
+    def __init__(self, model, lambda_burden):
+        self.model = model
+        self.lambda_burden = float(lambda_burden)
+        if not np.isfinite(self.lambda_burden) or self.lambda_burden < 0.0:
+            raise ValueError("lambda_burden must be finite and non-negative")
+        if model.n_dims != 2:
+            raise ValueError("Lagrangian policy requires [utility, -burden]")
+
+    def predict(self, states):
+        q = self.model.q_all_actions(np.asarray(states, dtype=np.float32))
+        if q.shape[1] != 2:
+            raise ValueError("Lagrangian advantage policy requires two actions")
+        advantage = q[:, 1, :] - q[:, 0, :]
+        score = advantage[:, 0] + self.lambda_burden * advantage[:, 1]
+        return (score > 0.0).astype(np.int64)
+
+
+def _discount_weights(stay_ids, gamma):
+    """Per-row discount weights whose dot product is mean return per stay."""
+    stay = np.asarray(stay_ids)
+    if len(stay) == 0:
+        return np.zeros(0, dtype=np.float64)
+    boundaries = np.r_[0, np.flatnonzero(stay[1:] != stay[:-1]) + 1, len(stay)]
+    out = np.empty(len(stay), dtype=np.float64)
+    for lo, hi in zip(boundaries[:-1], boundaries[1:]):
+        out[lo:hi] = float(gamma) ** np.arange(hi - lo, dtype=np.float64)
+    return out / max(len(boundaries) - 1, 1)
+
+
+def calibrate_burden_policies(model, split, burden_fractions, gamma=cfg.GAMMA,
+                              max_breakpoints=512):
+    """Choose Lagrange multipliers for clinical burden budgets on validation.
+
+    Candidate multipliers come from the learned advantage breakpoints, where
+    an action can actually change. For each fraction of clinician burden, the
+    selected candidate maximizes replay utility while respecting that limit.
+    The held-out test split must never be passed here.
+    """
+    fractions = np.asarray(burden_fractions, dtype=np.float64)
+    if (fractions.ndim != 1 or len(fractions) == 0
+            or not np.isfinite(fractions).all() or (fractions <= 0.0).any()):
+        raise ValueError("burden fractions must be positive finite values")
+
+    q = model.q_all_actions(np.asarray(split["state"], dtype=np.float32))
+    if q.shape[1:] != (2, 2):
+        raise ValueError("calibration requires binary [utility, -burden] Q-values")
+    advantage = q[:, 1, :].astype(np.float64) - q[:, 0, :].astype(np.float64)
+    du, dneg_burden = advantage[:, 0], advantage[:, 1]
+    roots = -du[np.abs(dneg_burden) > 1e-12] / dneg_burden[np.abs(dneg_burden) > 1e-12]
+    roots = np.unique(roots[np.isfinite(roots) & (roots >= 0.0)])
+    if len(roots) > max_breakpoints:
+        idx = np.linspace(0, len(roots) - 1, max_breakpoints).round().astype(int)
+        roots = roots[idx]
+    candidates = np.unique(np.r_[0.0, roots, np.nextafter(roots, -np.inf)])
+    candidates = candidates[np.isfinite(candidates) & (candidates >= 0.0)]
+    if len(roots):
+        candidates = np.unique(np.r_[candidates, np.nextafter(roots[-1], np.inf)])
+
+    weights = _discount_weights(split["stay_id"], gamma)
+    trigger = np.asarray(split["clinical_trigger"], dtype=np.float64)
+    draw_burden = np.asarray(split["draw_burden"], dtype=np.float64)
+    clinician_draw = np.asarray(split["action"]) != 0
+    clinician_burden = float(np.dot(weights, draw_burden * clinician_draw))
+    if clinician_burden <= 0.0:
+        raise ValueError("clinician validation burden must be positive")
+
+    candidate_rows = []
+    for lam in candidates:
+        draw = du + float(lam) * dneg_burden > 0.0
+        candidate_rows.append({
+            "lambda_burden": float(lam),
+            "utility": float(np.dot(weights, trigger * draw)),
+            "burden": float(np.dot(weights, draw_burden * draw)),
+            "draw_rate": float(draw.mean()),
+        })
+
+    selected = []
+    days = max(len(trigger) / 24.0, 1e-6)
+    for fraction in fractions:
+        limit = float(fraction * clinician_burden)
+        feasible = [row for row in candidate_rows if row["burden"] <= limit + 1e-12]
+        best = (max(feasible, key=lambda row: (row["utility"], row["burden"],
+                                               -row["lambda_burden"]))
+                if feasible else None)
+        if best is None:
+            selected.append({
+                "burden_fraction": float(fraction), "burden_limit": limit,
+                "clinician_burden": clinician_burden, "valid": False,
+            })
+            continue
+        row = dict(best)
+        row.update({
+            "burden_fraction": float(fraction),
+            "burden_limit": limit,
+            "clinician_burden": clinician_burden,
+            "achieved_burden_fraction": row["burden"] / clinician_burden,
+            "draws_per_patient_day": row["draw_rate"] * 24.0,
+            "valid": bool(row["utility"] > 0.0),
+        })
+        selected.append(row)
+    return selected
+
+
 def epsilon_constraint_select(candidates, budgets, margin=0.0):
     """Maximize validation utility subject to each burden budget.
 

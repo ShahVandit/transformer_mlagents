@@ -87,10 +87,10 @@ def main():
     ap.add_argument("--ope", choices=["all", "wis"], default="all",
                     help="joint track stage 8: all = FQE/WIS/WDR, "
                          "wis = skip FQE/WDR for a fast pass")
-    ap.add_argument("--selection", choices=["weighted", "epsilon"],
-                    default="weighted",
+    ap.add_argument("--selection", choices=["weighted", "epsilon", "calibrated"],
+                    default=None,
                     help="joint MO-FQI stage 8: report all weighted candidates "
-                         "or validation-selected epsilon-constrained policies")
+                         "or validation-calibrated burden policies (MO-FQI default)")
     ap.add_argument("--burden-fractions", nargs="+", type=float, default=None,
                     help="epsilon selection: burden limits as fractions of the "
                          "clinician's validation burden")
@@ -129,10 +129,16 @@ def main():
             base += ["--prefs"] + [str(x) for x in args.prefs]
         if args.track == "joint" and num == 8:
             base += ["--ope", args.ope, "--family", args.family]
-            base += ["--selection", args.selection]
+            selection = (args.selection or
+                         ("calibrated" if args.family == "mofqi" else "weighted"))
+            base += ["--selection", selection]
             if args.burden_fractions:
                 base += (["--burden-fractions"]
                          + [str(x) for x in args.burden_fractions])
+        if (args.track == "joint" and num == 4 and args.family == "mofqi"
+                and args.burden_fractions):
+            base += (["--burden-fractions"]
+                     + [str(x) for x in args.burden_fractions])
         if args.track == "joint" and args.device and num in (4, 8):
             base += ["--device", args.device]
         if args.exclude_poe_state and num == 3:

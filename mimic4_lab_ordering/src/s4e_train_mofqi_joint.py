@@ -29,6 +29,11 @@ def parse_preferences(flat):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefs", nargs="+", type=float, default=None)
+    ap.add_argument("--burden-fractions", nargs="+", type=float, default=None,
+                    help="validation burden targets relative to clinicians")
+    ap.add_argument("--lambda-grid", nargs="+", type=float,
+                    default=[0.0, 0.1, 0.3, 1.0, 3.0, 10.0],
+                    help="policy-consistent burden multipliers to train")
     ap.add_argument("--iterations", type=int, default=cfg.FQI_ITERATIONS)
     ap.add_argument("--sample-per-iter", type=int, default=cfg.FQI_SAMPLE_PER_ITER)
     ap.add_argument("--tag", default="")
@@ -52,6 +57,8 @@ def main():
     print("joint MDP audit: PASS")
 
     prefs = parse_preferences(args.prefs)
+    burden_fractions = (args.burden_fractions
+                        or cfg.JOINT_EPSILON_BURDEN_FRACTIONS)
     train_for_fit = dict(train)
     train_for_fit["reward"] = train["reward_norm"].astype(np.float32).copy()
     train_for_fit["reward"][:, 1] *= -1.0
@@ -59,38 +66,115 @@ def main():
     tag = tf.clean_tag(args.tag)
     print(f"joint MO-FQI: {len(train['action']):,} train transitions, "
           f"state dim={train['state'].shape[1]}, objectives=[utility, -burden]")
-    mode = ("preference-consistent backups" if args.per_preference_backup
-            else "one shared vector-Q backup")
-    print(f"training {len(prefs)} policies with {mode}, "
-          f"{args.iterations} iterations")
+    mode = (f"{len(prefs)} preference-consistent backups"
+            if args.per_preference_backup else
+            f"{len(args.lambda_grid)} policy-consistent lambda backups")
+    print(f"training with {mode}, {args.iterations} iterations")
     base_cache = tf.constant_policy_returns(val, norm_meta)
     rows = []
     shared_model = None
     if not args.per_preference_backup:
-        started = time.time()
-        shared_model = mofqi.MOFittedQ(
-            n_actions=len(cfg.JOINT_PANEL_BITS),
-            n_dims=len(cfg.JOINT_REWARD_DIMS),
-        )
-        shared_model.fit(
-            train_for_fit,
-            iterations=args.iterations,
-            gamma=cfg.GAMMA,
-            sample_per_iter=args.sample_per_iter,
-            preference=None,
-        )
-        shared_path = cfg.MODELS_DIR / f"joint_mofqi_vector{tag}.pkl"
+        lambdas = sorted({float(x) for x in args.lambda_grid
+                          if np.isfinite(x) and x >= 0.0})
+        if not lambdas:
+            raise SystemExit("--lambda-grid must contain a non-negative finite value")
+        models = {}
+        candidates = []
+        for lam in lambdas:
+            print(f"\n[lambda_burden={lam:g}]")
+            started = time.time()
+            model = mofqi.MOFittedQ(
+                n_actions=len(cfg.JOINT_PANEL_BITS),
+                n_dims=len(cfg.JOINT_REWARD_DIMS),
+            )
+            model.fit(
+                train_for_fit,
+                iterations=args.iterations,
+                gamma=cfg.GAMMA,
+                sample_per_iter=args.sample_per_iter,
+                preference=(1.0, lam),
+            )
+            key = str(lam).replace(".", "p")
+            models[key] = model
+            policy = mofqi.WeightedQPolicy(model, (1.0, lam))
+            acts = policy.predict(val["state"])
+            utility = objectives.utility_objective(val, acts)
+            burden = objectives.burden_objective(val, acts)
+            candidates.append({
+                "lambda_burden": lam,
+                "model_key": key,
+                "utility": float(tf.per_stay_sum(utility, val["stay_id"]).mean()),
+                "burden": float(tf.per_stay_sum(burden, val["stay_id"]).mean()),
+                "draws_per_patient_day": float(acts.sum() / max(len(acts) / 24.0, 1e-6)),
+            })
+            print(f"  completed in {time.time() - started:.1f}s; "
+                  f"draws/day={candidates[-1]['draws_per_patient_day']:.3f}")
+
+        clinician_burden = float(tf.per_stay_sum(
+            objectives.burden_objective(val, val["action"]), val["stay_id"]).mean())
+        calibrated = []
+        for fraction in burden_fractions:
+            limit = float(fraction) * clinician_burden
+            feasible = [row for row in candidates if row["burden"] <= limit]
+            best = max(feasible, key=lambda row: (row["utility"], -row["burden"])) if feasible else None
+            row = {"burden_fraction": float(fraction), "burden_limit": limit,
+                   "clinician_burden": clinician_burden, "valid": best is not None}
+            if best:
+                row.update(best)
+                row["achieved_burden_fraction"] = best["burden"] / clinician_burden
+            calibrated.append(row)
+
+        shared_path = cfg.MODELS_DIR / f"joint_mofqi_lambda_bundle{tag}.pkl"
         with shared_path.open("wb") as f:
-            pickle.dump({
-                "model": shared_model,
-                "state_cols": meta["state_cols"],
-                "reward_dims": ["utility", "neg_burden"],
-                "iterations": args.iterations,
-                "sample_per_iter": args.sample_per_iter,
-                "backup": "vector_pareto_max",
-            }, f)
-        print(f"shared vector-Q model saved -> {shared_path} "
-              f"({time.time() - started:.1f}s)")
+            pickle.dump({"models": models, "candidates": candidates,
+                         "state_cols": meta["state_cols"],
+                         "reward_dims": ["utility", "neg_burden"],
+                         "iterations": args.iterations,
+                         "sample_per_iter": args.sample_per_iter,
+                         "backup": "preference_consistent_lambda"}, f)
+        print(f"lambda bundle saved -> {shared_path}")
+        manifest_path = (cfg.MODELS_DIR /
+                         f"joint_mofqi_burden_policies{tag}.json")
+        manifest_path.write_text(json.dumps({
+            "track": "joint",
+            "learner": "MO-FQI",
+            "model_path": str(shared_path),
+            "q_reward_dims": ["utility", "neg_burden"],
+            "backup": "preference_consistent_lambda",
+            "policy_rule": "argmax weighted Q with preference=(1, lambda)",
+            "selection_split": "validation",
+            "burden_reference": "clinician_discounted_mean_return",
+            "gamma": cfg.GAMMA,
+            "policies": calibrated,
+        }, indent=2), encoding="utf-8")
+        print("\nvalidation-calibrated policies")
+        for row in calibrated:
+            print(f"  {row['burden_fraction']:.2f}x clinician: "
+                  f"lambda={row.get('lambda_burden', float('nan')):.6g} "
+                  f"achieved={row.get('achieved_burden_fraction', float('nan')):.3f}x "
+                  f"draws/day={row.get('draws_per_patient_day', float('nan')):.3f} "
+                  f"utility={row.get('utility', float('nan')):.4f}")
+        report = [
+            "# Shared MO-FQI burden-calibrated policies\n\n",
+            "One preference-independent vector MO-FQI model is trained on "
+            "`[utility, -burden]`. Each policy uses a Lagrange multiplier "
+            "selected on validation data to maximize utility without exceeding "
+            "a stated fraction of clinician burden.\n\n",
+            "| burden target | lambda | achieved burden | draws/day | utility |\n",
+            "|---:|---:|---:|---:|---:|\n",
+        ]
+        for row in calibrated:
+            report.append(
+                f"| {row['burden_fraction']:.2f}x | "
+                f"{row.get('lambda_burden', float('nan')):.6g} | "
+                f"{row.get('achieved_burden_fraction', float('nan')):.3f}x | "
+                f"{row.get('draws_per_patient_day', float('nan')):.3f} | "
+                f"{row.get('utility', float('nan')):.4f} |\n")
+        out = cfg.REPORTS_DIR / "train_joint_mofqi_family.md"
+        out.write_text("".join(report), encoding="utf-8")
+        print(f"wrote calibration manifest -> {manifest_path}")
+        print(f"wrote report -> {out}")
+        return
 
     for pref in prefs:
         print(f"\n[preference={pref}]")

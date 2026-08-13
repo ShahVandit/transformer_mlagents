@@ -69,6 +69,49 @@ def load_policy(pref, tag="", device="cpu", family="cql"):
     return d3rlpy.load_learnable(str(p), device=device)
 
 
+def load_calibrated_policies(tag="", burden_fractions=None):
+    """Load validation-selected policies backed by one shared MO-FQI model."""
+    suffix = clean_tag(tag)
+    manifest_path = cfg.MODELS_DIR / f"joint_mofqi_burden_policies{suffix}.json"
+    if not manifest_path.exists():
+        raise SystemExit(
+            f"{manifest_path} not found; rerun joint MO-FQI stage 4 to calibrate policies")
+    manifest = json.loads(manifest_path.read_text())
+    model_path = Path(manifest["model_path"])
+    if not model_path.is_absolute():
+        model_path = cfg.MODELS_DIR / model_path.name
+    if not model_path.exists():
+        raise SystemExit(f"{model_path} not found; run joint MO-FQI training first")
+    with model_path.open("rb") as f:
+        bundle = pickle.load(f)
+    rows = manifest.get("policies", [])
+    if burden_fractions is not None:
+        requested = [float(x) for x in burden_fractions]
+        rows = [next((row for row in rows
+                      if np.isclose(row["burden_fraction"], fraction)), None)
+                for fraction in requested]
+        missing = [fraction for fraction, row in zip(requested, rows) if row is None]
+        if missing:
+            raise SystemExit(
+                f"calibration manifest lacks burden fractions {missing}; "
+                "rerun stage 4 with --burden-fractions")
+    specs = []
+    for row in rows:
+        if not row.get("valid") or row.get("lambda_burden") is None:
+            continue
+        fraction = float(row["burden_fraction"])
+        model = bundle["models"][str(row["model_key"])]
+        specs.append({
+            "name": f"mofqi_burden_{str(fraction).replace('.', 'p')}x{suffix}",
+            "policy": mofqi.WeightedQPolicy(
+                model, (1.0, float(row["lambda_burden"]))),
+            "calibration": row,
+        })
+    if not specs:
+        raise SystemExit("calibration manifest contains no valid policies")
+    return specs, manifest
+
+
 def make_dataset(split, reward):
     from d3rlpy.constants import ActionSpace
     from d3rlpy.dataset import MDPDataset
@@ -448,7 +491,9 @@ def evaluate_policy(name, policy, train, test, beh, pi_b_test, trajs, subj_of_tr
 
 def output_stem(family, selection="weighted"):
     base = "joint_frontier" if family == "cql" else f"joint_{family}_frontier"
-    return base if selection == "weighted" else f"joint_{family}_epsilon_frontier"
+    if selection == "weighted":
+        return base
+    return f"joint_{family}_{selection}_frontier"
 
 
 def maybe_plot(df, family="cql", selection="weighted"):
@@ -529,7 +574,7 @@ def write_report(df, metrics=None, family="cql", selection="weighted"):
          f"| {label} burden | ESS final | valid | non-dominated |\n",
          "|---|---|---:|---:|---:|---:|---:|---|---|\n"]
     for _, r in df[cols].iterrows():
-        if selection == "epsilon" and r.get("policy") != "clinician":
+        if selection in ("epsilon", "calibrated") and r.get("policy") != "clinician":
             w = f"epsilon={r.get('epsilon_burden_fractions', '')}x clinician"
         else:
             w = ("" if pd.isna(r.get("w_utility", np.nan))
@@ -611,8 +656,8 @@ def main():
     ap.add_argument("--epsilon", type=float, default=cfg.OPE_EPSILON)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--family", choices=["cql", "direct", "mofqi"], default="cql")
-    ap.add_argument("--selection", choices=["weighted", "epsilon"],
-                    default="weighted",
+    ap.add_argument("--selection", choices=["weighted", "epsilon", "calibrated"],
+                    default=None,
                     help="weighted evaluates every trained preference; epsilon "
                          "maximizes validation utility under burden limits")
     ap.add_argument("--burden-fractions", nargs="+", type=float, default=None,
@@ -620,8 +665,11 @@ def main():
                          "validation burden")
     args = ap.parse_args()
 
-    if args.selection == "epsilon" and args.family != "mofqi":
-        raise SystemExit("epsilon selection currently requires --family mofqi")
+    args.selection = (args.selection or
+                      ("calibrated" if args.family == "mofqi" else "weighted"))
+
+    if args.selection in ("epsilon", "calibrated") and args.family != "mofqi":
+        raise SystemExit(f"{args.selection} selection requires --family mofqi")
 
     cfg.ensure_dirs()
     if args.family == "cql":
@@ -666,6 +714,17 @@ def main():
                   f"limit={item['burden_limit']:.4f} selected={selected} "
                   f"val_utility={item['val_utility']} "
                   f"val_burden={item['val_burden']} -> {status}")
+    calibrated_specs = []
+    calibrated_manifest = {}
+    if args.selection == "calibrated":
+        calibrated_specs, calibrated_manifest = load_calibrated_policies(
+            args.tag, args.burden_fractions)
+        print("loading validation-calibrated clinical burden policies")
+        for spec in calibrated_specs:
+            item = spec["calibration"]
+            print(f"  target={item['burden_fraction']:.2f}x clinician "
+                  f"lambda={item['lambda_burden']:.6g} "
+                  f"achieved={item['achieved_burden_fraction']:.3f}x")
 
     print(f"joint frontier: {len(test['action']):,} test transitions, "
           f"{len(np.unique(test['stay_id'])):,} test stays")
@@ -727,7 +786,7 @@ def main():
             "policy": None,
             "epsilon_rows": [],
         } for pref in prefs]
-    else:
+    elif args.selection == "epsilon":
         grouped = {}
         for item in epsilon_selection:
             name = item["selected_policy"]
@@ -741,6 +800,14 @@ def main():
             })
             spec["epsilon_rows"].append(item)
         evaluation_specs = list(grouped.values())
+    else:
+        evaluation_specs = [{
+            "name": spec["name"],
+            "preference": (np.nan, np.nan),
+            "policy": spec["policy"],
+            "epsilon_rows": [],
+            "calibration": spec["calibration"],
+        } for spec in calibrated_specs]
 
     for spec in evaluation_specs:
         pref = spec["preference"]
@@ -755,6 +822,13 @@ def main():
                 f"{x['burden_fraction']:.3g}" for x in spec["epsilon_rows"])
             row["epsilon_burden_limits"] = ",".join(
                 f"{x['burden_limit']:.6g}" for x in spec["epsilon_rows"])
+        elif args.selection == "calibrated":
+            item = spec["calibration"]
+            row["epsilon_burden_fractions"] = f"{item['burden_fraction']:.3g}"
+            row["epsilon_burden_limits"] = f"{item['burden_limit']:.6g}"
+            row["lambda_burden"] = float(item["lambda_burden"])
+            row["validation_achieved_burden_fraction"] = float(
+                item["achieved_burden_fraction"])
         policy_actions = policy.predict(test["state"].astype(np.float32)).astype(int)
         draw = policy_actions != 0
         utility = objectives.utility_objective(test, policy_actions)
@@ -770,6 +844,9 @@ def main():
         if args.selection == "epsilon":
             row["beats_trivial"] = any(x["valid"] for x in spec["epsilon_rows"])
             row["gate_source"] = "epsilon_constraint_val"
+        elif args.selection == "calibrated":
+            row["beats_trivial"] = bool(spec["calibration"]["valid"])
+            row["gate_source"] = "burden_calibration_val"
         else:
             row["beats_trivial"], row["gate_source"] = validity_from_sidecar(
                 pref, args.tag, val, norm_meta, base_cache, family=args.family)
@@ -827,6 +904,8 @@ def main():
     metrics["selection"] = args.selection
     if args.selection == "epsilon":
         metrics["epsilon_selection"] = epsilon_selection
+    elif args.selection == "calibrated":
+        metrics["burden_calibration"] = calibrated_manifest
 
     stem = output_stem(args.family, args.selection)
     csv_out = cfg.REPORTS_DIR / f"{stem}.csv"
