@@ -189,11 +189,12 @@ class MOFittedQ:
 
 
 class WeightedQPolicy:
-    """Deterministic policy obtained by scalarizing one learned Q-vector.
+    """Deterministic binary policy from a weighted action-advantage vector.
 
     The joint model is trained once with objectives ``[utility, -burden]``.
-    Preferences are applied only when choosing an action, yielding several
-    policies from the same vector-valued Q function.
+    For each state, the draw advantage is ``Q(s, draw) - Q(s, no_draw)``.
+    Preferences weight that same advantage vector, yielding several policies
+    from the same vector-valued MO-FQI model.
     """
 
     def __init__(self, model, preference):
@@ -204,8 +205,10 @@ class WeightedQPolicy:
 
     def predict(self, states):
         q = self.model.q_all_actions(np.asarray(states, dtype=np.float32))
-        scores = np.einsum("nad,d->na", q, self.preference)
-        return np.argmax(scores, axis=1).astype(np.int64)
+        if q.shape[1] != 2:
+            raise ValueError("weighted advantage policy requires two actions")
+        advantage = q[:, 1, :] - q[:, 0, :]
+        return (advantage @ self.preference > 0.0).astype(np.int64)
 
 
 def epsilon_constraint_select(candidates, budgets, margin=0.0):

@@ -220,6 +220,17 @@ python run_pipeline.py --labs wbc lactate  # restrict the per-lab stages
 python tests/test_core.py                  # 50 property tests
 ```
 
+For the joint MO-FQI experiment, stage 4 trains one shared vector-Q model and
+extracts the default five preference policies from its action advantages:
+
+```bash
+python run_pipeline.py --track joint --family mofqi --from 4 --to 8
+```
+
+Use `--prefs` to provide another set of utility/burden pairs. The older mode
+that fits a separate Bellman backup for every preference remains available with
+`python src/s4e_train_mofqi_joint.py --per-preference-backup`.
+
 To add POE to an existing cached cohort without rescanning `chartevents` or
 `labevents`, then rebuild the hourly data and joint MDP:
 

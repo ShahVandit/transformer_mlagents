@@ -123,6 +123,23 @@ def test_pareto():
           np.all(utility_policy.predict(dummy) == 0)
           and np.all(burden_policy.predict(dummy) == 1))
 
+    class AdvantageQ:
+        n_dims = 2
+
+        @staticmethod
+        def q_all_actions(states):
+            # Shared baseline values must cancel; only draw minus no-draw
+            # should determine the policy.
+            return np.tile(
+                np.array([[[100.0, -50.0], [100.2, -50.1]]], dtype=np.float32),
+                (len(states), 1, 1))
+
+    draw_policy = mofqi.WeightedQPolicy(AdvantageQ(), (0.9, 0.1))
+    skip_policy = mofqi.WeightedQPolicy(AdvantageQ(), (0.1, 0.9))
+    check("shared MO-FQI policies weight draw action advantages",
+          np.all(draw_policy.predict(dummy) == 1)
+          and np.all(skip_policy.predict(dummy) == 0))
+
     candidates = [
         {"name": "low", "utility": 2.0, "burden": 1.0},
         {"name": "middle", "utility": 4.0, "burden": 2.0},

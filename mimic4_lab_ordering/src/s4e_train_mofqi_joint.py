@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--iterations", type=int, default=cfg.FQI_ITERATIONS)
     ap.add_argument("--sample-per-iter", type=int, default=cfg.FQI_SAMPLE_PER_ITER)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--per-preference-backup", action="store_true",
+                    help="fit one preference-consistent model per preference")
     args = ap.parse_args()
 
     cfg.ensure_dirs()
@@ -57,38 +59,74 @@ def main():
     tag = tf.clean_tag(args.tag)
     print(f"joint MO-FQI: {len(train['action']):,} train transitions, "
           f"state dim={train['state'].shape[1]}, objectives=[utility, -burden]")
-    print(f"training {len(prefs)} policy-consistent vector-Q models, "
-          f"{args.iterations} iterations each")
+    mode = ("preference-consistent backups" if args.per_preference_backup
+            else "one shared vector-Q backup")
+    print(f"training {len(prefs)} policies with {mode}, "
+          f"{args.iterations} iterations")
     base_cache = tf.constant_policy_returns(val, norm_meta)
     rows = []
-    for pref in prefs:
-        print(f"\n[preference={pref}]")
+    shared_model = None
+    if not args.per_preference_backup:
         started = time.time()
-        model = mofqi.MOFittedQ(
+        shared_model = mofqi.MOFittedQ(
             n_actions=len(cfg.JOINT_PANEL_BITS),
             n_dims=len(cfg.JOINT_REWARD_DIMS),
         )
-        model.fit(
+        shared_model.fit(
             train_for_fit,
             iterations=args.iterations,
             gamma=cfg.GAMMA,
             sample_per_iter=args.sample_per_iter,
-            preference=pref,
+            preference=None,
         )
-        print(f"  training completed in {time.time() - started:.1f}s")
-        model_path = (cfg.MODELS_DIR /
-                      f"joint_mofqi_{tf.pref_slug(pref)}{tag}.pkl")
-        with model_path.open("wb") as f:
+        shared_path = cfg.MODELS_DIR / f"joint_mofqi_vector{tag}.pkl"
+        with shared_path.open("wb") as f:
             pickle.dump({
-                "model": model,
-                "preference": list(pref),
+                "model": shared_model,
                 "state_cols": meta["state_cols"],
                 "reward_dims": ["utility", "neg_burden"],
                 "iterations": args.iterations,
                 "sample_per_iter": args.sample_per_iter,
-                "backup": "preference_consistent",
+                "backup": "vector_pareto_max",
             }, f)
-        print(f"  saved vector-Q model -> {model_path}")
+        print(f"shared vector-Q model saved -> {shared_path} "
+              f"({time.time() - started:.1f}s)")
+
+    for pref in prefs:
+        print(f"\n[preference={pref}]")
+        model = shared_model
+        backup = "vector_pareto_max"
+        if args.per_preference_backup:
+            started = time.time()
+            model = mofqi.MOFittedQ(
+                n_actions=len(cfg.JOINT_PANEL_BITS),
+                n_dims=len(cfg.JOINT_REWARD_DIMS),
+            )
+            model.fit(
+                train_for_fit,
+                iterations=args.iterations,
+                gamma=cfg.GAMMA,
+                sample_per_iter=args.sample_per_iter,
+                preference=pref,
+            )
+            backup = "preference_consistent"
+            print(f"  preference-specific training completed in {time.time() - started:.1f}s")
+        model_path = (cfg.MODELS_DIR /
+                      (f"joint_mofqi_{tf.pref_slug(pref)}{tag}.pkl"
+                       if args.per_preference_backup else
+                       f"joint_mofqi_vector{tag}.pkl"))
+        if args.per_preference_backup:
+            with model_path.open("wb") as f:
+                pickle.dump({
+                    "model": model,
+                    "preference": list(pref),
+                    "state_cols": meta["state_cols"],
+                    "reward_dims": ["utility", "neg_burden"],
+                    "iterations": args.iterations,
+                    "sample_per_iter": args.sample_per_iter,
+                    "backup": backup,
+                }, f)
+            print(f"  saved vector-Q model -> {model_path}")
 
         policy = mofqi.WeightedQPolicy(model, pref)
         base = tf.trivial_baselines(val, pref, norm_meta, base_cache)
@@ -107,6 +145,9 @@ def main():
             "preference": list(pref),
             "reward_dims": cfg.JOINT_REWARD_DIMS,
             "q_reward_dims": ["utility", "neg_burden"],
+            "backup": backup,
+            "policy_rule": "weighted_draw_advantage_gt_zero",
+            "shared_model": not args.per_preference_backup,
             "beats_trivial": summary["beats_trivial"],
             "constant_baselines": base,
             "val_summary": summary,
@@ -115,8 +156,11 @@ def main():
 
     report = [
         "# Joint MO-FQI policy family\n\n",
-        "Each vector-Q model was trained on `[utility, -burden]` with its "
-        "preference used inside the Bellman backup.\n\n",
+        ("Each policy is extracted from one shared MO-FQI vector-Q model "
+         "trained on `[utility, -burden]`; preferences weight the learned "
+         "action advantages.\n\n" if not args.per_preference_backup else
+         "Each vector-Q model was trained on `[utility, -burden]` with its "
+         "preference used inside the Bellman backup.\n\n"),
         "| utility weight | burden weight | draws/day | coverage | reward | valid |\n",
         "|---:|---:|---:|---:|---:|---|\n",
     ]
