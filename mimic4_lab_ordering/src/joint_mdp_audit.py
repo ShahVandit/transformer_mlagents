@@ -14,7 +14,7 @@ import panels
 REQUIRED = {
     "state", "action", "reward", "reward_norm", "next_state", "done",
     "stay_id", "subject_id", "hour", "event", "future_event",
-    "information_potential", "draw_burden", "n_labs",
+    "information_potential", "clinical_trigger", "draw_burden", "n_labs",
 }
 
 
@@ -91,6 +91,7 @@ def audit_split(name, split, meta):
     utility = reward[:, 0]
     burden = reward[:, 1]
     potential = np.asarray(split["information_potential"])
+    trigger = np.asarray(split["clinical_trigger"])
     draw_burden = np.asarray(split["draw_burden"])
     draw = action != 0
     if meta.get("episode_start_definition") == objectives.EPISODE_START_DEFINITION:
@@ -99,16 +100,18 @@ def audit_split(name, split, meta):
         _require((state[:, seen_cols] == 1.0).all(),
                  f"{name}: episode contains decisions before all baselines exist")
     _require((potential >= 0).all(), f"{name}: information potential is negative")
-    _require(np.allclose(utility[potential == 0], 0.0),
-             f"{name}: zero-information rows have nonzero utility")
-    _require(np.allclose(utility[draw], potential[draw]),
-             f"{name}: logged draws do not receive +information utility")
+    _require(np.isin(trigger, [0.0, 1.0]).all(),
+             f"{name}: clinical trigger is not binary")
+    _require(np.allclose(utility[draw], trigger[draw]),
+             f"{name}: logged draws do not receive clinical-trigger utility")
     _require(np.allclose(utility[~draw], 0.0),
              f"{name}: no-draw rows receive information utility")
+    _require((trigger > 0).any() and (trigger == 0).any(),
+             f"{name}: clinical trigger has no usable variation")
+    _require((trigger[draw] > 0).any() and (trigger[~draw] > 0).any(),
+             f"{name}: clinical trigger is confounded with logged action")
     _require((utility > 0).any() and (utility >= 0).all(),
              f"{name}: utility has no usable draw-gated signal")
-    _require((potential[draw] > 0).any() and (potential[~draw] > 0).any(),
-             f"{name}: information potential is confounded with logged action")
     _require((draw_burden >= 1.0).all(),
              f"{name}: draw burden potential is below base cost")
     _require((burden >= 0).all(), f"{name}: burden is negative")
@@ -122,6 +125,7 @@ def audit_split(name, split, meta):
         "subjects": int(len(np.unique(subject))),
         "draw_rate": float(draw.mean()),
         "mean_utility": float(utility.mean()),
+        "mean_clinical_trigger": float(trigger.mean()),
         "mean_information_potential": float(potential.mean()),
         "mean_burden": float(burden.mean()),
     }
@@ -157,7 +161,7 @@ def audit_all(meta=None, splits=None):
     got_scale = np.asarray(meta["reward_normalization"]["reward_scale"])
     expected_scale = np.asarray(expected_norm["reward_scale"])
     _require(np.allclose(got_scale, expected_scale, rtol=1e-5, atol=1e-6),
-             "reward scale does not match train-only constant-policy range")
+             "reward scale does not match train logged mean return")
 
     reports = {name: audit_split(name, split, meta)
                for name, split in splits.items()}

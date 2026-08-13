@@ -136,7 +136,7 @@ def test_pareto():
 
     split = {
         "stay_id": np.array([1, 1, 2], dtype=np.int64),
-        "information_potential": np.array([1.0, 2.0, 4.0], dtype=np.float32),
+        "clinical_trigger": np.array([1.0, 2.0, 4.0], dtype=np.float32),
         "draw_burden": np.ones(3, dtype=np.float32),
     }
     utility, burden = frontier.discounted_policy_objectives(
@@ -171,12 +171,14 @@ def test_joint_mdp_audit_rejects_bad_transition():
     subject = np.array([10, 10, 20, 20], dtype=np.int64)
     action = np.array([0, 1, 0, 1], dtype=np.int64)
     potential = np.array([0.0, 2.0, 0.5, 1.0], dtype=np.float32)
+    trigger = np.array([1.0, 1.0, 0.0, 1.0], dtype=np.float32)
     draw_burden = np.array([1.0, 1.5, 1.0, 1.5], dtype=np.float32)
     base = {
         "stay_id": stay,
         "subject_id": subject,
         "hour": np.array([0, 1, 0, 1], dtype=np.int64),
         "action": action,
+        "clinical_trigger": trigger,
         "information_potential": potential,
         "draw_burden": draw_burden,
     }
@@ -389,6 +391,79 @@ def test_batch_slicing():
     check("slicing matches an isin filter", np.array_equal(np.sort(a), np.sort(b)))
 
 
+def test_clinical_trigger_utility():
+    """Paper Eqs. 3 and 4 as the joint utility, capped at one credit per hour."""
+    print("\nclinical-trigger utility (paper Eq. 3 + Eq. 4)")
+    import itemids as ids
+
+    n = 10
+    base = {
+        "stay_id": np.zeros(n, dtype=np.int64),
+        "hour": np.arange(n, dtype=np.int64),
+        "sofa_delta": np.zeros(n),
+        **{f"onset_{k}": np.zeros(n, dtype=np.int64)
+           for k in ids.INTERVENTION_KINDS},
+    }
+
+    # Eq. 3: a SOFA rise of >= 2 fires at that hour
+    d = {**base}
+    d["sofa_delta"] = d["sofa_delta"].copy()
+    d["sofa_delta"][4] = 2.0
+    d["sofa_delta"][5] = 1.9
+    trig = objectives.clinical_trigger(d)
+    check("Eq. 3 fires on a SOFA rise of exactly 2", trig[4] == 1.0)
+    check("Eq. 3 does not fire below the threshold", trig[5] == 0.0)
+
+    # Eq. 4: an intervention initiated at t+1 credits hour t, not hour t+1
+    d = {**base}
+    d["onset_vasopressor"] = d["onset_vasopressor"].copy()
+    d["onset_vasopressor"][7] = 1
+    trig = objectives.clinical_trigger(d)
+    check("Eq. 4 credits the hour BEFORE the intervention", trig[6] == 1.0)
+    check("Eq. 4 does not credit the intervention hour itself", trig[7] == 0.0)
+
+    # the cap: both triggers on one hour still yields exactly 1
+    d = {**base}
+    d["sofa_delta"] = d["sofa_delta"].copy()
+    d["onset_dialysis"] = d["onset_dialysis"].copy()
+    d["sofa_delta"][3] = 5.0          # Eq. 3 fires at 3
+    d["onset_dialysis"][4] = 1        # Eq. 4 also credits 3
+    trig = objectives.clinical_trigger(d)
+    check("co-firing triggers are capped at one credit", trig[3] == 1.0)
+    check("the trigger is binary everywhere",
+          bool(np.all((trig == 0.0) | (trig == 1.0))))
+
+    # the shift must not leak across stays
+    d = {**base}
+    d["stay_id"] = np.array([0] * 5 + [1] * 5, dtype=np.int64)
+    d["onset_ventilation"] = d["onset_ventilation"].copy()
+    d["onset_ventilation"][5] = 1     # first hour of stay 1
+    trig = objectives.clinical_trigger(d)
+    check("Eq. 4 does not credit the last hour of the previous stay",
+          trig[4] == 0.0)
+
+    # utility is gated on drawing, exactly as all three of the paper's
+    # positive terms are
+    d = {**base}
+    d["sofa_delta"] = d["sofa_delta"].copy()
+    d["sofa_delta"][2] = 3.0
+    u_draw = objectives.utility_objective(d, np.ones(n, dtype=np.int64))
+    u_none = objectives.utility_objective(d, np.zeros(n, dtype=np.int64))
+    check("utility pays only when a draw is taken", u_draw[2] == 1.0)
+    check("not drawing scores zero, never negative",
+          bool(np.all(u_none == 0.0)))
+    check("drawing at a non-trigger hour earns nothing", u_draw[0] == 0.0)
+
+    # sparsity is the property that makes the policy selective
+    check("utility is sparse, not dense like the old Eq. 5 term",
+          float((u_draw > 0).mean()) < 0.5)
+
+    # a stored column short-circuits recomputation and must win
+    d2 = {**base, "clinical_trigger": np.arange(n, dtype=np.float32)}
+    check("a precomputed clinical_trigger column is used as-is",
+          bool(np.allclose(objectives.clinical_trigger(d2), np.arange(n))))
+
+
 def test_joint_panels():
     print("\njoint draw encoding (Pareto track)")
     import panels
@@ -475,24 +550,28 @@ def test_joint_panels():
 
     d["information_potential"] = potential
     d["draw_burden"] = objectives.burden_potential(d)
+    # Utility is now the paper's Eq. 3 + Eq. 4 clinical trigger, not Eq. 5's
+    # information term; information_potential survives only as a diagnostic
+    # column. Supply the trigger explicitly so the gating semantics are tested
+    # independently of how it was derived.
+    d["clinical_trigger"] = np.array([0, 0, 1, 0, 0], dtype=np.float32)
     none = np.zeros(n, dtype=int)
-    informative = none.copy()
-    informative[2] = 1
-    uninformative = none.copy()
-    uninformative[1] = 1
+    on_trigger = none.copy()
+    on_trigger[2] = 1
+    off_trigger = none.copy()
+    off_trigger[1] = 1
     u_none = objectives.utility_objective(d, none)
-    u_info = objectives.utility_objective(d, informative)
-    u_low = objectives.utility_objective(d, uninformative)
-    b_low = objectives.burden_objective(d, uninformative)
-    check("no-draw actions receive zero information utility",
-          float(u_none.sum()) == 0.0)
-    check("an informative draw receives positive utility", float(u_info.sum()) > 0.0)
-    check("drawing at zero potential does not alter utility",
-          np.allclose(u_low, u_none))
+    u_trig = objectives.utility_objective(d, on_trigger)
+    u_off = objectives.utility_objective(d, off_trigger)
+    b_low = objectives.burden_objective(d, off_trigger)
+    check("no-draw actions receive zero utility", float(u_none.sum()) == 0.0)
+    check("a draw on a trigger hour receives positive utility",
+          float(u_trig.sum()) > 0.0)
+    check("a draw off-trigger earns no utility", np.allclose(u_off, u_none))
     check("an uninformative draw still incurs burden", float(b_low.sum()) > 0.0)
 
-    train_r = np.stack([u_info, objectives.burden_objective(d, informative)], axis=1)
-    train_split = {**d, "action": informative, "reward": train_r}
+    train_r = np.stack([u_trig, objectives.burden_objective(d, on_trigger)], axis=1)
+    train_split = {**d, "action": on_trigger, "reward": train_r}
     normed, norm_meta = objectives.normalize_rewards(train_split, train_r)
     check("normalization keeps neutral rewards at exactly zero",
           bool(np.array_equal(normed[0][0], np.zeros(2, dtype=np.float32))))
@@ -674,6 +753,7 @@ def main():
     test_state_and_delta()
     test_poe_features_are_past_only()
     test_batch_slicing()
+    test_clinical_trigger_utility()
     test_joint_panels()
     test_direct_policy()
     test_sofa()

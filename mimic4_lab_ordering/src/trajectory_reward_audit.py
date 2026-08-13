@@ -67,6 +67,7 @@ def stay_summary(split):
     for sl in stay_slices(split["stay_id"]):
         action = split["action"][sl]
         draw = action != 0
+        trigger = split["clinical_trigger"][sl]
         potential = split["information_potential"][sl]
         burden = split["draw_burden"][sl]
         n = len(action)
@@ -75,11 +76,12 @@ def stay_summary(split):
             "hours": n,
             "clinician_draws": int(draw.sum()),
             "clinician_draws_per_day": float(draw.sum() / max(n / 24.0, 1e-6)),
-            "clinician_utility": discounted_sum(potential * draw),
-            "always_draw_frozen_utility": discounted_sum(potential),
+            "clinician_utility": discounted_sum(trigger * draw),
+            "always_draw_frozen_utility": discounted_sum(trigger),
             "clinician_burden": discounted_sum(burden * draw),
             "always_draw_frozen_burden": discounted_sum(burden),
             "events": int(split["event"][sl].sum()),
+            "clinical_trigger_hours": int(trigger.sum()),
             "mean_information_potential": float(potential.mean()),
         })
     return pd.DataFrame(rows)
@@ -138,6 +140,7 @@ def trajectory_rows(split, meta, labels):
             "hour": int(split["hour"][idx]),
             "clinician_draw": int(split["action"][idx] != 0),
             "information_potential": float(split["information_potential"][idx]),
+            "clinical_trigger": float(split["clinical_trigger"][idx]),
             "draw_burden_from_logged_state": float(split["draw_burden"][idx]),
             "factual_utility": float(split["reward"][idx, 0]),
             "factual_burden": float(split["reward"][idx, 1]),
@@ -157,7 +160,7 @@ def policy_rows(split, selected):
         if stay_id not in selected:
             continue
         hours = split["hour"][sl]
-        potential = split["information_potential"][sl]
+        trigger = split["clinical_trigger"][sl]
         logged_burden = split["draw_burden"][sl]
         policies = {
             "clinician": split["action"][sl] != 0,
@@ -171,7 +174,7 @@ def policy_rows(split, selected):
                 "policy": name,
                 "draws": int(draw.sum()),
                 "draws_per_day": float(draw.sum() / max(len(draw) / 24.0, 1e-6)),
-                "frozen_state_utility": discounted_sum(potential * draw),
+                "frozen_state_utility": discounted_sum(trigger * draw),
                 "frozen_state_burden": discounted_sum(logged_burden * draw),
                 "policy_history_burden": discounted_sum(recursive_burden),
                 "utility_is_counterfactual_return": name == "clinician",
@@ -193,14 +196,14 @@ def write_report(summary, trajectories, policies, labels, split_name):
     lines = [
         f"# Trajectory reward audit ({split_name})\n\n",
         "The clinician row is factual. `always_draw` and `never_draw` utility "
-        "reuse logged future states, so they are one-step frozen-state "
+        "reuse logged clinical triggers, so they are frozen-trajectory "
         "diagnostics, not counterfactual trajectory returns. Altering a draw "
         "would change later `last_*`, `delta_*`, forecasts, and information "
         "potential. Burden can be replayed exactly from each candidate policy's "
         "own draw clock and is reported separately.\n\n",
         "## Selected stays\n\n",
-        "| selection | stay | hours | clinician draws/day | events | clinician utility | frozen always utility |\n",
-        "|---|---:|---:|---:|---:|---:|---:|\n",
+        "| selection | stay | hours | clinician draws/day | events | trigger hours | clinician utility | frozen always utility |\n",
+        "|---|---:|---:|---:|---:|---:|---:|---:|\n",
     ]
     label_of = {}
     for label, stay_id in labels.items():
@@ -210,6 +213,7 @@ def write_report(summary, trajectories, policies, labels, split_name):
         lines.append(
             f"| {label} | {int(row['stay_id'])} | {int(row['hours'])} | "
             f"{row['clinician_draws_per_day']:.3f} | {int(row['events'])} | "
+            f"{int(row['clinical_trigger_hours'])} | "
             f"{row['clinician_utility']:.3f} | "
             f"{row['always_draw_frozen_utility']:.3f} |\n"
         )
@@ -227,8 +231,9 @@ def write_report(summary, trajectories, policies, labels, split_name):
             f"{'yes' if row['utility_is_counterfactual_return'] else '**no**'} |\n"
         )
     lines.append(
-        "\nThe hour-level CSV contains each assay's contribution to information "
-        "potential, the logged action, factual reward, and deterioration flags.\n"
+        "\nThe hour-level CSV contains the clinical trigger, the diagnostic "
+        "information potential, the logged action, factual reward, and "
+        "deterioration flags.\n"
     )
     report_out.write_text("".join(lines), encoding="utf-8")
     return report_out, summary_out, detail_out, policy_out

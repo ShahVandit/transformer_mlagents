@@ -65,11 +65,11 @@ def validate_joint_artifacts(meta, *splits):
     if meta.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
         raise SystemExit("joint MDP uses the old reward objectives; rerun stage 3b")
     if meta.get("utility_definition") != objectives.UTILITY_DEFINITION:
-        raise SystemExit("joint MDP has no information-utility contract; rerun stage 3b")
+        raise SystemExit("joint MDP has no clinical-trigger utility contract; rerun stage 3b")
     for split in splits:
-        if "information_potential" not in split or "draw_burden" not in split:
+        if "clinical_trigger" not in split or "draw_burden" not in split:
             raise SystemExit(
-                "joint MDP lacks state-computable reward potentials; rerun stage 3b")
+                "joint MDP lacks clinical-trigger or burden inputs; rerun stage 3b")
         if len(split["action"]) and int(np.max(split["action"])) >= N_ACTIONS:
             raise SystemExit("joint MDP contains stale panel actions; rerun stage 3b")
 

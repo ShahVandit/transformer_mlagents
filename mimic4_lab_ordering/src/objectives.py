@@ -72,7 +72,7 @@ def deterioration_events(df):
     return onset | sofa
 
 
-UTILITY_DEFINITION = "state_computable_action_gated_forecast_information"
+UTILITY_DEFINITION = "paper_eq3_eq4_clinical_trigger_capped"
 EPISODE_START_DEFINITION = "after_all_target_lab_baselines_available"
 
 
@@ -128,20 +128,81 @@ def information_potential(df, thresholds):
     return np.sum(np.stack(values, axis=1), axis=1).astype(np.float32)
 
 
-def utility_objective(df, actions, thresholds=None):
-    """Give +u for a draw and zero utility when no draw is taken.
+def _shift_next_by_stay(values, stay_ids, bins=1):
+    """values[t + bins] within a stay; 0 past the end. Used for Eq. 4."""
+    v = np.asarray(values, dtype=np.float64)
+    out = np.zeros(len(v), dtype=np.float64)
+    stay_ids = np.asarray(stay_ids)
+    start = 0
+    for i in range(1, len(v) + 1):
+        if i == len(v) or stay_ids[i] != stay_ids[start]:
+            n = i - start
+            if n > bins:
+                out[start:i - bins] = v[start + bins:i]
+            start = i
+    return out
 
-    The forecast potential is available from the decision-time state, but a
-    no-draw row contains no observed counterfactual lab result. It therefore
-    cannot support a negative information reward. The burden objective is the
-    separate penalty for taking the draw.
+
+def clinical_trigger(df, lookahead_bins=cfg.TREAT_LOOKAHEAD_BINS):
+    """The paper's Eq. 3 OR Eq. 4, capped at one credit per hour.
+
+        Eq. 3  a SOFA rise of >= 2 between t-1 and t
+        Eq. 4  an intervention initiated at t+1
+
+    Why this and not Eq. 5's information term: measured on val, both of these
+    trigger a clinician draw at roughly TWICE the base rate (2.07x for the SOFA
+    jump, 2.19x for the impending intervention, 2.14x for the capped union),
+    while every computable form of Eq. 5 sits at chance -- 0.48 to 0.55 AUC,
+    lactate BELOW chance. A low AUC on these two is expected and not evidence
+    against them: they fire on under 2% of hours, and a 2x lift on a 2% base
+    rate caps AUC near 0.51 by arithmetic alone. Eq. 5 is dense rather than
+    rare, so its 0.545 is genuine weakness, and its density is also what made
+    drawing profitable at every hour under a small burden weight.
+
+    CAPPED at one, per the double-reward concern: the two triggers co-fire on
+    216 val rows (0.107% of hours, 2.98% of trigger rows). Summing them would
+    pay twice for one clinical episode.
+
+    Timing: `sofa_delta` is built from the forecaster's past-only predictive
+    means plus concurrent ventilation/vasopressor/GCS status -- information a
+    clinician deciding at hour t already has, and never anything from the
+    future. Eq. 4 deliberately looks one bin ahead: that is the reward's job,
+    and it is what forces the policy to ANTICIPATE rather than react. Neither
+    trigger is readable off the state (AUC 0.808 and 0.746 from a fitted model,
+    not ~1.0), so both remain genuine prediction problems.
     """
-    if _has_col(df, "information_potential"):
-        utility = _to_numpy(_col(df, "information_potential")).astype(np.float32)
-    elif thresholds is not None:
-        utility = information_potential(df, thresholds)
-    else:
-        raise ValueError("information_potential or utility thresholds are required")
+    if _has_col(df, "clinical_trigger"):
+        return _to_numpy(_col(df, "clinical_trigger")).astype(np.float32)
+
+    sofa_jump = (_to_numpy(_col(df, "sofa_delta")).astype(np.float64)
+                 >= cfg.SOFA_DELTA_THRESHOLD)
+
+    onset_cols = [f"onset_{k}" for k in ids.INTERVENTION_KINDS]
+    onset_now = np.column_stack(
+        [_to_numpy(_col(df, c)) for c in onset_cols]).sum(axis=1) > 0
+    onset_next = _shift_next_by_stay(
+        onset_now.astype(np.float64), _to_numpy(_col(df, "stay_id")),
+        bins=int(lookahead_bins)) > 0
+
+    return (sofa_jump | onset_next).astype(np.float32)
+
+
+def utility_objective(df, actions, thresholds=None):
+    """Eq. 3 + Eq. 4, gated on drawing and capped at one credit per hour.
+
+    Utility is zero unless a draw is taken, exactly as in the paper: all three
+    of its positive terms carry the 1[a != 0] gate. Not drawing therefore scores
+    zero rather than negative, and the burden objective is the sole counterweight.
+
+    Because the trigger fires on only ~3.6% of hours, utility is SPARSE. That is
+    the property that makes the policy selective: with the old dense information
+    term every hour carried positive utility, so drawing was profitable
+    everywhere and a small burden weight produced draw-every-hour. Here the
+    policy only profits where it predicts a trigger, and the preference weight
+    sets the threshold on that predicted probability -- so the draw rate still
+    varies smoothly across the frontier rather than pinning at 3.6%.
+    """
+    utility = clinical_trigger(df)
     draw = (np.asarray(actions) != 0).astype(np.float32)
     return utility * draw
 

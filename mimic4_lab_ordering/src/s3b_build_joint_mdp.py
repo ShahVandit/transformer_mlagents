@@ -55,10 +55,15 @@ def build_split(df, utility_thresholds, include_poe=True):
     action = panels.encode_frame(df)
     information_potential = objectives.information_potential(
         df, utility_thresholds)
+    # Paper Eqs. 3 and 4, capped at one credit per hour. Computed on the frame
+    # because it needs sofa_delta and the onset_* columns, which are not in the
+    # 21-dim state; the resulting per-row trigger is stored so every downstream
+    # stage recomputes the identical reward from the npz alone.
+    clinical_trigger = objectives.clinical_trigger(df)
     draw_burden = objectives.burden_potential(df)
     utility = objectives.utility_objective(
         {
-            "information_potential": information_potential,
+            "clinical_trigger": clinical_trigger,
             "stay_id": df["stay_id"].to_numpy(),
             "hour": df["hour"].to_numpy(),
         },
@@ -80,6 +85,7 @@ def build_split(df, utility_thresholds, include_poe=True):
         "event": event.astype(np.int8),
         "future_event": future_event.astype(np.int8),
         "information_potential": information_potential.astype(np.float32),
+        "clinical_trigger": clinical_trigger.astype(np.float32),
         "draw_burden": draw_burden.astype(np.float32),
         "n_labs": panels.panel_n_labs(action),
     }

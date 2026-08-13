@@ -1,4 +1,4 @@
-"""Standalone truth-table checks for joint information utility and burden."""
+"""Standalone truth-table checks for joint clinical utility and burden."""
 import sys
 from pathlib import Path
 
@@ -41,9 +41,11 @@ def main():
     assert potential[2] == 12.0
 
     clinician = frame["action"].copy()
+    trigger = np.array([0, 0, 1, 0, 1, 0], dtype=np.float32)
     split = {
         **frame,
         "information_potential": potential,
+        "clinical_trigger": trigger,
         "draw_burden": objectives.burden_potential(frame),
         "action": clinician,
     }
@@ -59,8 +61,8 @@ def main():
     rows = {}
     for name, actions in {
         "never": never,
-        "low_information": low,
-        "high_information": high,
+        "off_trigger": low,
+        "on_trigger": high,
         "repeated": repeated,
         "always": always,
     }.items():
@@ -74,23 +76,22 @@ def main():
 
     assert rows["never"][0] == 0.0
     assert rows["never"][1] == 0.0
-    assert rows["low_information"][0] == rows["never"][0]
-    assert rows["low_information"][1] > 0.0
-    assert rows["high_information"][0] > rows["low_information"][0]
-    assert rows["repeated"][0] == rows["high_information"][0]
-    assert rows["repeated"][1] > rows["high_information"][1]
-    assert rows["always"][0] == rows["high_information"][0]
+    assert rows["off_trigger"][0] == rows["never"][0]
+    assert rows["off_trigger"][1] > 0.0
+    assert rows["on_trigger"][0] > rows["off_trigger"][0]
+    assert rows["repeated"][0] == rows["on_trigger"][0]
+    assert rows["repeated"][1] > rows["on_trigger"][1]
+    assert rows["always"][0] > rows["on_trigger"][0]
     assert rows["always"][1] > rows["repeated"][1]
 
-    # At an informative opportunity, drawing receives +u. A no-draw decision
-    # has no observed counterfactual lab result, so its utility is zero.
+    # At a clinical trigger, drawing receives +1. A no-draw decision scores 0.
     missed = objectives.utility_objective(split, never)
     taken = objectives.utility_objective(split, high)
     assert missed[2] == 0.0
-    assert taken[2] == potential[2] > 0.0
+    assert taken[2] == trigger[2] == 1.0
     assert objectives.utility_objective(split, low)[1] == missed[1] == 0.0
 
-    # Full clinician-conditioned action table at one informative logged draw
+    # Full clinician-conditioned action table at one trigger hour
     # and one logged no-draw hour.
     informative_hour = 2
     no_draw_hour = 3
@@ -98,7 +99,7 @@ def main():
     missed_draw = objectives.utility_objective(split, never)
     extra_draw = objectives.utility_objective(split, repeated)
     matched_no_draw = objectives.utility_objective(split, never)
-    assert matched_draw[informative_hour] == potential[informative_hour]
+    assert matched_draw[informative_hour] == trigger[informative_hour]
     assert missed_draw[informative_hour] == 0.0
     assert matched_no_draw[no_draw_hour] == 0.0
     assert extra_draw[no_draw_hour] == 0.0
@@ -124,8 +125,8 @@ def main():
             split, clinician_actions, pref, norm_meta)
         assert np.allclose(stored, replayed), pref
 
-    print("PASS: informative draws earn +u, no-draw actions earn zero utility, "
-          "zero-potential draws earn no utility, and every draw incurs burden")
+    print("PASS: trigger-aligned draws earn +1, no-draw actions earn zero "
+          "utility, off-trigger draws earn no utility, and every draw incurs burden")
 
 
 if __name__ == "__main__":
