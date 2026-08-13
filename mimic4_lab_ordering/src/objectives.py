@@ -73,6 +73,16 @@ def deterioration_events(df):
 
 
 UTILITY_DEFINITION = "state_computable_action_gated_forecast_information"
+EPISODE_START_DEFINITION = "after_all_target_lab_baselines_available"
+
+
+def post_baseline_mask(df):
+    """Rows where every target lab has a value strictly before decision time."""
+    available = [
+        np.isfinite(_to_numpy(_col(df, f"last_{lab}")).astype(np.float64))
+        for lab in panels.LABS
+    ]
+    return np.logical_and.reduce(available)
 
 
 def fit_utility_thresholds(train_df):
@@ -303,46 +313,30 @@ def _mean_stay_returns(values, stay_ids):
 
 
 def normalize_rewards(train_split, *splits):
-    """Scale each objective by its training-set per-stay achievable range.
+    """Scale objectives by logged TRAIN mean return per stay.
 
-    The anchors are the two constant policies: never draw and always draw. This
-    makes a simplex weight describe a fraction of each objective's observed
-    constant-policy per-stay span instead of mixing objectives with very different
-    accumulation rates. Zero remains neutral and no validation/test outcomes
-    are used to fit the scale.
+    Constant-action trajectories are not valid normalization anchors here:
+    changing a draw changes later lab-history and forecast state. The logged
+    clinician trajectory is factual, train-only, and keeps zero reward neutral.
     """
     train_reward = np.asarray(_col(train_split, "reward"), dtype=np.float32)
     stay = _to_numpy(_col(train_split, "stay_id"))
-    n = len(stay)
-    never = np.zeros(n, dtype=np.int64)
-    always = np.ones(n, dtype=np.int64)
+    logged_return = _mean_stay_returns(train_reward, stay).astype(np.float32)
+    objective_scale = np.abs(logged_return)
+    objective_scale[objective_scale < 1e-6] = 1.0
 
-    never_reward = np.stack([
-        utility_objective(train_split, never),
-        burden_objective(train_split, never),
-    ], axis=1)
-    always_reward = np.stack([
-        utility_objective(train_split, always),
-        burden_objective(train_split, always),
-    ], axis=1)
-    never_return = _mean_stay_returns(never_reward, stay)
-    always_return = _mean_stay_returns(always_reward, stay)
-    objective_range = np.abs(always_return - never_return).astype(np.float32)
-    objective_range[objective_range < 1e-6] = 1.0
-
-    out = [(np.asarray(x, dtype=np.float32) / objective_range).astype(np.float32)
+    out = [(np.asarray(x, dtype=np.float32) / objective_scale).astype(np.float32)
            for x in splits]
     raw_mu = train_reward.mean(axis=0).astype(np.float32)
     return out, {
         "reward_mean": np.zeros_like(raw_mu).tolist(),
-        # Kept for compatibility with downstream readers; this is now a range,
-        # not a standard deviation.
-        "reward_sd": objective_range.tolist(),
-        "reward_scale": objective_range.tolist(),
+        # Kept for compatibility with downstream readers; this is a factual
+        # mean-return scale, not a standard deviation.
+        "reward_sd": objective_scale.tolist(),
+        "reward_scale": objective_scale.tolist(),
         "raw_reward_mean": raw_mu.tolist(),
-        "never_draw_return": never_return.tolist(),
-        "always_draw_return": always_return.tolist(),
-        "normalization": "per_stay_extreme_range",
+        "logged_clinician_mean_return": logged_return.tolist(),
+        "normalization": "train_logged_mean_return",
     }
 
 

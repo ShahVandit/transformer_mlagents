@@ -8,6 +8,7 @@ import numpy as np
 
 import config as cfg
 import objectives
+import panels
 
 
 REQUIRED = {
@@ -92,6 +93,11 @@ def audit_split(name, split, meta):
     potential = np.asarray(split["information_potential"])
     draw_burden = np.asarray(split["draw_burden"])
     draw = action != 0
+    if meta.get("episode_start_definition") == objectives.EPISODE_START_DEFINITION:
+        seen_cols = [meta["state_cols"].index(f"seen_{lab}")
+                     for lab in panels.LABS]
+        _require((state[:, seen_cols] == 1.0).all(),
+                 f"{name}: episode contains decisions before all baselines exist")
     _require((potential >= 0).all(), f"{name}: information potential is negative")
     _require(np.allclose(utility[potential == 0], 0.0),
              f"{name}: zero-information rows have nonzero utility")
@@ -136,14 +142,16 @@ def audit_all(meta=None, splits=None):
     _require(meta.get("reward_dims") == cfg.JOINT_REWARD_DIMS,
              "metadata reward dimensions are stale")
     _require(meta.get("reward_normalization", {}).get("normalization")
-             == "per_stay_extreme_range", "reward normalization is stale")
+             == "train_logged_mean_return", "reward normalization is stale")
+    _require(meta.get("episode_start_definition")
+             == objectives.EPISODE_START_DEFINITION,
+             "post-baseline episode contract is missing or stale")
     _require(len(meta.get("state_cols", [])) == meta.get("state_dim"),
              "metadata state columns do not match state_dim")
     _require(len(set(meta.get("state_cols", []))) == meta.get("state_dim"),
              "metadata state columns contain duplicates")
 
-    # Independently recompute the scale from TRAIN only. This catches metadata
-    # produced from validation/test outcomes or from an older reward function.
+    # Independently recompute the factual scale from TRAIN only.
     _, expected_norm = objectives.normalize_rewards(
         splits["train"], splits["train"]["reward"])
     got_scale = np.asarray(meta["reward_normalization"]["reward_scale"])

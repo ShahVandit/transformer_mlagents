@@ -30,6 +30,27 @@ def make_done_and_next_state(df, state):
 
 def build_split(df, utility_thresholds, include_poe=True):
     df = add_sofa(df.sort_values(["stay_id", "hour"]).reset_index(drop=True))
+    original_rows = len(df)
+    original_stays = int(df["stay_id"].nunique())
+
+    # Events must be defined before trimming. Otherwise an event already active
+    # when the baseline becomes available would be relabeled as a new onset.
+    event = objectives.deterioration_events(df)
+    episode_onset = objectives.deterioration_episode_onsets(df)
+    future_event = objectives._future_any_by_stay(
+        episode_onset, df["stay_id"].to_numpy(),
+        cfg.JOINT_DETECTION_LOOKAHEAD_HOURS)
+
+    eligible = objectives.post_baseline_mask(df)
+    df = df.loc[eligible].copy().reset_index(drop=True)
+    event = event[eligible]
+    future_event = future_event[eligible]
+    if df.empty:
+        raise ValueError("no post-baseline decision rows remain")
+    # Episode time starts at the first genuine repeat-order decision. State
+    # variables were built on the original timeline and retain their true age.
+    df["hour"] = df.groupby("stay_id", sort=False).cumcount().astype(np.int64)
+
     state, cols = build_state(df, include_poe=include_poe)
     action = panels.encode_frame(df)
     information_potential = objectives.information_potential(
@@ -46,13 +67,8 @@ def build_split(df, utility_thresholds, include_poe=True):
     burden = objectives.burden_objective(
         {"draw_burden": draw_burden}, action)
     reward = np.stack([utility, burden], axis=1).astype(np.float32)
-    event = objectives.deterioration_events(df)
-    episode_onset = objectives.deterioration_episode_onsets(df)
-    future_event = objectives._future_any_by_stay(
-        episode_onset, df["stay_id"].to_numpy(),
-        cfg.JOINT_DETECTION_LOOKAHEAD_HOURS)
     done, next_state = make_done_and_next_state(df, state)
-    return {
+    split = {
         "state": state,
         "action": action.astype(np.int64),
         "reward": reward,
@@ -66,7 +82,14 @@ def build_split(df, utility_thresholds, include_poe=True):
         "information_potential": information_potential.astype(np.float32),
         "draw_burden": draw_burden.astype(np.float32),
         "n_labs": panels.panel_n_labs(action),
-    }, cols
+    }
+    stats = {
+        "original_rows": int(original_rows),
+        "retained_rows": int(len(df)),
+        "original_stays": original_stays,
+        "retained_stays": int(df["stay_id"].nunique()),
+    }
+    return split, cols, stats
 
 
 def main():
@@ -83,20 +106,26 @@ def main():
             raise SystemExit(f"{p} not found; run stage 2 first")
 
     train_frame = pd.read_parquet(paths["train"])
-    utility_thresholds = objectives.fit_utility_thresholds(train_frame)
-    print("information thresholds fitted on clinician-ordered TRAIN rows")
+    train_baseline = objectives.post_baseline_mask(train_frame)
+    utility_thresholds = objectives.fit_utility_thresholds(
+        train_frame.loc[train_baseline])
+    print("information thresholds fitted on post-baseline clinician-ordered "
+          "TRAIN rows")
     for lab, threshold in utility_thresholds.items():
         print(f"  {lab}: {threshold:.4f}")
 
     built = {}
+    episode_stats = {}
     state_cols = None
     for split in ("train", "val", "test"):
         frame = train_frame if split == "train" else pd.read_parquet(paths[split])
-        d, state_cols = build_split(
+        d, state_cols, stats = build_split(
             frame, utility_thresholds, include_poe=not args.exclude_poe_state)
         built[split] = d
+        episode_stats[split] = stats
         print(f"{split}: {len(d['action']):,} hours, "
               f"{len(np.unique(d['stay_id'])):,} stays, "
+              f"retained={stats['retained_rows'] / stats['original_rows']:.1%}, "
               f"draw_rate={(d['action'] != 0).mean():.4f}, "
               f"future_event_rate={d['future_event'].mean():.4f}")
         del frame
@@ -122,6 +151,8 @@ def main():
         "panel_names": cfg.JOINT_PANEL_NAMES,
         "lookahead_hours": cfg.JOINT_DETECTION_LOOKAHEAD_HOURS,
         "utility_definition": objectives.UTILITY_DEFINITION,
+        "episode_start_definition": objectives.EPISODE_START_DEFINITION,
+        "episode_filter_stats": episode_stats,
         "utility_thresholds": utility_thresholds,
         "gamma": cfg.GAMMA,
         "action_distribution": {

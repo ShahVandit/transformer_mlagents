@@ -58,8 +58,10 @@ def validate_joint_artifacts(meta, *splits):
     if meta.get("panel_bits") != cfg.JOINT_PANEL_BITS:
         raise SystemExit("joint MDP uses the old action mapping; rerun stage 3b")
     norm = meta.get("reward_normalization", {})
-    if norm.get("normalization") != "per_stay_extreme_range":
+    if norm.get("normalization") != "train_logged_mean_return":
         raise SystemExit("joint MDP uses the old reward scaling; rerun stage 3b")
+    if meta.get("episode_start_definition") != objectives.EPISODE_START_DEFINITION:
+        raise SystemExit("joint MDP starts before lab baselines; rerun stage 3b")
     if meta.get("reward_dims") != cfg.JOINT_REWARD_DIMS:
         raise SystemExit("joint MDP uses the old reward objectives; rerun stage 3b")
     if meta.get("utility_definition") != objectives.UTILITY_DEFINITION:

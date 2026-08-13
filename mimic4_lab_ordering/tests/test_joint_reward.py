@@ -113,12 +113,11 @@ def main():
     normed, norm_meta = objectives.normalize_rewards(split, clinician_raw)
     split["reward_norm"] = normed[0]
 
-    assert norm_meta["normalization"] == "per_stay_extreme_range"
-    assert np.allclose(
-        np.asarray(norm_meta["reward_scale"]),
-        np.abs(np.asarray(norm_meta["always_draw_return"]) -
-               np.asarray(norm_meta["never_draw_return"])),
-    )
+    assert norm_meta["normalization"] == "train_logged_mean_return"
+    expected_scale = np.abs(
+        np.asarray(norm_meta["logged_clinician_mean_return"]))
+    expected_scale[expected_scale < 1e-6] = 1.0
+    assert np.allclose(np.asarray(norm_meta["reward_scale"]), expected_scale)
     for pref in ((0.9, 0.1), (0.5, 0.5), (0.1, 0.9)):
         stored = train_family.scalar_reward(split, pref)
         replayed = train_family.scalar_policy_reward(

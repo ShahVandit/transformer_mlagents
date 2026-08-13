@@ -459,7 +459,7 @@ def test_joint_panels():
          "hour": np.arange(n, dtype=float)}
     for lab in __import__("itemids").TARGET_LABS:
         d[f"mean_{lab}"] = np.array([0, 1, 4, 1, 0], dtype=float)
-        d[f"last_{lab}"] = np.zeros(n)
+        d[f"last_{lab}"] = np.array([np.nan, 0, 0, 0, 0], dtype=float)
         d[f"std_{lab}"] = np.ones(n)
         d[f"obs_{lab}"] = np.array([np.nan, 2, np.nan, 2, np.nan])
         d[f"delta_{lab}"] = np.array([np.nan, 1, 1, 2, 3], dtype=float)
@@ -470,6 +470,8 @@ def test_joint_panels():
           all(v == 1.0 for v in thresholds.values()))
     check("threshold-level draws have no information utility", potential[1] == 0.0)
     check("larger forecast changes have more information utility", potential[2] > 0.0)
+    check("post-baseline rows require all prior target labs",
+          list(objectives.post_baseline_mask(d)) == [False, True, True, True, True])
 
     d["information_potential"] = potential
     d["draw_burden"] = objectives.burden_potential(d)
@@ -494,8 +496,8 @@ def test_joint_panels():
     normed, norm_meta = objectives.normalize_rewards(train_split, train_r)
     check("normalization keeps neutral rewards at exactly zero",
           bool(np.array_equal(normed[0][0], np.zeros(2, dtype=np.float32))))
-    check("normalization records per-stay range semantics",
-          norm_meta.get("normalization") == "per_stay_extreme_range")
+    check("normalization records factual train-return semantics",
+          norm_meta.get("normalization") == "train_logged_mean_return")
 
 
 def test_direct_policy():
